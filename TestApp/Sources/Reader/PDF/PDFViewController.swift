@@ -10,7 +10,7 @@ import ReadiumShared
 import SwiftUI
 import UIKit
 
-final class PDFViewController: VisualReaderViewController<PDFNavigatorViewController> {
+final class PDFViewController: VisualReaderViewController<PDFNavigatorViewController>, Loggable {
     private let preferencesStore: AnyUserPreferencesStore<PDFPreferences>
 
     init(
@@ -48,6 +48,28 @@ final class PDFViewController: VisualReaderViewController<PDFNavigatorViewContro
         super.init(navigator: navigator, publication: publication, bookId: bookId, books: books, bookmarks: bookmarks, highlights: highlights)
 
         navigator.delegate = self
+
+        // Log TTS availability for debugging
+        if PublicationSpeechSynthesizer.canSpeak(publication: publication) {
+            log(.info, "PDF TTS: Text-to-Speech is available for this PDF")
+        } else {
+            log(.warning, "PDF TTS: Text-to-Speech not available (PDF may be scanned or have no extractable text)")
+        }
+    }
+
+    @objc func highlightSelection() {
+        guard let selection = navigator.currentSelection else {
+            return
+        }
+
+        let highlight = Highlight(
+            bookId: bookId,
+            locator: selection.locator,
+            color: .yellow
+        )
+
+        saveHighlight(highlight)
+        navigator.clearSelection()
     }
 
     override func presentUserPreferences() {
