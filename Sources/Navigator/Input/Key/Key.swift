@@ -7,7 +7,7 @@
 import Foundation
 import UIKit
 
-public enum Key: Equatable, CustomStringConvertible {
+public enum Key: Equatable, Sendable, CustomStringConvertible {
     // Printable character.
     case character(String)
 

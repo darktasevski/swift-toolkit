@@ -10,12 +10,42 @@ import UIKit.UIGestureRecognizerSubclass
 /// A ``UIGestureRecognizer`` that will forward the touch events to an
 /// ``InputObserving``. It will never recognize any gesture, only forward the
 /// events.
+@MainActor
 final class InputObservingGestureRecognizerAdapter: UIGestureRecognizer {
     let observer: InputObserving
+
+    /// Serial event processor that ensures events are processed in order.
+    /// This prevents race conditions when touches from different gestures overlap.
+    private var eventProcessor: Task<Void, Never>?
+    private var eventContinuation: AsyncStream<PointerEvent>.Continuation?
 
     init(observer: CompositeInputObserver) {
         self.observer = observer
         super.init(target: nil, action: nil)
+
+        // Set up serial event processing via AsyncStream with bounded buffer
+        // to prevent unbounded memory growth under backpressure
+        let (stream, continuation) = AsyncStream<PointerEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        self.eventContinuation = continuation
+
+        // Process events serially to ensure order is preserved
+        self.eventProcessor = Task { @MainActor [weak self] in
+            for await event in stream {
+                guard let self else { break }
+                _ = await self.observer.didReceive(event)
+            }
+        }
+    }
+
+    deinit {
+        // Finish the stream first to signal no more events, then cancel the task.
+        // Note: Events queued but not yet processed will be lost. This is
+        // intentional as the gesture recognizer is being deallocated along with
+        // the view hierarchy it was attached to.
+        eventContinuation?.finish()
+        eventProcessor?.cancel()
     }
 
     /// Stores the ``PointerEvent`` that were notified to the `observer`, to
@@ -49,39 +79,38 @@ final class InputObservingGestureRecognizerAdapter: UIGestureRecognizer {
         // them manually for the observer.
         let pointersToReset = pendingPointers
         pendingPointers = [:]
-        Task {
-            for (_, event) in pointersToReset {
-                var event = event
-                event.phase = .cancel
-                _ = await observer.didReceive(event)
-            }
+
+        // Send cancel events through the serial queue to maintain order
+        for (_, event) in pointersToReset {
+            var event = event
+            event.phase = .cancel
+            eventContinuation?.yield(event)
         }
     }
 
     private func on(_ phase: PointerEvent.Phase, touches: Set<UITouch>, event: UIEvent) {
-        Task {
-            for touch in touches {
-                guard let view = view else {
-                    continue
-                }
-
-                let pointer = Pointer(touch: touch, event: event)
-                let pointerEvent = PointerEvent(
-                    pointer: pointer,
-                    phase: phase,
-                    location: touch.location(in: view),
-                    modifiers: KeyModifiers(event: event)
-                )
-
-                switch phase {
-                case .down, .move:
-                    pendingPointers[pointer.id] = pointerEvent
-                case .up, .cancel:
-                    pendingPointers.removeValue(forKey: pointer.id)
-                }
-
-                _ = await observer.didReceive(pointerEvent)
+        for touch in touches {
+            guard let view = view else {
+                continue
             }
+
+            let pointer = Pointer(touch: touch, event: event)
+            let pointerEvent = PointerEvent(
+                pointer: pointer,
+                phase: phase,
+                location: touch.location(in: view),
+                modifiers: KeyModifiers(event: event)
+            )
+
+            switch phase {
+            case .down, .move:
+                pendingPointers[pointer.id] = pointerEvent
+            case .up, .cancel:
+                pendingPointers.removeValue(forKey: pointer.id)
+            }
+
+            // Queue the event for serial processing
+            eventContinuation?.yield(pointerEvent)
         }
     }
 }

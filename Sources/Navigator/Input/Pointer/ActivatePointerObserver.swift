@@ -90,15 +90,10 @@ public extension InputObserving where Self == ActivatePointerObserver {
         case failed(activePointers: Set<AnyHashable>)
     }
 
-    private var state: State = .idle {
-        didSet {
-//            log(.info, "state \(state)")
-        }
-    }
+    private var state: State = .idle
 
     public func didReceive(_ event: PointerEvent) async -> Bool {
         let ignored = shouldIgnore(event)
-//        log(.info, "on \(ignored ? "ignored " : "")\(event)")
 
         guard !ignored else {
             return false

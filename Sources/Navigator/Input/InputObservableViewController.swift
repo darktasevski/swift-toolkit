@@ -12,6 +12,60 @@ import UIKit
 open class InputObservableViewController: UIViewController, InputObservable {
     let inputObservers = CompositeInputObserver()
 
+    // MARK: - Serial Event Processing
+
+    /// Serial event processors that ensure events are processed in order.
+    /// This prevents race conditions when events from different sources overlap.
+    private var pointerEventProcessor: Task<Void, Never>?
+    private var pointerEventContinuation: AsyncStream<PointerEvent>.Continuation?
+    private var keyEventProcessor: Task<Void, Never>?
+    private var keyEventContinuation: AsyncStream<KeyEvent>.Continuation?
+
+    private func setupEventProcessors() {
+        // Set up pointer event processing with bounded buffer
+        let (pointerStream, pointerContinuation) = AsyncStream<PointerEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        self.pointerEventContinuation = pointerContinuation
+        self.pointerEventProcessor = Task { @MainActor [weak self] in
+            for await event in pointerStream {
+                guard let self else { break }
+                _ = await self.inputObservers.didReceive(event)
+            }
+        }
+
+        // Set up key event processing with bounded buffer
+        let (keyStream, keyContinuation) = AsyncStream<KeyEvent>.makeStream(
+            bufferingPolicy: .bufferingNewest(64)
+        )
+        self.keyEventContinuation = keyContinuation
+        self.keyEventProcessor = Task { @MainActor [weak self] in
+            for await event in keyStream {
+                guard let self else { break }
+                _ = await self.inputObservers.didReceive(event)
+            }
+        }
+    }
+
+    private func teardownEventProcessors() {
+        // Finish streams first to signal no more events, then cancel tasks.
+        // Note: Events queued but not yet processed will be lost. This is
+        // intentional as the view controller is being deallocated.
+        pointerEventContinuation?.finish()
+        pointerEventProcessor?.cancel()
+        keyEventContinuation?.finish()
+        keyEventProcessor?.cancel()
+    }
+
+    deinit {
+        teardownEventProcessors()
+    }
+
+    override open func viewDidLoad() {
+        super.viewDidLoad()
+        setupEventProcessors()
+    }
+
     override open func viewDidAppear(_ animated: Bool) {
         super.viewDidAppear(animated)
 
@@ -78,13 +132,12 @@ open class InputObservableViewController: UIViewController, InputObservable {
     }
 
     private func on(_ phase: KeyEvent.Phase, presses: Set<UIPress>, with event: UIPressesEvent?) {
-        Task {
-            for press in presses {
-                guard let event = KeyEvent(phase: phase, uiPress: press) else {
-                    continue
-                }
-                _ = await inputObservers.didReceive(event)
+        for press in presses {
+            guard let event = KeyEvent(phase: phase, uiPress: press) else {
+                continue
             }
+            // Queue the event for serial processing
+            keyEventContinuation?.yield(event)
         }
     }
 
@@ -109,19 +162,19 @@ open class InputObservableViewController: UIViewController, InputObservable {
     }
 
     private func on(_ phase: PointerEvent.Phase, touches: Set<UITouch>, event: UIEvent?) {
-        Task {
-            for touch in touches {
-                guard let view = view else {
-                    continue
-                }
-
-                _ = await inputObservers.didReceive(PointerEvent(
-                    pointer: Pointer(touch: touch, event: event),
-                    phase: phase,
-                    location: touch.location(in: view),
-                    modifiers: KeyModifiers(event: event)
-                ))
+        for touch in touches {
+            guard let view = view else {
+                continue
             }
+
+            let pointerEvent = PointerEvent(
+                pointer: Pointer(touch: touch, event: event),
+                phase: phase,
+                location: touch.location(in: view),
+                modifiers: KeyModifiers(event: event)
+            )
+            // Queue the event for serial processing
+            pointerEventContinuation?.yield(pointerEvent)
         }
     }
 }
