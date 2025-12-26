@@ -22,21 +22,28 @@ public struct AudioPreferences: ConfigurablePreferences {
         willSet { precondition(speed == nil || speed! >= 0) }
     }
 
+    /// Audio enhancement settings (voice boost, normalization, EQ).
+    /// Used when an enhanced audio engine is available.
+    public var enhancement: AudioEnhancementConfiguration?
+
     public init(
         volume: Double? = nil,
-        speed: Double? = nil
+        speed: Double? = nil,
+        enhancement: AudioEnhancementConfiguration? = nil
     ) {
         precondition(volume == nil || 0 ... 1 ~= volume!)
         precondition(speed == nil || speed! >= 0)
 
         self.volume = volume
         self.speed = speed
+        self.enhancement = enhancement
     }
 
     public func merging(_ other: AudioPreferences) -> AudioPreferences {
         AudioPreferences(
             volume: other.volume ?? volume,
-            speed: other.speed ?? speed
+            speed: other.speed ?? speed,
+            enhancement: other.enhancement ?? enhancement
         )
     }
 

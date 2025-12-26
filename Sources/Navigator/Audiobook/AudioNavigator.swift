@@ -9,14 +9,14 @@ import Foundation
 import ReadiumShared
 
 /// Status of a played media resource.
-public enum MediaPlaybackState {
+public enum MediaPlaybackState: Hashable, Sendable {
     case paused
     case loading
     case playing
 }
 
 /// Holds metadata about a played media resource.
-public struct MediaPlaybackInfo {
+public struct MediaPlaybackInfo: Equatable, Sendable {
     /// Index of the current resource in the `readingOrder`.
     public let resourceIndex: Int
 
@@ -61,6 +61,12 @@ public struct MediaPlaybackInfo {
     /// Called when the ranges of buffered media data change.
     /// Warning: They may be discontinuous.
     func navigator(_ navigator: AudioNavigator, loadedTimeRangesDidChange ranges: [Range<Double>])
+
+    /// Called periodically with audio level data for visualization.
+    /// - Parameters:
+    ///   - navigator: The audio navigator.
+    ///   - levels: Audio level data containing normalized levels (0.0 to 1.0).
+    func navigator(_ navigator: AudioNavigator, didUpdateAudioLevels levels: AudioLevelData)
 }
 
 public extension AudioNavigatorDelegate {
@@ -69,14 +75,20 @@ public extension AudioNavigatorDelegate {
     func navigator(_ navigator: AudioNavigator, shouldPlayNextResource info: MediaPlaybackInfo) -> Bool { true }
 
     func navigator(_ navigator: AudioNavigator, loadedTimeRangesDidChange ranges: [Range<Double>]) {}
+
+    func navigator(_ navigator: AudioNavigator, didUpdateAudioLevels levels: AudioLevelData) {}
 }
 
 /// Navigator for audio-based publications such as:
 ///
 /// * Readium Audiobook
 /// * ZAB (Zipped Audio Book)
+@MainActor
 public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Loggable {
     public weak var delegate: AudioNavigatorDelegate?
+
+    /// Factory for creating audio playback engines.
+    public typealias EngineFactory = @MainActor () -> any AudioPlaybackEngine
 
     public struct Configuration {
         /// Initial set of setting preferences.
@@ -91,6 +103,16 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         /// Custom configuration for the audio session.
         public var audioSession: AudioSession.Configuration
 
+        /// Factory to create the audio playback engine.
+        /// Defaults to `AVPlayerEngine` for backwards compatibility.
+        public var engineFactory: EngineFactory?
+
+        /// The source file URL for the publication.
+        /// Required for `EnhancedAudioEngine` which needs direct file access.
+        /// For standalone audio files (MP3, etc.), this should be the file URL.
+        /// For packaged audiobooks (LCP, etc.), this should be the container URL.
+        public var sourceURL: URL?
+
         public init(
             preferences: AudioPreferences = AudioPreferences(),
             defaults: AudioDefaults = AudioDefaults(),
@@ -99,12 +121,16 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                 category: .playback,
                 mode: .spokenAudio,
                 routeSharingPolicy: .longFormAudio
-            )
+            ),
+            engineFactory: EngineFactory? = nil,
+            sourceURL: URL? = nil
         ) {
             self.preferences = preferences
             self.defaults = defaults
             self.playbackRefreshInterval = playbackRefreshInterval
             self.audioSession = audioSession
+            self.engineFactory = engineFactory
+            self.sourceURL = sourceURL
         }
     }
 
@@ -113,6 +139,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     private let config: Configuration
 
     public var audioConfiguration: AudioSession.Configuration { config.audioSession }
+
+    /// The audio playback engine used by this navigator.
+    public let engine: any AudioPlaybackEngine
 
     public init(
         publication: Publication,
@@ -133,20 +162,54 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             preferences: config.preferences,
             defaults: config.defaults
         )
+
+        // Create the audio engine using the factory or default to AVPlayerEngine
+        if let factory = config.engineFactory {
+            engine = factory()
+        } else {
+            engine = AVPlayerEngine(timeUpdateInterval: config.playbackRefreshInterval)
+        }
+
+        // Set initial engine settings
+        engine.volume = Float(settings.volume)
+        engine.rate = Float(settings.speed)
+
+        // Set up engine delegate
+        engine.delegate = self
     }
 
     deinit {
-        if let timeObserver = timeObserver {
-            player.removeTimeObserver(timeObserver)
-        }
-
         playTask?.cancel()
+
+        // AudioSession.end(for:) is nonisolated and only captures ObjectIdentifier,
+        // so it's safe to call from deinit
         AudioSession.shared.end(for: self)
+
+        // Engine cleanup must run on main thread. We capture the engine reference
+        // and dispatch async. The engine will clean up its observers.
+        // Note: Prefer calling close() explicitly before releasing the navigator
+        // to ensure cleanup completes synchronously.
+        let engine = self.engine
+        DispatchQueue.main.async {
+            engine.stop()
+        }
+    }
+
+    /// Explicitly closes the navigator and releases all resources.
+    ///
+    /// Call this method before releasing the navigator to ensure proper cleanup.
+    /// While deinit will also clean up resources, calling close() explicitly
+    /// guarantees synchronous cleanup and is recommended for deterministic behavior.
+    public func close() {
+        playTask?.cancel()
+        playTask = nil
+        AudioSession.shared.end(for: self)
+        engine.stop()
     }
 
     /// Returns whether the resource is currently playing or not.
     public var state: MediaPlaybackState {
-        MediaPlaybackState(player.timeControlStatus)
+        MediaPlaybackState(engine.state)
     }
 
     /// Current playback info.
@@ -169,8 +232,8 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
 
     /// Duration in seconds in the current resource.
     private var resourceDuration: Double? {
-        if let duration = player.currentItem?.duration, duration.isNumeric {
-            return duration.secondsOrZero
+        if let duration = engine.duration {
+            return duration
         } else {
             return publication.readingOrder[resourceIndex].duration
         }
@@ -183,12 +246,28 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     private let durations: [Double]
 
     public var currentTime: Double {
-        player.currentTime().secondsOrZero
+        engine.currentTime
     }
+
+    /// Whether an asset is currently loaded in the engine.
+    private var hasLoadedAsset: Bool = false
 
     private var playTask: Task<Void, Never>? {
         willSet {
             playTask?.cancel()
+        }
+    }
+
+    /// Preloads the first resource to make duration available without starting playback.
+    ///
+    /// Call this after initialization to show duration in the UI before the user presses play.
+    public func preload() async {
+        guard !hasLoadedAsset else { return }
+
+        if let location = initialLocation {
+            await go(to: location, options: NavigatorGoOptions(animated: false))
+        } else if let link = publication.readingOrder.first {
+            await go(to: link, options: NavigatorGoOptions(animated: false))
         }
     }
 
@@ -197,20 +276,22 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         playTask = Task { @MainActor in
             AudioSession.shared.start(with: self, isPlaying: false)
 
-            if player.currentItem == nil {
+            if !hasLoadedAsset {
                 if let location = initialLocation {
                     await go(to: location)
                 } else if let link = publication.readingOrder.first {
                     await go(to: link)
                 }
             }
-            player.playImmediately(atRate: Float(settings.speed))
+            // Apply speed before starting playback (not applied when paused)
+            engine.rate = Float(settings.speed)
+            engine.play()
         }
     }
 
     /// Pauses the playback.
     public func pause() {
-        player.pause()
+        engine.pause()
     }
 
     /// Toggles the playback.
@@ -228,7 +309,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         let wasPlaying = (state == .playing)
         pause()
 
-        await player.seek(to: CMTime(seconds: time, preferredTimescale: 1000))
+        await engine.seek(to: time)
 
         if wasPlaying {
             play()
@@ -240,87 +321,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         await seek(to: currentTime + delta)
     }
 
-    private var rateObserver: NSKeyValueObservation?
-    private var timeControlStatusObserver: NSKeyValueObservation?
-    private var currentItemObserver: NSKeyValueObservation?
-    private var timeObserver: Any?
-
     private lazy var mediaLoader = PublicationMediaLoader(publication: publication)
-
-    private lazy var player: AVPlayer = {
-        let player = AVPlayer()
-        player.allowsExternalPlayback = false
-        player.automaticallyWaitsToMinimizeStalling = false
-        player.volume = Float(settings.volume)
-
-        timeObserver = player.addPeriodicTimeObserver(
-            forInterval: CMTime(
-                seconds: config.playbackRefreshInterval,
-                preferredTimescale: 1000
-            ),
-            queue: .main
-        ) { [weak self] time in
-            if let self = self {
-                let time = time.secondsOrZero
-                self.playbackDidChange(time)
-            }
-        }
-
-        rateObserver = player.observe(\.rate, options: [.new, .old]) { [weak self] player, _ in
-            guard let self = self else {
-                return
-            }
-
-            let session = AudioSession.shared
-            switch player.timeControlStatus {
-            case .paused:
-                session.user(self, didChangePlaying: false)
-            case .waitingToPlayAtSpecifiedRate, .playing:
-                session.user(self, didChangePlaying: true)
-            @unknown default:
-                break
-            }
-        }
-
-        timeControlStatusObserver = player.observe(\.timeControlStatus, options: [.new, .old]) { [weak self] _, _ in
-            self?.playbackDidChange()
-        }
-
-        currentItemObserver = player.observe(\.currentItem, options: [.new, .old]) { [weak self] _, _ in
-            self?.playbackDidChange()
-        }
-
-        NotificationCenter.default.addObserver(forName: .AVPlayerItemDidPlayToEndTime, object: nil, queue: .main) { [weak self] notification in
-            guard
-                let self = self,
-                let currentItem = player.currentItem,
-                currentItem == (notification.object as? AVPlayerItem)
-            else {
-                return
-            }
-
-            self.shouldPlayNextResource { playNext in
-                Task {
-                    if playNext, await self.goForward() {
-                        self.play()
-                    }
-                }
-            }
-        }
-
-        return player
-    }()
-
-    private func shouldPlayNextResource(completion: @escaping (Bool) -> Void) {
-        guard let delegate = delegate else {
-            completion(true)
-            return
-        }
-
-        makePlaybackInfo { info in
-            completion(delegate.navigator(self, shouldPlayNextResource: info))
-        }
-    }
 
     private func playbackDidChange(_ time: Double? = nil) {
         if let time = time {
@@ -378,34 +379,6 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         )
     }
 
-    // MARK: - Loaded Time Ranges
-
-    private var lastLoadedTimeRanges: [Range<Double>] = []
-
-    private lazy var loadedTimeRangesTimer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] timer in
-        guard let self = self else {
-            timer.invalidate()
-            return
-        }
-
-        let ranges: [Range<Double>] = (self.player.currentItem?.loadedTimeRanges ?? [])
-            .map { value in
-                let range = value.timeRangeValue
-                let start = range.start.secondsOrZero
-                let duration = range.duration.secondsOrZero
-                return start ..< (start + duration)
-            }
-
-        guard ranges != self.lastLoadedTimeRanges else {
-            return
-        }
-
-        self.lastLoadedTimeRanges = ranges
-        Task { @MainActor in
-            self.delegate?.navigator(self, loadedTimeRangesDidChange: ranges)
-        }
-    }
-
     // MARK: - Navigator
 
     public private(set) var currentLocation: Locator?
@@ -422,19 +395,22 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         do {
             currentLocation = locator
             // Loads resource
-            if player.currentItem == nil || resourceIndex != newResourceIndex {
+            if !hasLoadedAsset || resourceIndex != newResourceIndex {
                 log(.info, "Starts playing \(link.href)")
                 let asset = try mediaLoader.makeAsset(for: link)
-                player.replaceCurrentItem(with: AVPlayerItem(asset: asset))
+                // For engines that need direct file access (like EnhancedAudioEngine),
+                // use the sourceURL from configuration. This is necessary because
+                // Readium's virtual URL scheme doesn't work with AVAudioFile.
+                try await engine.load(asset, originalFileURL: config.sourceURL)
+                hasLoadedAsset = true
                 resourceIndex = newResourceIndex
-                loadedTimeRangesTimer.fire()
                 await delegate?.navigator(self, loadedTimeRangesDidChange: [])
             }
 
             // Seeks to time
             let time = locator.locations.time?.begin ?? ((resourceDuration ?? 0) * (locator.locations.progression ?? 0))
 
-            let finished = await player.seek(to: CMTime(seconds: time, preferredTimescale: 1000))
+            let finished = await engine.seek(to: time)
             if finished {
                 await delegate?.navigator(self, didJumpTo: locator)
             }
@@ -496,12 +472,17 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             defaults: config.defaults
         )
 
-        player.volume = Float(settings.volume)
+        engine.volume = Float(settings.volume)
 
-        // We don't directly change `player.rate`, because it might be 0 when the player is paused. `settings.speed`
-        // is actually the default speed while playing.
+        // We don't directly change engine rate when paused, as it would start playback.
+        // The rate is applied when play() is called.
         if state != .paused {
-            player.rate = Float(settings.speed)
+            engine.rate = Float(settings.speed)
+        }
+
+        // Apply enhancement settings if engine supports them
+        if let enhancedEngine = engine as? EnhancedAudioPlaybackEngine {
+            enhancedEngine.enhancementConfiguration = settings.enhancement
         }
     }
 
@@ -513,23 +494,70 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 }
 
-private extension MediaPlaybackState {
-    init(_ timeControlStatus: AVPlayer.TimeControlStatus) {
-        switch timeControlStatus {
-        case .paused:
-            self = .paused
-        case .waitingToPlayAtSpecifiedRate:
-            self = .loading
-        case .playing:
-            self = .playing
-        @unknown default:
-            self = .loading
+// MARK: - AudioPlaybackEngineDelegate
+
+extension AudioNavigator: AudioPlaybackEngineDelegate {
+    public func engine(_ engine: any AudioPlaybackEngine, didUpdateTime time: Double) {
+        playbackDidChange(time)
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, didChangeState engineState: AudioEnginePlaybackState) {
+        let session = AudioSession.shared
+        switch engineState {
+        case .stopped, .paused:
+            session.user(self, didChangePlaying: false)
+        case .loading, .playing:
+            session.user(self, didChangePlaying: true)
+        }
+        playbackDidChange()
+    }
+
+    public func engineDidFinishPlaying(_ engine: any AudioPlaybackEngine) {
+        shouldPlayNextResource { [weak self] playNext in
+            guard let self else { return }
+            Task {
+                if playNext, await self.goForward() {
+                    self.play()
+                }
+            }
+        }
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, didUpdateLoadedTimeRanges ranges: [Range<Double>]) {
+        Task { @MainActor in
+            delegate?.navigator(self, loadedTimeRangesDidChange: ranges)
+        }
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, didUpdateAudioLevels levels: AudioLevelData) {
+        Task { @MainActor in
+            delegate?.navigator(self, didUpdateAudioLevels: levels)
+        }
+    }
+
+    private func shouldPlayNextResource(completion: @escaping (Bool) -> Void) {
+        guard let delegate = delegate else {
+            completion(true)
+            return
+        }
+
+        makePlaybackInfo { info in
+            completion(delegate.navigator(self, shouldPlayNextResource: info))
         }
     }
 }
 
-private extension CMTime {
-    var secondsOrZero: Double {
-        isNumeric ? seconds : 0
+// MARK: - Private Extensions
+
+private extension MediaPlaybackState {
+    init(_ engineState: AudioEnginePlaybackState) {
+        switch engineState {
+        case .stopped, .paused:
+            self = .paused
+        case .loading:
+            self = .loading
+        case .playing:
+            self = .playing
+        }
     }
 }

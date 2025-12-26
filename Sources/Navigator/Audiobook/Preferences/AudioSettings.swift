@@ -13,6 +13,7 @@ import ReadiumShared
 public struct AudioSettings: ConfigurableSettings {
     public let volume: Double
     public let speed: Double
+    public let enhancement: AudioEnhancementConfiguration
 
     init(preferences: AudioPreferences, defaults: AudioDefaults) {
         volume = preferences.volume
@@ -22,6 +23,10 @@ public struct AudioSettings: ConfigurableSettings {
         speed = preferences.speed
             ?? defaults.speed
             ?? 1.0
+
+        enhancement = preferences.enhancement
+            ?? defaults.enhancement
+            ?? .default
     }
 }
 
@@ -33,12 +38,15 @@ public struct AudioSettings: ConfigurableSettings {
 public struct AudioDefaults {
     public var volume: Double?
     public var speed: Double?
+    public var enhancement: AudioEnhancementConfiguration?
 
     public init(
         volume: Double? = nil,
-        speed: Double? = nil
+        speed: Double? = nil,
+        enhancement: AudioEnhancementConfiguration? = nil
     ) {
         self.volume = volume
         self.speed = speed
+        self.enhancement = enhancement
     }
 }

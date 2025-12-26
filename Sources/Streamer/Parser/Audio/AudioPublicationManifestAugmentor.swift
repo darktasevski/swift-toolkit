@@ -63,8 +63,92 @@ public final class AVAudioPublicationManifestAugmentor: AudioPublicationManifest
             return duration + avAsset.duration.seconds
         }
         manifest.metadata = metadata
+
+        // Extract QuickTime chapters from M4B/M4A files
+        // Only extract if we have a single audio file (typical M4B audiobook)
+        if manifest.tableOfContents.isEmpty, avAssets.count == 1, let avAsset = avAssets.first {
+            manifest.tableOfContents = await extractChapters(from: avAsset, readingOrderLink: manifest.readingOrder.first)
+        }
+
         let cover = avMetadata.filter([.commonIdentifierArtwork, .id3MetadataAttachedPicture, .iTunesMetadataCoverArt]).first(where: { $0.dataValue.flatMap(UIImage.init(data:)) })
         return .init(manifest: manifest, cover: cover)
+    }
+
+    /// Extracts QuickTime chapter metadata from an AVAsset.
+    ///
+    /// M4B and M4A files can contain embedded chapter markers as QuickTime chapter atoms.
+    /// This method extracts them and converts them to Readium Link objects for the table of contents.
+    private func extractChapters(from avAsset: AVURLAsset?, readingOrderLink: Link?) async -> [Link] {
+        guard let avAsset = avAsset else { return [] }
+
+        // Get available chapter locales
+        let locales: [Locale]
+        if #available(iOS 15, macOS 12, *) {
+            guard let loadedLocales = try? await avAsset.load(.availableChapterLocales), !loadedLocales.isEmpty else {
+                return []
+            }
+            locales = loadedLocales
+        } else {
+            // Fallback for iOS < 15: use synchronous API
+            locales = avAsset.availableChapterLocales
+            guard !locales.isEmpty else { return [] }
+        }
+
+        // Prefer user's locale, fallback to first available
+        let preferredLocale = locales.first { $0.identifier == Locale.current.identifier } ?? locales[0]
+
+        // Load chapter metadata groups
+        let chapterGroups: [AVTimedMetadataGroup]
+        if #available(iOS 15, macOS 12, *) {
+            guard let loadedGroups = try? await avAsset.loadChapterMetadataGroups(
+                withTitleLocale: preferredLocale,
+                containingItemsWithCommonKeys: [.commonKeyTitle]
+            ), !loadedGroups.isEmpty else {
+                return []
+            }
+            chapterGroups = loadedGroups
+        } else {
+            // Fallback for iOS < 15: use synchronous API
+            chapterGroups = avAsset.chapterMetadataGroups(
+                withTitleLocale: preferredLocale,
+                containingItemsWithCommonKeys: [AVMetadataKey.commonKeyTitle]
+            )
+            guard !chapterGroups.isEmpty else { return [] }
+        }
+
+        // Get the base href from the reading order link
+        let baseHref = readingOrderLink?.url().string ?? ""
+
+        return chapterGroups.enumerated().compactMap { index, group in
+            // Extract chapter title from metadata
+            let titleItems = AVMetadataItem.metadataItems(
+                from: group.items,
+                filteredByIdentifier: .commonIdentifierTitle
+            )
+            let title = titleItems.first?.stringValue ?? "Chapter \(index + 1)"
+
+            // Calculate start time in seconds
+            // Validate CMTime to prevent NaN/Inf from creating malformed hrefs
+            guard group.timeRange.start.isNumeric else {
+                // Fallback: return a link without time fragment
+                return Link(
+                    href: baseHref,
+                    mediaType: readingOrderLink?.mediaType,
+                    title: title
+                )
+            }
+            let startTime = group.timeRange.start.seconds
+
+            // Create a link with time fragment for navigation
+            // Format: "file.m4b#t=123.456" following Media Fragments URI spec
+            let href = baseHref.isEmpty ? "#t=\(startTime)" : "\(baseHref)#t=\(startTime)"
+
+            return Link(
+                href: href,
+                mediaType: readingOrderLink?.mediaType,
+                title: title
+            )
+        }
     }
 }
 
