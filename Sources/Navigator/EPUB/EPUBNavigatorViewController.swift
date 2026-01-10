@@ -18,12 +18,19 @@ import WebKit
     // MARK: - WebView Customization
 
     func navigator(_ navigator: EPUBNavigatorViewController, setupUserScripts userContentController: WKUserContentController)
+
+    // MARK: - Image Zoom
+
+    /// Called when the user tapped on an image that should be zoomed.
+    func navigator(_ navigator: EPUBNavigatorViewController, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?)
 }
 
 public extension EPUBNavigatorDelegate {
     func navigator(_ navigator: EPUBNavigatorViewController, viewportDidChange viewport: EPUBNavigatorViewController.Viewport?) {}
 
     func navigator(_ navigator: EPUBNavigatorViewController, setupUserScripts userContentController: WKUserContentController) {}
+
+    func navigator(_ navigator: EPUBNavigatorViewController, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
 }
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
@@ -1228,6 +1235,10 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         for callback in callbacks {
             callback(OnDecorationActivatedEvent(decoration: decoration, group: group, rect: frame, point: point))
         }
+    }
+
+    func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {
+        delegate?.navigator(self, didActivateImageAt: url, altText: altText, caption: caption, attribution: attribution)
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect) {

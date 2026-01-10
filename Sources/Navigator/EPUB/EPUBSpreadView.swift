@@ -24,6 +24,9 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the user tapped on a decoration.
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: String, frame: CGRect?, point: CGPoint?)
 
+    /// Called when the user tapped on an image for zooming.
+    func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?)
+
     /// Called when the text selection changes.
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect)
 
@@ -424,6 +427,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         registerJSMessage(named: "selectionChanged") { [weak self] in self?.selectionDidChange($0) }
         registerJSMessage(named: "decorationActivated") { [weak self] in self?.decorationDidActivate($0) }
         registerJSMessage(named: "keyEventReceived") { [weak self] in self?.didReceiveKeyEvent($0) }
+        registerJSMessage(named: "imageActivated") { [weak self] in self?.didActivateImage($0) }
     }
 
     /// Add the message handlers for incoming javascript events.
@@ -477,6 +481,25 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         let point = ClickEvent(json: decoration["click"])
             .map { convertPointToNavigatorSpace($0.point) }
         delegate?.spreadView(self, didActivateDecoration: decorationId, inGroup: groupName, frame: frame, point: point)
+    }
+
+    // MARK: - Image Activation
+
+    /// Called by the JavaScript layer when the user taps on a zoomable image.
+    private func didActivateImage(_ body: Any) {
+        guard
+            let data = body as? [String: Any],
+            let srcString = data["src"] as? String,
+            let url = URL(string: srcString)
+        else {
+            log(.warning, "Invalid body for didActivateImage: \(body)")
+            return
+        }
+
+        let altText = data["alt"] as? String
+        let caption = data["caption"] as? String
+        let attribution = data["attribution"] as? String
+        delegate?.spreadView(self, didActivateImageAt: url, altText: altText, caption: caption, attribution: attribution)
     }
 
     // MARK: - Accessibility
