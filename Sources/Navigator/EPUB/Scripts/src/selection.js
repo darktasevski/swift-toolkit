@@ -4,15 +4,13 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-import { log as logNative, logError } from "./utils";
+import { logError } from "./utils";
 import { toNativeRect } from "./rect";
 import { TextRange } from "./vendor/hypothesis/anchoring/text-range";
 
 // Polyfill for iOS 12
 import matchAll from "string.prototype.matchall";
 matchAll.shim();
-
-const debug = true;
 
 export function getCurrentSelection() {
   if (!readium.link) {
@@ -22,12 +20,25 @@ export function getCurrentSelection() {
   if (!href) {
     return null;
   }
-  const text = getCurrentSelectionText();
-  if (!text) {
+
+  const selectionData = getCurrentSelectionText();
+  if (!selectionData) {
     return null;
   }
+
   const rect = getSelectionRect();
-  return { href, text, rect };
+
+  // Compute domRange for highlight anchoring
+  const domRange = computeDomRange(selectionData.range);
+
+  // Extract text properties (without the range)
+  const text = {
+    highlight: selectionData.highlight,
+    before: selectionData.before,
+    after: selectionData.after,
+  };
+
+  return { href, text, rect, domRange };
 }
 
 function getSelectionRect() {
@@ -47,23 +58,24 @@ function getSelectionRect() {
 
 function getCurrentSelectionText() {
   const selection = window.getSelection();
-  if (!selection) {
+  if (!selection || selection.isCollapsed) {
     return undefined;
   }
-  if (selection.isCollapsed) {
-    return undefined;
-  }
+
   const highlight = selection.toString();
   const cleanHighlight = highlight
     .trim()
     .replace(/\n/g, " ")
     .replace(/\s\s+/g, " ");
+
   if (cleanHighlight.length === 0) {
     return undefined;
   }
+
   if (!selection.anchorNode || !selection.focusNode) {
     return undefined;
   }
+
   const range =
     selection.rangeCount === 1
       ? selection.getRangeAt(0)
@@ -73,13 +85,21 @@ function getCurrentSelectionText() {
           selection.focusNode,
           selection.focusOffset
         );
+
   if (!range || range.collapsed) {
-    log("$$$$$$$$$$$$$$$$$ CANNOT GET NON-COLLAPSED SELECTION RANGE?!");
     return undefined;
   }
 
   const text = document.body.textContent;
-  const textRange = TextRange.fromRange(range).relativeTo(document.body);
+
+  let textRange;
+  try {
+    textRange = TextRange.fromRange(range).relativeTo(document.body);
+  } catch (e) {
+    logError(e);
+    return undefined;
+  }
+
   const start = textRange.start.offset;
   const end = textRange.end.offset;
 
@@ -99,7 +119,8 @@ function getCurrentSelectionText() {
     after = after.slice(0, lastWordEnd.index + 1);
   }
 
-  return { highlight, before, after };
+  // Return the range as well so we can compute domRange
+  return { highlight, before, after, range };
 }
 
 function createOrderedRange(startNode, startOffset, endNode, endOffset) {
@@ -109,16 +130,172 @@ function createOrderedRange(startNode, startOffset, endNode, endOffset) {
   if (!range.collapsed) {
     return range;
   }
-  log(">>> createOrderedRange COLLAPSED ... RANGE REVERSE?");
+  // Try reversed range (selection direction may be backwards)
   const rangeReverse = new Range();
   rangeReverse.setStart(endNode, endOffset);
   rangeReverse.setEnd(startNode, startOffset);
   if (!rangeReverse.collapsed) {
-    log(">>> createOrderedRange RANGE REVERSE OK.");
-    return range;
+    return rangeReverse;
   }
-  log(">>> createOrderedRange RANGE REVERSE ALSO COLLAPSED?!");
   return undefined;
+}
+
+/**
+ * Computes a unique CSS selector for an element.
+ * Uses ID if available, otherwise builds a path with nth-child selectors.
+ */
+function getCssSelector(element) {
+  if (!element || element.nodeType !== Node.ELEMENT_NODE) {
+    return null;
+  }
+
+  // If element has an ID, use it (most reliable)
+  if (element.id) {
+    return "#" + CSS.escape(element.id);
+  }
+
+  // Build path from root
+  const path = [];
+  let current = element;
+
+  while (current && current !== document.body && current !== document.documentElement) {
+    if (current.nodeType !== Node.ELEMENT_NODE) {
+      current = current.parentElement;
+      continue;
+    }
+
+    let selector = current.tagName.toLowerCase();
+
+    // If element has an ID, use it and stop
+    if (current.id) {
+      selector = "#" + CSS.escape(current.id);
+      path.unshift(selector);
+      break;
+    }
+
+    // Add nth-child for uniqueness among siblings
+    const parent = current.parentElement;
+    if (parent) {
+      const siblings = Array.from(parent.children).filter(
+        (child) => child.tagName === current.tagName
+      );
+      if (siblings.length > 1) {
+        const index = siblings.indexOf(current) + 1;
+        selector += ":nth-of-type(" + index + ")";
+      }
+    }
+
+    path.unshift(selector);
+    current = current.parentElement;
+  }
+
+  // Prepend body to make the selector absolute
+  if (path.length > 0 && !path[0].startsWith("#")) {
+    path.unshift("body");
+  }
+
+  return path.join(" > ");
+}
+
+/**
+ * Finds the text node index within the parent element.
+ * Returns the index of the text node among all child text nodes of the parent.
+ */
+function getTextNodeIndex(node) {
+  if (!node) return -1;
+
+  // If the node is not a text node, return -1
+  if (node.nodeType !== Node.TEXT_NODE) {
+    return -1;
+  }
+
+  const parent = node.parentElement;
+  if (!parent) return -1;
+
+  let textNodeIndex = 0;
+  for (const child of parent.childNodes) {
+    if (child === node) {
+      return textNodeIndex;
+    }
+    if (child.nodeType === Node.TEXT_NODE) {
+      textNodeIndex++;
+    }
+  }
+
+  return -1;
+}
+
+/**
+ * Computes a DOMRange object from a Range for serialization.
+ * This follows the Readium DOMRange format for highlight anchoring.
+ */
+function computeDomRange(range) {
+  if (!range) return null;
+
+  try {
+    const startContainer = range.startContainer;
+    const endContainer = range.endContainer;
+    const startOffset = range.startOffset;
+    const endOffset = range.endOffset;
+
+    // Get the parent element for the start
+    const startElement =
+      startContainer.nodeType === Node.TEXT_NODE
+        ? startContainer.parentElement
+        : startContainer;
+
+    // Get the parent element for the end
+    const endElement =
+      endContainer.nodeType === Node.TEXT_NODE
+        ? endContainer.parentElement
+        : endContainer;
+
+    if (!startElement || !endElement) {
+      return null;
+    }
+
+    const startCssSelector = getCssSelector(startElement);
+    const endCssSelector = getCssSelector(endElement);
+
+    // Validate CSS selectors - must be non-null and non-empty.
+    // Empty selectors can occur with malformed HTML, elements removed from DOM during selection,
+    // or edge cases where getCssSelector cannot build a valid path (e.g., detached nodes).
+    if (!startCssSelector || !endCssSelector || startCssSelector === "" || endCssSelector === "") {
+      return null;
+    }
+
+    // Get text node indices
+    const startTextNodeIndex =
+      startContainer.nodeType === Node.TEXT_NODE
+        ? getTextNodeIndex(startContainer)
+        : 0;
+
+    const endTextNodeIndex =
+      endContainer.nodeType === Node.TEXT_NODE
+        ? getTextNodeIndex(endContainer)
+        : 0;
+
+    // Validate text node indices - getTextNodeIndex returns -1 on failure
+    if (startTextNodeIndex < 0 || endTextNodeIndex < 0) {
+      return null;
+    }
+
+    return {
+      start: {
+        cssSelector: startCssSelector,
+        textNodeIndex: startTextNodeIndex,
+        charOffset: startOffset,
+      },
+      end: {
+        cssSelector: endCssSelector,
+        textNodeIndex: endTextNodeIndex,
+        charOffset: endOffset,
+      },
+    };
+  } catch (e) {
+    logError(e);
+    return null;
+  }
 }
 
 export function convertRangeInfo(document, rangeInfo) {
@@ -126,7 +303,6 @@ export function convertRangeInfo(document, rangeInfo) {
     rangeInfo.startContainerElementCssSelector
   );
   if (!startElement) {
-    log("^^^ convertRangeInfo NO START ELEMENT CSS SELECTOR?!");
     return undefined;
   }
   let startContainer = startElement;
@@ -135,15 +311,11 @@ export function convertRangeInfo(document, rangeInfo) {
       rangeInfo.startContainerChildTextNodeIndex >=
       startElement.childNodes.length
     ) {
-      log(
-        "^^^ convertRangeInfo rangeInfo.startContainerChildTextNodeIndex >= startElement.childNodes.length?!"
-      );
       return undefined;
     }
     startContainer =
       startElement.childNodes[rangeInfo.startContainerChildTextNodeIndex];
     if (startContainer.nodeType !== Node.TEXT_NODE) {
-      log("^^^ convertRangeInfo startContainer.nodeType !== Node.TEXT_NODE?!");
       return undefined;
     }
   }
@@ -151,7 +323,6 @@ export function convertRangeInfo(document, rangeInfo) {
     rangeInfo.endContainerElementCssSelector
   );
   if (!endElement) {
-    log("^^^ convertRangeInfo NO END ELEMENT CSS SELECTOR?!");
     return undefined;
   }
   let endContainer = endElement;
@@ -159,15 +330,11 @@ export function convertRangeInfo(document, rangeInfo) {
     if (
       rangeInfo.endContainerChildTextNodeIndex >= endElement.childNodes.length
     ) {
-      log(
-        "^^^ convertRangeInfo rangeInfo.endContainerChildTextNodeIndex >= endElement.childNodes.length?!"
-      );
       return undefined;
     }
     endContainer =
       endElement.childNodes[rangeInfo.endContainerChildTextNodeIndex];
     if (endContainer.nodeType !== Node.TEXT_NODE) {
-      log("^^^ convertRangeInfo endContainer.nodeType !== Node.TEXT_NODE?!");
       return undefined;
     }
   }
@@ -185,18 +352,14 @@ export function location2RangeInfo(location) {
   const start = domRange.start;
   const end = domRange.end;
 
+  // Support both `charOffset` (current spec) and `offset` (legacy) property names
+  // for backward compatibility with persisted Locator models from older versions.
   return {
     endContainerChildTextNodeIndex: end.textNodeIndex,
     endContainerElementCssSelector: end.cssSelector,
-    endOffset: end.offset,
+    endOffset: end.charOffset ?? end.offset,
     startContainerChildTextNodeIndex: start.textNodeIndex,
     startContainerElementCssSelector: start.cssSelector,
-    startOffset: start.offset,
+    startOffset: start.charOffset ?? start.offset,
   };
-}
-
-function log() {
-  if (debug) {
-    logNative.apply(null, arguments);
-  }
 }

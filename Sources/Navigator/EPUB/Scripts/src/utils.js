@@ -282,6 +282,18 @@ export function rangeFromLocator(locator) {
   try {
     let locations = locator.locations;
     let text = locator.text;
+
+    // Try domRange first - it's the most precise anchoring method
+    if (locations && locations.domRange) {
+      let range = rangeFromDomRange(locations.domRange);
+      if (range) {
+        log("rangeFromLocator: Successfully anchored using domRange");
+        return range;
+      }
+      log("rangeFromLocator: domRange anchoring failed, falling back to text matching");
+    }
+
+    // Fall back to text-based matching
     if (text && text.highlight) {
       var root;
       if (locations && locations.cssSelector) {
@@ -326,6 +338,98 @@ export function rangeFromLocator(locator) {
     logError(e);
   }
 
+  return null;
+}
+
+/**
+ * Creates a DOM Range from a domRange object.
+ * domRange format: { start: { cssSelector, textNodeIndex, charOffset }, end: { ... } }
+ */
+function rangeFromDomRange(domRange) {
+  try {
+    if (!domRange || !domRange.start) {
+      return null;
+    }
+
+    const start = domRange.start;
+    const end = domRange.end || start;
+
+    // Validate CSS selectors before querying
+    if (!start.cssSelector) {
+      log("rangeFromDomRange: start.cssSelector is empty");
+      return null;
+    }
+
+    // Find start container
+    const startElement = document.querySelector(start.cssSelector);
+    if (!startElement) {
+      log("rangeFromDomRange: Could not find start element: " + start.cssSelector);
+      return null;
+    }
+
+    // Find the text node at the given index
+    const startTextNode = getTextNodeAtIndex(startElement, start.textNodeIndex);
+    if (!startTextNode) {
+      log("rangeFromDomRange: Could not find start text node at index " + start.textNodeIndex);
+      return null;
+    }
+
+    // Validate end CSS selector
+    if (!end.cssSelector) {
+      log("rangeFromDomRange: end.cssSelector is empty");
+      return null;
+    }
+
+    // Find end container
+    const endElement = document.querySelector(end.cssSelector);
+    if (!endElement) {
+      log("rangeFromDomRange: Could not find end element: " + end.cssSelector);
+      return null;
+    }
+
+    const endTextNode = getTextNodeAtIndex(endElement, end.textNodeIndex);
+    if (!endTextNode) {
+      log("rangeFromDomRange: Could not find end text node at index " + end.textNodeIndex);
+      return null;
+    }
+
+    // Create the range
+    const range = document.createRange();
+
+    // Clamp offsets to valid range (handle undefined, null, and negative values)
+    const startOffset = Math.min(Math.max(start.charOffset ?? 0, 0), startTextNode.length);
+    const endOffset = Math.min(Math.max(end.charOffset ?? 0, 0), endTextNode.length);
+
+    range.setStart(startTextNode, startOffset);
+    range.setEnd(endTextNode, endOffset);
+
+    // Zero-length selections (collapsed ranges) don't represent a valid text selection
+    if (range.collapsed) {
+      log("rangeFromDomRange: Range is collapsed (zero-length selection)");
+      return null;
+    }
+
+    return range;
+  } catch (e) {
+    log("rangeFromDomRange: Error creating range: " + e.message);
+    logError(e);
+    return null;
+  }
+}
+
+/**
+ * Gets the text node at the given index within an element.
+ */
+function getTextNodeAtIndex(element, index) {
+  let textNodeIndex = 0;
+  for (const child of element.childNodes) {
+    if (child.nodeType === Node.TEXT_NODE) {
+      if (textNodeIndex === index) {
+        return child;
+      }
+      textNodeIndex++;
+    }
+  }
   return null;
 }
 

@@ -228,6 +228,19 @@ public struct Locator: Hashable, CustomStringConvertible, Loggable, Sendable {
         /// Syntactic sugar to access the `otherLocations` values by subscripting `Locations` directly.
         /// locations["cssSelector"] == locations.otherLocations["cssSelector"]
         public subscript(key: String) -> Any? { otherLocations[key] }
+
+        /// Returns a copy with the given key-value pair added to otherLocations.
+        public func adding(_ key: String, value: Any) -> Locations {
+            var newOtherLocations = otherLocations
+            newOtherLocations[key] = value
+            return Locations(
+                fragments: fragments,
+                progression: progression,
+                totalProgression: totalProgression,
+                position: position,
+                otherLocations: newOtherLocations
+            )
+        }
     }
 
     public struct Text: Hashable, Loggable, Sendable {

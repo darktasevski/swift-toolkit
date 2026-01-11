@@ -1241,7 +1241,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         delegate?.navigator(self, didActivateImageAt: url, altText: altText, caption: caption, attribution: attribution)
     }
 
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect) {
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {
         guard
             let locator = currentLocation,
             let text = text
@@ -1249,8 +1249,19 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             viewModel.editingActions.selection = nil
             return
         }
+
+        // Create the selection locator, including domRange in otherLocations if available
+        let selectionLocator = locator.copy(
+            locations: { locations in
+                if let domRange = domRange {
+                    locations = locations.adding("domRange", value: domRange.json)
+                }
+            },
+            text: { $0 = text }
+        )
+
         viewModel.editingActions.selection = Selection(
-            locator: locator.copy(text: { $0 = text }),
+            locator: selectionLocator,
             frame: frame
         )
     }

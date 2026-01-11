@@ -28,7 +28,11 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?)
 
     /// Called when the text selection changes.
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect)
+    /// - Parameters:
+    ///   - text: The selected text with context
+    ///   - frame: The bounding rectangle of the selection
+    ///   - domRange: The DOM range for anchoring highlights (optional)
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?)
 
     /// Called when the pages visible in the spread changed.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
@@ -328,7 +332,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private func selectionDidChange(_ body: Any) {
         if body is NSNull {
             focusedResource = nil
-            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero)
+            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
             return
         }
 
@@ -340,14 +344,23 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             var frame = CGRect(json: selection["rect"])
         else {
             focusedResource = nil
-            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero)
+            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
             log(.warning, "Invalid body for selectionDidChange: \(body)")
             return
         }
 
+        // Parse domRange from JavaScript (optional, used for precise highlight anchoring)
+        let domRange: DOMRange?
+        do {
+            domRange = try DOMRange(json: selection["domRange"])
+        } catch {
+            log(.debug, "Failed to parse domRange: \(error)")
+            domRange = nil
+        }
+
         focusedResource = viewModel.readingOrder.firstIndexWithHREF(href)
         frame.origin = convertPointToNavigatorSpace(frame.origin)
-        delegate?.spreadView(self, selectionDidChange: text, frame: frame)
+        delegate?.spreadView(self, selectionDidChange: text, frame: frame, domRange: domRange)
     }
 
     /// Update webview style to userSettings.
