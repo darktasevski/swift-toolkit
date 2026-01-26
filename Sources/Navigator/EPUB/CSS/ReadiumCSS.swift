@@ -23,6 +23,56 @@ struct ReadiumCSS {
 extension ReadiumCSS {
     mutating func update(with settings: EPUBSettings) {
         layout = settings.cssLayout
+
+        // MARK: - Dynamic RS Properties Update
+        //
+        // Update `rsProperties.baseFontFamily` based on the `publisherStyles` setting.
+        //
+        // ## Why This Is Needed
+        //
+        // ReadiumCSS applies a default base font family to the `html` element via
+        // `--RS__baseFontFamily` (defined in ReadiumCSS-before.css as "Iowan Old Style",
+        // Palatino, etc.). This default is applied regardless of user preferences.
+        //
+        // When `publisherStyles` is enabled, users expect to see the publisher's original
+        // fonts - including any fonts embedded in the EPUB via @font-face declarations.
+        // However, many EPUBs don't explicitly set a font on `html` or `body`; they rely
+        // on CSS inheritance and browser defaults. In those cases, Readium's default
+        // "Iowan Old Style" takes precedence over the publisher's intended fonts.
+        //
+        // ## Solution
+        //
+        // When `publisherStyles` is true, we set `baseFontFamily` to `["inherit"]`, which
+        // generates `--RS__baseFontFamily: inherit` in the CSS. This allows the publisher's
+        // font declarations (or the browser's default serif) to take effect.
+        //
+        // When `publisherStyles` is false, we reset to `nil` to restore Readium's default
+        // font stack, ensuring consistent typography when user customization is enabled.
+        //
+        // ## Use Cases
+        //
+        // 1. **EPUBs with embedded fonts**: Publishers embed custom fonts (e.g., EB Garamond,
+        //    Roboto) via @font-face. With `publisherStyles` enabled, these fonts now display
+        //    correctly instead of being overridden by "Iowan Old Style".
+        //
+        // 2. **EPUBs relying on system fonts**: Some EPUBs specify `font-family: serif` or
+        //    `font-family: Georgia` on body text. These declarations now take effect when
+        //    `publisherStyles` is enabled.
+        //
+        // 3. **Dynamic toggling**: Users can toggle "Use Publisher Styles" in the reader
+        //    settings, and the font change applies immediately without needing to reload
+        //    the book or recreate the navigator.
+        //
+        // 4. **Comparison with Apple Books**: Apple Books shows the publisher's original
+        //    fonts when "Original" is selected. This change achieves parity with that
+        //    behavior.
+        //
+        if settings.publisherStyles {
+            rsProperties.baseFontFamily = ["inherit"]
+        } else {
+            rsProperties.baseFontFamily = nil
+        }
+
         userProperties = CSSUserProperties(
             view: settings.scroll ? .scroll : .paged,
             colCount: {
