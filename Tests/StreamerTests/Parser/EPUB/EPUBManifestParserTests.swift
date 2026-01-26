@@ -17,10 +17,10 @@ class EPUBManifestParserTests: XCTestCase {
             "EPUB/content.opf": "OPF/full-metadata.opf",
         ])
 
-        let manifest = try await sut.parseManifest()
+        let result = try await sut.parseManifest()
 
         XCTAssertEqual(
-            manifest,
+            result.manifest,
             Manifest(
                 metadata: Metadata(
                     identifier: "urn:uuid:7408D53A-5383-40AA-8078-5256C872AE41",
@@ -91,10 +91,10 @@ class EPUBManifestParserTests: XCTestCase {
             "EPUB/nav.xhtml": "Navigation Documents/full-metadata-nav.xhtml",
         ])
 
-        let manifest = try await sut.parseManifest()
+        let result = try await sut.parseManifest()
 
         XCTAssertEqual(
-            manifest.readingOrder,
+            result.manifest.readingOrder,
             [
                 link(href: "EPUB/titlepage.xhtml", mediaType: .xhtml, rels: [.cover]),
                 link(href: "EPUB/toc.xhtml", mediaType: .xhtml, rels: [.contents]),
@@ -110,10 +110,10 @@ class EPUBManifestParserTests: XCTestCase {
             "EPUB/content.opf": "OPF/guide-epub2.opf",
         ])
 
-        let manifest = try await sut.parseManifest()
+        let result = try await sut.parseManifest()
 
         XCTAssertEqual(
-            manifest.subcollections["landmarks"],
+            result.manifest.subcollections["landmarks"],
             [PublicationCollection(links: [
                 link(href: "EPUB/toc.xhtml", title: "Table of Contents", rels: [.contents]),
                 link(href: "EPUB/toc.xhtml#figures", title: "List Of Illustrations", rels: ["http://idpf.org/epub/vocab/structure/#loi"]),
@@ -122,7 +122,7 @@ class EPUBManifestParserTests: XCTestCase {
         )
 
         XCTAssertEqual(
-            manifest.readingOrder,
+            result.manifest.readingOrder,
             [
                 link(href: "EPUB/titlepage.xhtml", mediaType: .xhtml),
                 link(href: "EPUB/beginpage.xhtml", mediaType: .xhtml, rels: [.start]),
