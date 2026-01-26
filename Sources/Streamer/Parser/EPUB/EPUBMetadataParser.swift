@@ -307,6 +307,38 @@ final class EPUBMetadataParser: Loggable {
         dcElement(tag: "identifier[@id=/opf:package/@unique-identifier]")?
             .stringValue
 
+    /// Returns a UUID identifier for Adobe font deobfuscation.
+    /// Adobe font obfuscation requires a UUID-based key, but some EPUBs use a non-UUID
+    /// as their unique-identifier. In those cases, we look for any dc:identifier that
+    /// contains a UUID (with or without the "urn:uuid:" prefix).
+    lazy var adobeFontDeobfuscationId: String? = {
+        // First, check if the unique identifier is already a UUID
+        if let uniqueId = uniqueIdentifier, isUUID(uniqueId) {
+            return uniqueId
+        }
+
+        // Otherwise, look for any dc:identifier that is a UUID
+        let identifiers = metas["identifier", in: .dcterms]
+        for meta in identifiers {
+            let content = meta.content
+            if isUUID(content) {
+                return content
+            }
+        }
+
+        return nil
+    }()
+
+    /// Checks if the given string is a UUID (with or without urn:uuid: prefix)
+    private func isUUID(_ string: String) -> Bool {
+        var normalized = string.trimmingCharacters(in: .whitespacesAndNewlines)
+        // RFC 4122: The URN namespace identifier is case-insensitive
+        if normalized.lowercased().hasPrefix("urn:uuid:") {
+            normalized = String(normalized.dropFirst(9))
+        }
+        return UUID(uuidString: normalized) != nil
+    }
+
     /// https://github.com/readium/architecture/blob/master/streamer/parser/metadata.md#publication-date
     private lazy var publishedDate =
         dcElement(tag: "date[not(@opf:event) or @opf:event='publication']")?

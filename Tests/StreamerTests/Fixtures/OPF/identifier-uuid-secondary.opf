@@ -1,0 +1,17 @@
+<?xml version="1.0"?>
+<!-- Simulates EPUBs like "Tender Is the Flesh" where the unique-identifier is NOT a UUID
+     but a secondary dc:identifier contains the UUID needed for Adobe font deobfuscation -->
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Test Book</dc:title>
+    <dc:identifier id="uid">2049042252</dc:identifier>
+    <dc:identifier opf:scheme="UUID">urn:uuid:7e0343ed-f601-4690-9a27-50936af0b279</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml" />
+  </manifest>
+  <spine>
+    <itemref idref="titlepage"/>
+  </spine>
+</package>

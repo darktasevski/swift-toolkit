@@ -59,15 +59,21 @@ public final class EPUBParser: PublicationParser {
             // `Encryption` indexed by HREF.
             let encryptions = await (try? EPUBEncryptionParser(container: container))?.parseEncryptions() ?? [:]
 
-            let manifest = try await EPUBManifestParser(
+            let parserResult = try await EPUBManifestParser(
                 container: asset.container,
                 encryptions: encryptions
             ).parseManifest()
 
-            let deobfuscator = EPUBDeobfuscator(publicationId: manifest.metadata.identifier ?? "", encryptions: encryptions)
+            // For Adobe font deobfuscation, prefer the UUID-based identifier if available,
+            // otherwise fall back to the main publication identifier.
+            let deobfuscationId = parserResult.adobeFontDeobfuscationId
+                ?? parserResult.manifest.metadata.identifier
+                ?? ""
+
+            let deobfuscator = EPUBDeobfuscator(publicationId: deobfuscationId, encryptions: encryptions)
 
             return .success(Publication.Builder(
-                manifest: manifest,
+                manifest: parserResult.manifest,
                 container: container.map { url, resource in
                     deobfuscator.deobfuscate(resource: resource, at: url)
                 },

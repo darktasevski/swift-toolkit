@@ -90,6 +90,10 @@ final class OPFParser: Loggable {
         let readingOrder: [Link]
         let resources: [Link]
         let epub2Guide: [Link]
+        /// UUID identifier for Adobe font deobfuscation, if available.
+        /// This may differ from the main identifier when the EPUB uses a non-UUID
+        /// as its unique-identifier but includes a UUID in another dc:identifier.
+        let adobeFontDeobfuscationId: String?
     }
 
     /// Parse the OPF file of the EPUB container and return a `Publication`.
@@ -97,7 +101,8 @@ final class OPFParser: Loggable {
     func parsePublication() throws -> Package {
         let manifestItems = parseManifestItems()
         let (resources, readingOrder) = splitResourcesAndReadingOrderLinks(manifestItems)
-        var metadata = try EPUBMetadataParser(document: document, displayOptions: displayOptions, metas: metas).parse()
+        let metadataParser = EPUBMetadataParser(document: document, displayOptions: displayOptions, metas: metas)
+        var metadata = try metadataParser.parse()
 
         // If all reading order items are bitmaps, we infer a Divina.
         if readingOrder.allAreBitmap {
@@ -110,7 +115,8 @@ final class OPFParser: Loggable {
             metadata: metadata,
             readingOrder: readingOrder,
             resources: resources,
-            epub2Guide: parseEPUB2Guide()
+            epub2Guide: parseEPUB2Guide(),
+            adobeFontDeobfuscationId: metadataParser.adobeFontDeobfuscationId
         )
     }
 

@@ -11,12 +11,18 @@ final class EPUBManifestParser {
     private let container: Container
     private let encryptions: [RelativeURL: Encryption]
 
+    struct ParsedManifest {
+        let manifest: Manifest
+        /// UUID identifier for Adobe font deobfuscation, if available.
+        let adobeFontDeobfuscationId: String?
+    }
+
     init(container: Container, encryptions: [RelativeURL: Encryption]) {
         self.container = container
         self.encryptions = encryptions
     }
 
-    func parseManifest() async throws -> Manifest {
+    func parseManifest() async throws -> ParsedManifest {
         let opfHREF = try await EPUBContainerParser(container: container).parseOPFHREF()
 
         // Extracts metadata and links from the OPF.
@@ -32,7 +38,10 @@ final class EPUBManifestParser {
 
         fillReadingOrderRels(in: &manifest)
 
-        return manifest
+        return ParsedManifest(
+            manifest: manifest,
+            adobeFontDeobfuscationId: opfPackage.adobeFontDeobfuscationId
+        )
     }
 
     /// Extracts the link relations from the landmarks to fill in the reading

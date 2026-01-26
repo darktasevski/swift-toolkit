@@ -1,0 +1,16 @@
+<?xml version="1.0"?>
+<!-- No UUID in any identifier - adobeFontDeobfuscationId should return nil -->
+<package xmlns="http://www.idpf.org/2007/opf" unique-identifier="uid" version="2.0">
+  <metadata xmlns:dc="http://purl.org/dc/elements/1.1/"
+      xmlns:opf="http://www.idpf.org/2007/opf">
+    <dc:title>Test Book</dc:title>
+    <dc:identifier id="uid">978-1-234567-89-0</dc:identifier>
+    <dc:identifier opf:scheme="ASIN">B08285V3C4</dc:identifier>
+  </metadata>
+  <manifest>
+    <item id="titlepage" href="titlepage.xhtml" media-type="application/xhtml+xml" />
+  </manifest>
+  <spine>
+    <itemref idref="titlepage"/>
+  </spine>
+</package>

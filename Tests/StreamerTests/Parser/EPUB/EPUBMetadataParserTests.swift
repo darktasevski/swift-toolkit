@@ -339,18 +339,52 @@ class EPUBMetadataParserTests: XCTestCase {
         )
     }
 
+    // MARK: - Adobe Font Deobfuscation ID
+
+    /// When unique-identifier is already a UUID, adobeFontDeobfuscationId should return it.
+    func testAdobeFontDeobfuscationIdFromUniqueIdentifier() throws {
+        let sut = try makeParser("identifier-uuid-unique")
+        XCTAssertEqual(sut.adobeFontDeobfuscationId, "urn:uuid:36d5078e-ff7d-468e-a5f3-f47c14b91f2f")
+    }
+
+    /// When unique-identifier is NOT a UUID but another dc:identifier contains one,
+    /// adobeFontDeobfuscationId should find and return the UUID.
+    /// This is the case for EPUBs like "Tender Is the Flesh" with Adobe font obfuscation.
+    func testAdobeFontDeobfuscationIdFromSecondaryIdentifier() throws {
+        let sut = try makeParser("identifier-uuid-secondary")
+        // The unique identifier is "2049042252" (not a UUID)
+        // but the secondary identifier contains the UUID
+        XCTAssertEqual(sut.adobeFontDeobfuscationId, "urn:uuid:7e0343ed-f601-4690-9a27-50936af0b279")
+    }
+
+    /// When no UUID exists in any identifier, adobeFontDeobfuscationId should return nil.
+    func testAdobeFontDeobfuscationIdReturnsNilWhenNoUUID() throws {
+        let sut = try makeParser("identifier-no-uuid")
+        XCTAssertNil(sut.adobeFontDeobfuscationId)
+    }
+
+    /// UUID without urn:uuid: prefix should still be detected.
+    func testAdobeFontDeobfuscationIdWithoutUrnPrefix() throws {
+        let sut = try makeParser("identifier-uuid-no-prefix")
+        XCTAssertEqual(sut.adobeFontDeobfuscationId, "36d5078e-ff7d-468e-a5f3-f47c14b91f2f")
+    }
+
     // MARK: - Toolkit
 
     func parseMetadata(_ name: String, displayOptions: String? = nil) throws -> Metadata {
+        try makeParser(name, displayOptions: displayOptions).parse()
+    }
+
+    func makeParser(_ name: String, displayOptions: String? = nil) throws -> EPUBMetadataParser {
         func parseDocument(named name: String, type: String) throws -> ReadiumFuzi.XMLDocument {
             try XMLDocument(data: fixtures.data(at: "\(name).\(type)"))
         }
 
         let document = try parseDocument(named: name, type: "opf")
-        return try EPUBMetadataParser(
+        return EPUBMetadataParser(
             document: document,
             displayOptions: displayOptions.map { try parseDocument(named: $0, type: "xml") },
             metas: OPFMetaList(document: document)
-        ).parse()
+        )
     }
 }
