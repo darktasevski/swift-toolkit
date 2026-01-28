@@ -9,6 +9,50 @@ import AudioToolbox
 import AVFoundation
 import Foundation
 import ReadiumShared
+import Synchronization
+
+// MARK: - Silence Skip Configuration
+
+/// Configuration for automatic silence skipping in audiobook playback.
+///
+/// This type is defined locally in swift-toolkit to avoid coupling with the app's Domain layer.
+/// The app should map between its Domain.SilenceSkipConfiguration and this type.
+public struct SilenceSkipConfiguration: Sendable, Equatable, Codable, Hashable {
+    /// Whether silence skipping is enabled.
+    public var enabled: Bool
+
+    /// Detection sensitivity level.
+    public var sensitivity: Sensitivity
+
+    public init(
+        enabled: Bool = false,
+        sensitivity: Sensitivity = .balanced
+    ) {
+        self.enabled = enabled
+        self.sensitivity = sensitivity
+    }
+
+    /// Sensitivity presets for silence detection.
+    public enum Sensitivity: String, Sendable, Codable, CaseIterable, Hashable {
+        /// Conservative: only skips dead silence (-40 dB threshold).
+        case gentle
+
+        /// Default: balanced detection (-45 dB threshold).
+        case balanced
+
+        /// Aggressive: skips quieter gaps (-50 dB threshold).
+        case aggressive
+
+        /// The dB threshold below which audio is considered silence.
+        public var thresholdDb: Float {
+            switch self {
+            case .gentle: -40
+            case .balanced: -45
+            case .aggressive: -50
+            }
+        }
+    }
+}
 
 /// Audio playback engine with DSP capabilities for voice enhancement and normalization.
 ///
@@ -89,7 +133,41 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         set {
             currentRate = newValue
             timePitchNode.rate = newValue
+            // Update user rate for silence skip (so we restore to correct speed after skip)
+            silenceState.withLock { $0.userRate = newValue }
         }
+    }
+
+    /// Configuration for automatic silence skipping.
+    public var silenceSkipConfiguration: SilenceSkipConfiguration {
+        get { silenceState.withLock { $0.config } }
+        set {
+            // Capture values atomically before spawning Task
+            let enabled = newValue.enabled
+            let resetState = !enabled
+
+            silenceState.withLock { state in
+                state.config = newValue
+                if resetState {
+                    state.detectionState = .speech
+                }
+            }
+
+            // Rate reset must happen on main actor
+            if resetState {
+                Task { @MainActor in
+                    let userRate = self.silenceState.withLock { $0.userRate }
+                    if self.timePitchNode.rate != userRate {
+                        self.scheduleRateRamp(to: userRate)
+                    }
+                }
+            }
+        }
+    }
+
+    /// Updates the user's chosen playback rate (preserved during silence skip).
+    public func setUserRate(_ rate: Float) {
+        silenceState.withLock { $0.userRate = rate }
     }
 
     public func load(_ asset: AVURLAsset, originalFileURL: URL?) async throws {
@@ -191,6 +269,16 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
             isPlaying = false
         }
 
+        // Reset silence detection state on seek to prevent being stuck in sped-up state
+        let userRate = silenceState.withLock { state in
+            state.detectionState = .speech
+            return state.userRate
+        }
+        // Restore user's rate if we were in a speed-up state
+        if timePitchNode.rate != userRate {
+            timePitchNode.rate = userRate
+        }
+
         // Update seek offset
         seekOffset = time
         lastKnownTime = time
@@ -215,6 +303,14 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         seekOffset = 0
         lastKnownTime = 0
         stopTimeUpdates()
+
+        // Cancel any in-progress rate ramp
+        cancelRateRamp()
+
+        // Reset silence skip state
+        silenceState.withLock { state in
+            state.detectionState = .speech
+        }
 
         // Clean up FFT resources
         if let fftSetup = fftSetup {
@@ -267,17 +363,17 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     /// 3. FFT processing must be moved off the audio thread to prevent dropouts
     private let fftQueue = DispatchQueue(label: "com.readium.audio.fft", qos: .userInteractive)
 
-    /// Flag to track if FFT processing is in progress (for frame dropping).
-    private var isProcessingFFT = false
+    /// Thread-safe state for FFT processing coordination.
+    /// Uses Mutex for consistency with silence skip state (Swift 6 pattern).
+    private struct FFTProcessingState: Sendable {
+        var isProcessing = false
+        var lastUpdateTime: CFAbsoluteTime = 0
+    }
 
-    /// Lock for thread-safe access to isProcessingFFT flag.
-    private let fftLock = NSLock()
+    private let fftProcessingState = Mutex(FFTProcessingState())
 
     /// Minimum interval between audio level updates (throttling to ~25Hz).
     private let levelUpdateMinInterval: TimeInterval = 0.04
-
-    /// Last time audio levels were emitted.
-    private var lastLevelUpdateTime: CFAbsoluteTime = 0
 
     // MARK: - FFT Properties
 
@@ -314,6 +410,34 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         static let boundaries: [Float] = [20, 150, 400, 2000, 6000, 20000]
         static let count = 5
     }
+
+    // MARK: - Silence Skip State (Thread-Safe)
+
+    /// Thread-safe container for silence detection state.
+    /// Accessed from audio processing queue and main actor.
+    private struct SilenceSkipState: Sendable {
+        var config = SilenceSkipConfiguration()
+        var detectionState = DetectionState.speech
+        var userRate: Float = 1.0
+
+        enum DetectionState: Equatable, Sendable {
+            case speech
+            case maybeSilent(since: TimeInterval) // CACurrentMediaTime
+            case speedingUp(since: TimeInterval) // CACurrentMediaTime
+            case seeking
+        }
+    }
+
+    private let silenceState = Mutex(SilenceSkipState())
+
+    // Silence skip thresholds (immutable, no synchronization needed)
+    private let minimumSilenceDuration: TimeInterval = 0.4
+    private let longSilenceThreshold: TimeInterval = 2.0
+    private let silencePlaybackRate: Float = 2.5
+    private let rateRampDuration: TimeInterval = 0.1
+
+    /// Task for current rate ramp animation (for cancellation).
+    private var rampTask: Task<Void, Never>?
 
     // MARK: - Audio Engine Setup
 
@@ -579,6 +703,36 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         }
     }
 
+    // MARK: - Silence Skip Rate Ramping
+
+    /// Smoothly ramps playback rate to prevent audio artifacts.
+    /// Must be called from MainActor since it accesses timePitchNode.rate.
+    @MainActor
+    private func scheduleRateRamp(to targetRate: Float) {
+        rampTask?.cancel()
+        rampTask = Task { [weak self] in
+            guard let self else { return }
+            let startRate = timePitchNode.rate
+            let steps = 10
+            let stepDuration = rateRampDuration / Double(steps)
+
+            for i in 1...steps {
+                guard !Task.isCancelled else { return }
+                let progress = Float(i) / Float(steps)
+                let newRate = startRate + (targetRate - startRate) * progress
+                self.timePitchNode.rate = newRate
+                try? await Task.sleep(for: .seconds(stepDuration))
+            }
+        }
+    }
+
+    /// Cancels any in-progress rate ramp. Called from stop().
+    @MainActor
+    private func cancelRateRamp() {
+        rampTask?.cancel()
+        rampTask = nil
+    }
+
     // MARK: - Time Updates
 
     private func startTimeUpdates() {
@@ -612,13 +766,15 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         mixerNode.installTap(onBus: 0, bufferSize: levelMeteringBufferSize, format: format) { [weak self] buffer, _ in
             guard let self else { return }
 
+            // Silence detection runs on every buffer (lightweight RMS calculation)
+            self.detectAndHandleSilence(buffer)
+
             // Drop frames if FFT processing can't keep up (prevents audio thread blocking)
-            self.fftLock.lock()
-            let shouldProcess = !self.isProcessingFFT
-            if shouldProcess {
-                self.isProcessingFFT = true
+            let shouldProcess = self.fftProcessingState.withLock { state in
+                guard !state.isProcessing else { return false }
+                state.isProcessing = true
+                return true
             }
-            self.fftLock.unlock()
 
             guard shouldProcess else { return }
 
@@ -643,9 +799,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         fftQueue.sync {}
 
         // Reset processing flag
-        fftLock.lock()
-        isProcessingFFT = false
-        fftLock.unlock()
+        fftProcessingState.withLock { $0.isProcessing = false }
 
         // Send silent levels when stopping
         Task { @MainActor [weak self] in
@@ -660,9 +814,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     private func processAudioBuffer(_ buffer: AVAudioPCMBuffer) {
         defer {
             // Clear processing flag to allow next frame
-            fftLock.lock()
-            isProcessingFFT = false
-            fftLock.unlock()
+            fftProcessingState.withLock { $0.isProcessing = false }
         }
 
         guard let channelData = buffer.floatChannelData,
@@ -712,13 +864,11 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
 
         // Throttle updates to reduce MainActor hops (thread-safe access)
         let now = CFAbsoluteTimeGetCurrent()
-        let shouldUpdate: Bool = {
-            fftLock.lock()
-            defer { fftLock.unlock() }
-            guard now - lastLevelUpdateTime >= levelUpdateMinInterval else { return false }
-            lastLevelUpdateTime = now
+        let shouldUpdate = fftProcessingState.withLock { state in
+            guard now - state.lastUpdateTime >= levelUpdateMinInterval else { return false }
+            state.lastUpdateTime = now
             return true
-        }()
+        }
         guard shouldUpdate else { return }
 
         // Apply smoothing on main thread
@@ -785,6 +935,99 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         }
 
         return bandLevels
+    }
+
+    // MARK: - Silence Skip Detection
+
+    /// Called from audio tap callback (audio processing queue).
+    /// Reports events to delegate; does NOT accumulate state.
+    private func detectAndHandleSilence(_ buffer: AVAudioPCMBuffer) {
+        guard let channelData = buffer.floatChannelData,
+              buffer.format.sampleRate > 0 else { return }
+
+        // Read config atomically
+        let config = silenceState.withLock { $0.config }
+        guard config.enabled else { return }
+
+        let frameLength = vDSP_Length(buffer.frameLength)
+        var rms: Float = 0
+
+        // Calculate RMS (root mean square)
+        vDSP_rmsqv(channelData[0], 1, &rms, frameLength)
+
+        // Convert to dB
+        let db = 20 * log10(max(rms, 1e-10))
+        let isSilent = db < config.sensitivity.thresholdDb
+
+        // Use monotonic time (not wall clock) to avoid NTP sync jumps
+        let now = CACurrentMediaTime()
+        let bufferDuration = Double(buffer.frameLength) / buffer.format.sampleRate
+
+        // Capture currentTime before acquiring lock to avoid accessing @MainActor state inside lock.
+        // This is safe because currentTime is a computed property reading from audio engine state.
+        let capturedCurrentTime = currentTime
+
+        // State machine with atomic access
+        silenceState.withLock { state in
+            switch (state.detectionState, isSilent) {
+            case (.speech, true):
+                // Speech → potential silence
+                state.detectionState = .maybeSilent(since: now)
+
+            case (.maybeSilent(let since), true):
+                let silenceDuration = now - since
+
+                if silenceDuration >= longSilenceThreshold {
+                    // Long silence: hard seek
+                    state.detectionState = .seeking
+                    let skipTo = capturedCurrentTime + silenceDuration
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        await self.seek(to: skipTo)
+                        self.silenceState.withLock { $0.detectionState = .speech }
+                        // Report skip event with duration - TCA accumulates
+                        self.delegate?.engine(self, didSkipSilence: silenceDuration)
+                    }
+                } else if silenceDuration >= minimumSilenceDuration {
+                    // Short silence: speed up
+                    state.detectionState = .speedingUp(since: now)
+                    let userRate = state.userRate
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.scheduleRateRamp(to: self.silencePlaybackRate * userRate)
+                        self.delegate?.engine(self, silenceSkipStateChanged: true)
+                    }
+                }
+
+            case (.maybeSilent, false):
+                // False alarm - back to speech
+                state.detectionState = .speech
+
+            case (.speedingUp, true):
+                // Still in short silence - calculate time saved this buffer
+                // Report to delegate; TCA accumulates
+                let effectiveRate = silencePlaybackRate
+                let savedThisBuffer = bufferDuration * Double(effectiveRate - 1) / Double(effectiveRate)
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.delegate?.engine(self, didAccumulateTimeSaved: savedThisBuffer)
+                }
+
+            case (.speedingUp, false):
+                // Silence ended - return to normal
+                state.detectionState = .speech
+                let userRate = state.userRate
+                Task { @MainActor [weak self] in
+                    guard let self else { return }
+                    self.scheduleRateRamp(to: userRate)
+                    self.delegate?.engine(self, silenceSkipStateChanged: false)
+                }
+
+            case (.speech, false), (.seeking, _):
+                // Normal speech or seeking - no action
+                break
+            }
+        }
     }
 
     // MARK: - URL Extraction

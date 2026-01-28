@@ -72,12 +72,26 @@ public protocol AudioPlaybackEngineDelegate: AnyObject {
     ///   - engine: The audio engine.
     ///   - levels: Audio level data containing normalized levels (0.0 to 1.0).
     func engine(_ engine: any AudioPlaybackEngine, didUpdateAudioLevels levels: AudioLevelData)
+
+    /// Called when silence skip state changes (started/stopped skipping).
+    func engine(_ engine: any AudioPlaybackEngine, silenceSkipStateChanged isSkipping: Bool)
+
+    /// Called after a silence gap was hard-skipped.
+    /// Note: Duration is approximate - measured from detection start to seek trigger.
+    func engine(_ engine: any AudioPlaybackEngine, didSkipSilence duration: TimeInterval)
+
+    /// Called with time saved delta during speed-up (per buffer).
+    /// TCA feature accumulates these deltas.
+    func engine(_ engine: any AudioPlaybackEngine, didAccumulateTimeSaved delta: TimeInterval)
 }
 
 /// Default implementations for optional delegate methods.
 public extension AudioPlaybackEngineDelegate {
     func engine(_ engine: any AudioPlaybackEngine, didUpdateLoadedTimeRanges ranges: [Range<Double>]) {}
     func engine(_ engine: any AudioPlaybackEngine, didUpdateAudioLevels levels: AudioLevelData) {}
+    func engine(_ engine: any AudioPlaybackEngine, silenceSkipStateChanged isSkipping: Bool) {}
+    func engine(_ engine: any AudioPlaybackEngine, didSkipSilence duration: TimeInterval) {}
+    func engine(_ engine: any AudioPlaybackEngine, didAccumulateTimeSaved delta: TimeInterval) {}
 }
 
 /// Protocol abstracting audio playback functionality.

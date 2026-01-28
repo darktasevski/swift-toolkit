@@ -67,6 +67,15 @@ public struct MediaPlaybackInfo: Equatable, Sendable {
     ///   - navigator: The audio navigator.
     ///   - levels: Audio level data containing normalized levels (0.0 to 1.0).
     func navigator(_ navigator: AudioNavigator, didUpdateAudioLevels levels: AudioLevelData)
+
+    /// Called when silence skip state changes (started/stopped skipping).
+    func navigator(_ navigator: AudioNavigator, silenceSkipStateChanged isSkipping: Bool)
+
+    /// Called after a silence gap was hard-skipped.
+    func navigator(_ navigator: AudioNavigator, didSkipSilence duration: TimeInterval)
+
+    /// Called with time saved delta during speed-up (per buffer).
+    func navigator(_ navigator: AudioNavigator, didAccumulateTimeSaved delta: TimeInterval)
 }
 
 public extension AudioNavigatorDelegate {
@@ -77,6 +86,12 @@ public extension AudioNavigatorDelegate {
     func navigator(_ navigator: AudioNavigator, loadedTimeRangesDidChange ranges: [Range<Double>]) {}
 
     func navigator(_ navigator: AudioNavigator, didUpdateAudioLevels levels: AudioLevelData) {}
+
+    func navigator(_ navigator: AudioNavigator, silenceSkipStateChanged isSkipping: Bool) {}
+
+    func navigator(_ navigator: AudioNavigator, didSkipSilence duration: TimeInterval) {}
+
+    func navigator(_ navigator: AudioNavigator, didAccumulateTimeSaved delta: TimeInterval) {}
 }
 
 /// Navigator for audio-based publications such as:
@@ -492,6 +507,15 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
             defaults: config.defaults
         )
     }
+
+    /// Sets the silence skip configuration on the audio engine.
+    ///
+    /// - Parameter config: The silence skip configuration.
+    public func setSilenceSkipConfiguration(_ config: SilenceSkipConfiguration) {
+        if let enhancedEngine = engine as? EnhancedAudioEngine {
+            enhancedEngine.silenceSkipConfiguration = config
+        }
+    }
 }
 
 // MARK: - AudioPlaybackEngineDelegate
@@ -532,6 +556,24 @@ extension AudioNavigator: AudioPlaybackEngineDelegate {
     public func engine(_ engine: any AudioPlaybackEngine, didUpdateAudioLevels levels: AudioLevelData) {
         Task { @MainActor in
             delegate?.navigator(self, didUpdateAudioLevels: levels)
+        }
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, silenceSkipStateChanged isSkipping: Bool) {
+        Task { @MainActor in
+            delegate?.navigator(self, silenceSkipStateChanged: isSkipping)
+        }
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, didSkipSilence duration: TimeInterval) {
+        Task { @MainActor in
+            delegate?.navigator(self, didSkipSilence: duration)
+        }
+    }
+
+    public func engine(_ engine: any AudioPlaybackEngine, didAccumulateTimeSaved delta: TimeInterval) {
+        Task { @MainActor in
+            delegate?.navigator(self, didAccumulateTimeSaved: delta)
         }
     }
 
