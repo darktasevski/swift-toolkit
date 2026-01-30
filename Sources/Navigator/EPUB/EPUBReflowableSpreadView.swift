@@ -186,13 +186,91 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return false
         }
 
-        scrollView.setContentOffset(newOffset, animated: options.animated)
+        // FORK: Apply custom page turn animation based on options
+        let animationType = options.paginationAnimationType
+        let duration = options.pageTurnDuration
 
-        // This delay is only used when turning pages in a single resource if
-        // the page turn is animated. The delay is roughly the length of the
-        // animation.
-        // TODO: completion should be implemented using scroll view delegates
-        try? await Task.sleep(seconds: 0.3)
+        switch animationType {
+        case .none:
+            scrollView.setContentOffset(newOffset, animated: false)
+
+        case .slide:
+            // Native scroll animation
+            await withCheckedContinuation { continuation in
+                UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut) {
+                    self.scrollView.contentOffset = newOffset
+                } completion: { _ in
+                    continuation.resume()
+                }
+            }
+
+        case .fade:
+            // Fade out, scroll instantly, fade in
+            let halfDuration = duration / 2
+            await withCheckedContinuation { continuation in
+                UIView.animate(withDuration: halfDuration, delay: 0, options: .curveEaseIn) {
+                    self.webView.alpha = 0
+                } completion: { _ in
+                    continuation.resume()
+                }
+            }
+            scrollView.setContentOffset(newOffset, animated: false)
+            await withCheckedContinuation { continuation in
+                UIView.animate(withDuration: halfDuration, delay: 0, options: .curveEaseOut) {
+                    self.webView.alpha = 1
+                } completion: { _ in
+                    continuation.resume()
+                }
+            }
+
+        case .cover, .reveal:
+            // Cover/reveal require snapshot-based animation for within-chapter navigation
+            // Create a snapshot of the current page
+            let snapshot = webView.snapshotView(afterScreenUpdates: false)
+
+            if let snapshot = snapshot {
+                snapshot.frame = webView.bounds
+                webView.superview?.addSubview(snapshot)
+
+                // Position and animate based on type
+                if animationType == .cover {
+                    // Scroll instantly, then animate snapshot off
+                    scrollView.setContentOffset(newOffset, animated: false)
+                    let exitOffset = -offsetX // Opposite direction
+                    await withCheckedContinuation { continuation in
+                        UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut) {
+                            snapshot.transform = CGAffineTransform(translationX: exitOffset, y: 0)
+                        } completion: { _ in
+                            snapshot.removeFromSuperview()
+                            continuation.resume()
+                        }
+                    }
+                } else {
+                    // Reveal: animate snapshot away, then it reveals new content underneath
+                    // First scroll to show new content underneath
+                    scrollView.setContentOffset(newOffset, animated: false)
+                    // Bring snapshot to front and animate it away
+                    snapshot.layer.zPosition = 1
+                    await withCheckedContinuation { continuation in
+                        UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut) {
+                            snapshot.transform = CGAffineTransform(translationX: -offsetX, y: 0)
+                        } completion: { _ in
+                            snapshot.removeFromSuperview()
+                            continuation.resume()
+                        }
+                    }
+                }
+            } else {
+                // Fallback to slide if snapshot fails
+                await withCheckedContinuation { continuation in
+                    UIView.animate(withDuration: duration, delay: 0, options: .curveEaseOut) {
+                        self.scrollView.contentOffset = newOffset
+                    } completion: { _ in
+                        continuation.resume()
+                    }
+                }
+            }
+        }
 
         return true
     }

@@ -100,6 +100,7 @@ public final class DirectionalNavigationAdapter {
     private let pointerPolicy: PointerPolicy
     private let keyboardPolicy: KeyboardPolicy
     private let animatedTransition: Bool
+    private let customOptionsProvider: (@MainActor () -> NavigatorGoOptions)?
     private let onNavigation: @MainActor () -> Void
 
     @available(*, deprecated, message: "Use `bind(to:)` instead of notifying the event yourself. See the migration guide.")
@@ -111,17 +112,22 @@ public final class DirectionalNavigationAdapter {
     ///  - pointerPolicy: Policy on page turns using pointers (touches, mouse).
     ///  - keyboardPolicy: Policy on page turns using the keyboard.
     ///  - animatedTransition: Indicates whether the page turns should be
-    ///    animated.
+    ///    animated. Ignored if `customOptionsProvider` is set.
+    ///  - customOptionsProvider: Optional closure that provides custom
+    ///    `NavigatorGoOptions` for each navigation. When set, this takes
+    ///    precedence over `animatedTransition`.
     ///  - onNavigation: Callback called when a navigation is triggered.
     public init(
         pointerPolicy: PointerPolicy = PointerPolicy(),
         keyboardPolicy: KeyboardPolicy = KeyboardPolicy(),
         animatedTransition: Bool = false,
+        customOptionsProvider: (@MainActor () -> NavigatorGoOptions)? = nil,
         onNavigation: @escaping @MainActor () -> Void = {}
     ) {
         self.pointerPolicy = pointerPolicy
         self.keyboardPolicy = keyboardPolicy
         self.animatedTransition = animatedTransition
+        self.customOptionsProvider = customOptionsProvider
         self.onNavigation = onNavigation
     }
 
@@ -238,7 +244,7 @@ public final class DirectionalNavigationAdapter {
 
     @MainActor private func go(_ action: (NavigatorGoOptions) async -> Bool) async -> Bool {
         onNavigation()
-        let options = NavigatorGoOptions(animated: animatedTransition)
+        let options = customOptionsProvider?() ?? NavigatorGoOptions(animated: animatedTransition)
         return await action(options)
     }
 
@@ -264,6 +270,7 @@ public final class DirectionalNavigationAdapter {
         )
         keyboardPolicy = KeyboardPolicy()
         self.animatedTransition = animatedTransition
+        customOptionsProvider = nil
         onNavigation = {}
     }
 

@@ -7,17 +7,18 @@
 import ReadiumShared
 import UIKit
 
-enum PageLocation: Equatable {
+// FORK: Made public for Features module animation gesture access
+public enum PageLocation: Equatable {
     case start
     case end
     case locator(Locator)
 
-    init(_ locator: Locator?) {
+    public init(_ locator: Locator?) {
         self = locator.map { .locator($0) }
             ?? .start
     }
 
-    var isStart: Bool {
+    public var isStart: Bool {
         switch self {
         case .start:
             return true
@@ -29,7 +30,8 @@ enum PageLocation: Equatable {
     }
 }
 
-protocol PageView {
+// FORK: Made public for Features module animation gesture access
+public protocol PageView {
     /// Moves the page to the given internal location.
     func go(to location: PageLocation) async
 }
@@ -45,20 +47,24 @@ protocol PaginationViewDelegate: AnyObject {
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
 }
 
-final class PaginationView: UIView, Loggable {
+// FORK: Made public for Features module animation gesture access
+public final class PaginationView: UIView, Loggable {
     weak var delegate: PaginationViewDelegate?
 
     /// Total number of page views to be paginated.
-    private(set) var pageCount: Int = 0
+    // FORK: Made public for animation gesture access
+    public private(set) var pageCount: Int = 0
 
     /// Index of the page currently being displayed.
-    private(set) var currentIndex: Int = 0
+    // FORK: Made public for animation gesture access
+    public private(set) var currentIndex: Int = 0
 
     /// Direction for the reading progression.
     private(set) var readingProgression: ReadingProgression = .ltr
 
     /// Pre-loaded page views, indexed by their position.
-    private(set) var loadedViews: [Int: UIView & PageView] = [:]
+    // FORK: Made public for animation gesture access
+    public private(set) var loadedViews: [Int: UIView & PageView] = [:]
 
     /// Number of positions (as in `Publication.positionList`) to preload before and after the
     /// current page.
@@ -91,7 +97,8 @@ final class PaginationView: UIView, Loggable {
         return orderedViews
     }
 
-    private let scrollView = UIScrollView()
+    // FORK: Changed from private to public for animation extension access from Features module
+    public let scrollView = UIScrollView()
 
     /// Allows the scroll view to scroll.
     var isScrollEnabled: Bool {
@@ -150,7 +157,7 @@ final class PaginationView: UIView, Loggable {
         scrollView.contentOffset.x = xOffsetForIndex(currentIndex)
     }
 
-    override func willMove(toSuperview newSuperview: UIView?) {
+    override public func willMove(toSuperview newSuperview: UIView?) {
         super.willMove(toSuperview: newSuperview)
 
         if newSuperview == nil {
@@ -162,7 +169,7 @@ final class PaginationView: UIView, Loggable {
         }
     }
 
-    override func didMoveToWindow() {
+    override public func didMoveToWindow() {
         super.didMoveToWindow()
 
         if window == nil {
@@ -173,7 +180,8 @@ final class PaginationView: UIView, Loggable {
     }
 
     /// Returns the x offset to the page view with given index in the scroll view.
-    private func xOffsetForIndex(_ index: Int) -> CGFloat {
+    // FORK: Changed from private to public for animation extension access from Features module
+    public func xOffsetForIndex(_ index: Int) -> CGFloat {
         (readingProgression == .rtl)
             ? scrollView.contentSize.width - (CGFloat(index + 1) * scrollView.bounds.width)
             : scrollView.bounds.width * CGFloat(index)
@@ -203,7 +211,8 @@ final class PaginationView: UIView, Loggable {
     }
 
     /// Updates the current and pre-loaded views.
-    private func setCurrentIndex(_ index: Int, location: PageLocation? = nil) {
+    // FORK: Changed from private to public for animation extension access from Features module
+    public func setCurrentIndex(_ index: Int, location: PageLocation? = nil) {
         guard isEmpty || index != currentIndex else {
             return
         }
@@ -324,8 +333,11 @@ final class PaginationView: UIView, Loggable {
 
         if currentIndex == index {
             await scrollToView(at: index, location: location)
+        } else if options.animated {
+            // FORK: Reader App custom page turn animations
+            await animateToView(at: index, location: location, options: options)
         } else {
-            await fadeToView(at: index, location: location, animated: options.animated)
+            await scrollToView(at: index, location: location)
         }
         return true
     }
@@ -350,7 +362,8 @@ final class PaginationView: UIView, Loggable {
         await fade(to: 1)
     }
 
-    private func scrollToView(at index: Int, location: PageLocation) async {
+    // FORK: Changed from private to public for animation extension access from Features module
+    public func scrollToView(at index: Int, location: PageLocation) async {
         guard currentIndex != index else {
             if let view = currentView {
                 await view.go(to: location)
@@ -378,15 +391,15 @@ extension PaginationView: UIScrollViewDelegate {
     /// Note: using this approach might provide a better experience:
     /// https://oleb.net/blog/2014/05/scrollviews-inside-scrollviews/
 
-    func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
+    public func scrollViewWillEndDragging(_ scrollView: UIScrollView, withVelocity velocity: CGPoint, targetContentOffset: UnsafeMutablePointer<CGPoint>) {
         scrollView.isScrollEnabled = false
     }
 
-    func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
+    public func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
         scrollView.isScrollEnabled = isScrollEnabled
     }
 
-    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+    public func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !decelerate {
             scrollView.isScrollEnabled = isScrollEnabled
         }

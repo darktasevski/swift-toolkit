@@ -543,7 +543,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Pagination and spreads
 
-    private var paginationView: PaginationView?
+    // FORK: Changed from private to public for animation extension access from Features module
+    public var paginationView: PaginationView?
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
         let view = PaginationView(
