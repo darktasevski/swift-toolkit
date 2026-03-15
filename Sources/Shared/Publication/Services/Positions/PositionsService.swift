@@ -31,9 +31,11 @@ private let positionsLink = Link(
 )
 
 public extension PositionsService {
-    var links: [Link] { [positionsLink] }
+    var links: [Link] {
+        [positionsLink]
+    }
 
-    func get<T>(_ href: T) -> (any Resource)? where T: URLConvertible {
+    func get<T: URLConvertible>(_ href: T) -> (any Resource)? {
         guard href.anyURL.isEquivalentTo(positionsLink.url()) else {
             return nil
         }
@@ -103,7 +105,8 @@ public extension Publication {
     private func positionsFromManifest() async -> ReadResult<[Locator]> {
         await links.firstWithMediaType(.readiumPositions)
             .flatMap { get($0) }?
-            .readAsJSONObject()
+            .read()
+            .asJSONObject()
             .map { [Locator](json: $0["positions"]) }
             ?? .success([])
     }

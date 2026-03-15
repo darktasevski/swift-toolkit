@@ -50,6 +50,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         /// Failed to serve the publication or assets with the provided HTTP
         /// server.
+        @available(*, deprecated, message: "The HTTP server is no longer needed for the EPUB navigator.")
         case serverFailure(Error)
     }
 
@@ -202,16 +203,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // All events are ignored when loading spreads, except for `loaded` and `load`.
             case (.loading, .loaded):
                 self = .idle
+
             case (.loading, _):
                 return false
 
             case let (.idle, .jump(locator)):
                 self = .jumping(pendingLocator: locator)
+
             case let (.idle, .move(direction)):
                 self = .moving(direction: direction)
 
             case (.jumping, .jumped):
                 self = .idle
+
             // Moving or jumping to another locator is not allowed during a pending jump.
             case (.jumping, .jump),
                  (.jumping, .move):
@@ -219,6 +223,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
             case (.moving, .moved):
                 self = .idle
+
             // Moving or jumping to another locator is not allowed during a pending move.
             case (.moving, .jump),
                  (.moving, .move):
@@ -273,9 +278,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     private var positionsByReadingOrder: [[Locator]] = []
 
     private let viewModel: EPUBNavigatorViewModel
-    public var publication: Publication { viewModel.publication }
+    public var publication: Publication {
+        viewModel.publication
+    }
 
-    var config: Configuration { viewModel.config }
+    var config: Configuration {
+        viewModel.config
+    }
 
     /// Creates a new instance of `EPUBNavigatorViewController`.
     ///
@@ -286,14 +295,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     ///   - readingOrder: Custom order of resources to display. Used for example
     ///   to display a non-linear resource on its own.
     ///   - config: Additional navigator configuration.
-    ///   - httpServer: HTTP server used to serve the publication resources to
-    ///   the web views.
     public convenience init(
         publication: Publication,
         initialLocation: Locator?,
         readingOrder: [Link]? = nil,
-        config: Configuration = .init(),
-        httpServer: HTTPServer
+        config: Configuration = .init()
     ) throws {
         precondition(readingOrder.map { !$0.isEmpty } ?? true)
 
@@ -301,11 +307,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             throw EPUBError.publicationRestricted
         }
 
-        let viewModel = try EPUBNavigatorViewModel(
+        let viewModel = EPUBNavigatorViewModel(
             publication: publication,
             readingOrder: readingOrder ?? publication.readingOrder,
-            config: config,
-            httpServer: httpServer
+            config: config
         )
 
         self.init(
@@ -319,6 +324,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // positions list is empty, and also not compute the
             // totalProgression when calculating the current locator.
             (readingOrder != nil) ? { .success([]) } : publication.positionsByReadingOrder
+        )
+    }
+
+    /// Creates a new instance of `EPUBNavigatorViewController`.
+    @available(*, deprecated, message: "The HTTP server is no longer needed for the EPUB navigator.")
+    public convenience init(
+        publication: Publication,
+        initialLocation: Locator?,
+        readingOrder: [Link]? = nil,
+        config: Configuration = .init(),
+        httpServer: HTTPServer
+    ) throws {
+        try self.init(
+            publication: publication,
+            initialLocation: initialLocation,
+            readingOrder: readingOrder,
+            config: config
         )
     }
 
@@ -924,7 +946,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     // MARK: - Configurable
 
-    public var settings: EPUBSettings { viewModel.settings }
+    public var settings: EPUBSettings {
+        viewModel.settings
+    }
 
     public func submitPreferences(_ preferences: EPUBPreferences) {
         viewModel.submitPreferences(preferences)
@@ -1050,7 +1074,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         // the application's bars.
         var insets = view.window?.safeAreaInsets ?? .zero
 
-        switch publication.metadata.layout ?? .reflowable {
+        switch publication.metadata.epubLayout {
         case .fixed:
             // With iPadOS and macOS, we aim to display content edge-to-edge
             // since there are no physical notches or Dynamic Island like on the
@@ -1063,10 +1087,6 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             let configInset = config.contentInset(for: view.traitCollection.verticalSizeClass)
             insets.top = max(insets.top, configInset.top)
             insets.bottom = max(insets.bottom, configInset.bottom)
-
-        case .scrolled:
-            // Not supported with EPUB.
-            break
         }
 
         return insets

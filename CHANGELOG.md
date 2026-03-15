@@ -2,13 +2,59 @@
 
 All notable changes to this project will be documented in this file. Take a look at [the migration guide](docs/Migration%20Guide.md) to upgrade between two major versions.
 
-## [Unreleased]
+<!-- ## [Unreleased] -->
+
+## [3.8.0]
+
+### Added
+
+#### LCP
+
+* New Keychain-based implementations of the LCP license and passphrase repositories: `LCPKeychainLicenseRepository` and `LCPKeychainPassphraseRepository`.
+    * Stored securely in the iOS/macOS Keychain.
+    * Persist across app reinstalls.
+    * Optionally synchronized across devices via iCloud Keychain.
+
+### Changed
+
+#### Navigator
+
+* The EPUB navigator no longer requires an HTTP server. Publication resources are now served directly to the web views using a custom URL scheme handler.
+    * The `httpServer` parameter of `EPUBNavigatorViewController` is deprecated and ignored.
+
+### Deprecated
+
+#### Navigator
+
+* `CBZNavigatorViewController` is now deprecated.
+    * Open CBZ publications with `EPUBNavigatorViewController` instead, which has more configuration options and preferences.
+
+#### LCP
+
+* `ReadiumAdapterLCPSQLite` is now deprecated in favor of the built-in Keychain repositories. See [the migration guide](docs/Migration%20Guide.md) for instructions.
+
+### Fixed
+
+* Fixed casting of `ResourceProperties`'s `mediaType` (contributed by [@lbeus](https://github.com/readium/swift-toolkit/pull/719)).
+
+#### Navigator
+
+* The first resource of a fixed-layout EPUB is now displayed on its own by default, matching Apple Books behavior.
+* Fixed the default spread position for single fixed-layout EPUB spreads that are not the first page.
+
+#### LCP
+
+* Fixed the `print` method consuming copy rights instead of print rights.
+
+
+## [3.7.0]
 
 ### Added
 
 #### Shared
 
 * Added support for JXL (JPEG XL) bitmap images. JXL is decoded natively on iOS 17+.
+* `Publication.cover()` now falls back on the first reading order resource if it's a bitmap image and no cover is declared.
 
 #### Navigator
 
@@ -22,6 +68,21 @@ All notable changes to this project will be documented in this file. Take a look
 * EPUB manifest item fallbacks are now exposed as `alternates` in the corresponding `Link`.
 * EPUBs with only bitmap images in the spine are now treated as Divina publications with fixed layout.
     * When an EPUB spine item is HTML with a bitmap image fallback (or vice versa), the image is preferred as the primary link.
+* Standalone audio files (e.g. MP3) metadata extraction now includes `narrators` (from the composer metadata fields) and merges artist metadata into `authors`, following conventions used by common audiobook tools.
+
+### Changed
+
+* The iOS minimum deployment target is now iOS 15.0.
+
+#### Shared
+
+* Accessibility display strings are now sourced from the [thorium-locales](https://github.com/edrlab/thorium-locales/) repository (instead of W3C's repository). Contributions are welcome on [Weblate](https://hosted.weblate.org/projects/thorium-reader/publication-metadata/).
+
+#### LCP
+
+* The LCP dialog used by `LCPDialogAuthentication` has been redesigned.
+    * **Breaking:** The LCP dialog localization string keys have been renamed. If you overrode these strings in your app, you must update them. [See the migration guide](docs/Migration%20Guide.md) for the key mapping.
+* LCP localized strings are now sourced from the [thorium-locales](https://github.com/edrlab/thorium-locales/) repository. Contributions are welcome on [Weblate](https://hosted.weblate.org/projects/thorium-reader/readium-lcp/).
 
 ### Deprecated
 
@@ -1091,3 +1152,5 @@ progression. Now if no reading progression is set, the `effectiveReadingProgress
 [3.4.0]: https://github.com/readium/swift-toolkit/compare/3.3.0...3.4.0
 [3.5.0]: https://github.com/readium/swift-toolkit/compare/3.4.0...3.5.0
 [3.6.0]: https://github.com/readium/swift-toolkit/compare/3.5.0...3.6.0
+[3.7.0]: https://github.com/readium/swift-toolkit/compare/3.6.0...3.7.0
+[3.8.0]: https://github.com/readium/swift-toolkit/compare/3.7.0...3.8.0

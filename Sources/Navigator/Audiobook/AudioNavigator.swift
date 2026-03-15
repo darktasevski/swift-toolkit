@@ -81,7 +81,9 @@ public struct MediaPlaybackInfo: Equatable, Sendable {
 public extension AudioNavigatorDelegate {
     func navigator(_ navigator: AudioNavigator, playbackDidChange info: MediaPlaybackInfo) {}
 
-    func navigator(_ navigator: AudioNavigator, shouldPlayNextResource info: MediaPlaybackInfo) -> Bool { true }
+    func navigator(_ navigator: AudioNavigator, shouldPlayNextResource info: MediaPlaybackInfo) -> Bool {
+        true
+    }
 
     func navigator(_ navigator: AudioNavigator, loadedTimeRangesDidChange ranges: [Range<Double>]) {}
 
@@ -153,7 +155,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     private let initialLocation: Locator?
     private let config: Configuration
 
-    public var audioConfiguration: AudioSession.Configuration { config.audioSession }
+    public var audioConfiguration: AudioSession.Configuration {
+        config.audioSession
+    }
 
     /// The audio playback engine used by this navigator.
     public let engine: any AudioPlaybackEngine

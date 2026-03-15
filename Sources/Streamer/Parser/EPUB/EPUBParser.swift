@@ -8,12 +8,6 @@ import Foundation
 import ReadiumFuzi
 import ReadiumShared
 
-/// Epub related constants.
-private enum EPUBConstant {
-    /// Media Overlays URL.
-    static let mediaOverlayURL = "media-overlay?resource="
-}
-
 /// Errors thrown during the parsing of the EPUB
 ///
 /// - wrongMimeType: The mimetype file is missing or its content differs from
@@ -83,12 +77,13 @@ public final class EPUBParser: PublicationParser {
                             HTMLResourceContentIterator.Factory(),
                         ]
                     ),
+                    guidedNavigation: SMILGuidedNavigationService.makeFactory(),
                     positions: EPUBPositionsService.makeFactory(reflowableStrategy: reflowablePositionsStrategy),
                     search: StringSearchService.makeFactory()
                 )
             ))
         } catch {
-            return .failure(.reading(.decoding(error)))
+            return .failure(.reading(.wrap(error) ?? .decoding(error)))
         }
     }
 }
