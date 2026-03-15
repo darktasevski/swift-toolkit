@@ -757,7 +757,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     // MARK: - Audio Level Metering
 
     /// Starts audio level metering by installing a tap on the mixer node.
-    private func startLevelMetering() {
+    public func startLevelMetering() {
         guard !isLevelMeteringActive else { return }
 
         let format = mixerNode.outputFormat(forBus: 0)
@@ -788,7 +788,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     }
 
     /// Stops audio level metering by removing the tap.
-    private func stopLevelMetering() {
+    public func stopLevelMetering() {
         guard isLevelMeteringActive else { return }
 
         mixerNode.removeTap(onBus: 0)
