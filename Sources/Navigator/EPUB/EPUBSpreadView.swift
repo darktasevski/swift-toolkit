@@ -5,7 +5,6 @@
 //
 
 import ReadiumShared
-import SwiftSoup
 @preconcurrency import WebKit
 
 protocol EPUBSpreadViewDelegate: AnyObject {
@@ -22,7 +21,7 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     func spreadView(_ spreadView: EPUBSpreadView, didTapOnInternalLink href: String, clickEvent: ClickEvent?)
 
     /// Called when the user tapped on a decoration.
-    func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: String, frame: CGRect?, point: CGPoint?)
+    func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?)
 
     /// Called when the user tapped on an image for zooming.
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?)
@@ -358,7 +357,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let selection = body as? [String: Any],
             let hrefString = selection["href"] as? String,
             let href = AnyURL(string: hrefString),
-            let text = try? Locator.Text(json: selection["text"]),
+            let text = try? Locator.Text(json: JSONValue(selection["text"])),
             var frame = CGRect(json: selection["rect"])
         else {
             focusedResource = nil
@@ -395,7 +394,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         0 ... 1
     }
 
-    func go(to location: PageLocation) async {
+    func go(to location: PageLocation, animated: Bool) async {
         fatalError("go(to:) must be implemented in subclasses")
     }
 
@@ -420,8 +419,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         let result = await evaluateScript("readium.findFirstVisibleLocator()")
         do {
             let link = spread.first.link
-            return try Locator(json: result.get())?
-                .copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
+
+            guard
+                let json = try JSONValue(result.get()),
+                let locator = try Locator(json: json)
+            else {
+                return nil
+            }
+            return locator.copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
+
         } catch {
             log(.error, error)
             return nil

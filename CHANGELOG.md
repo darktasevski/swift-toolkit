@@ -2,7 +2,58 @@
 
 All notable changes to this project will be documented in this file. Take a look at [the migration guide](docs/Migration%20Guide.md) to upgrade between two major versions.
 
-<!-- ## [Unreleased] -->
+## [Unreleased]
+
+### Added
+
+#### Playground
+
+* New `Playground` iOS app – a minimal SwiftUI sample demonstrating how to use the Readium Swift Toolkit and to test its API.
+    * `Recipes/` contains self-contained and explained code you can reuse in your own application.
+    * `App/` folder contains the scaffolding (file management, navigation, error handling) needed to run the Playground.
+
+#### Shared
+
+* Added support for SVG covers in `ResourceCoverService`. SVG images can now be used as publication covers and are rendered to bitmaps (contributed by [@grighakobian](https://github.com/readium/swift-toolkit/pull/751)).
+
+### Removed
+
+* Carthage is no longer a supported distribution method. Please migrate to Swift Package Manager or CocoaPods.
+
+### Changed
+
+#### Shared
+
+* All public types that parsed or serialized JSON now use the new type-safe `JSONValue` enum instead of `Any` / `[String: Any]`. See [the migration guide](docs/Migration%20Guide.md) for upgrade instructions.
+
+#### Navigator
+
+* The `DirectionalNavigationAdapter`'s policies and animated transitions are now mutable, allowing you to update the adapter's behavior after creation.
+
+### Fixed
+
+#### Shared
+
+* Fixed parsing of URI templates.
+    * Fixed `URITemplate` not recognizing `{&...}` (form-style query continuation) expressions.
+    * Fixed `URITemplate` expanding a form-style expression (`{?...}` or `{&...}`) to a bare `?` or `&` when none of the listed variables are provided. It now correctly expands to an empty string.
+
+#### Navigator
+
+* [#737](https://github.com/readium/swift-toolkit/issues/737) Improved page turn animations in the EPUB navigator.
+    * Fixed screen glitches when turning with animations disabled.
+    * A slide animation is now used when navigating between adjacent resources.
+* The EPUB navigator now reports a continuous `locator.locations.totalProgression` value, interpolated from the actual scroll position within the resource's global progression range. Previously, the value was quantized to the nearest position in the position list.
+* Fixed a race condition in `EPUBNavigatorViewController` where rapidly calling `apply(decorations:in:)` for the same group could cause multiple decorations to appear simultaneously.
+* [#721](https://github.com/readium/swift-toolkit/issues/721) Fixed position of EPUB decorations when using the paragraph indent preference.
+
+#### Streamer
+
+* Fixed parsing of EPUB contributors.
+    * Fixed `media:narrator` contributors not being recognized as narrators.
+    * Fixed `dc:creator` elements with a known MARC relator role (e.g. `opf:role="trl"`) being incorrectly routed to the `author` collection instead of the role's collection.
+    * A known role on a contributor no longer leaks into the `roles` field of the `Contributor` object when it is already expressed by the contributor's collection (e.g. `authors`, `publishers`).
+
 
 ## [3.8.0]
 
