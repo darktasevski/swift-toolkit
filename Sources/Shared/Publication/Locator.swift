@@ -196,7 +196,7 @@ public struct Locator: Hashable, CustomStringConvertible, Loggable, Sendable, JS
         }
 
         /// Returns a copy with the given key-value pair added to otherLocations.
-        public func adding(_ key: String, value: Any) -> Locations {
+        public func adding(_ key: String, value: JSONValue) -> Locations {
             var newOtherLocations = otherLocations
             newOtherLocations[key] = value
             return Locations(

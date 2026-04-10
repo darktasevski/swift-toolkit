@@ -944,7 +944,9 @@ extension PDFNavigatorViewController: DecorableNavigator {
         inGroup group: String,
         onActivated: @escaping OnActivatedCallback
     ) {
-        _ = observeDecorationInteractionsCancellable(inGroup: group, onActivated: onActivated)
+        var callbacks = decorationCallbacks[group] ?? []
+        callbacks.append((token: UUID(), callback: onActivated))
+        decorationCallbacks[group] = callbacks
     }
 
     /// Observes decoration interactions with cancellation support.

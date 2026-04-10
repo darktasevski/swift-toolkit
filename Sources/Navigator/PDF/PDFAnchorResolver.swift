@@ -62,52 +62,55 @@ public struct PDFAnchorResolver: Loggable {
 
     // MARK: - Resolution Methods (internal for testing)
 
-    /// Parses anchor data from dictionary or JSON string format.
+    /// Parses anchor data from JSONValue (object or JSON string format).
     /// - Note: Internal for testing.
-    static func parseAnchor(_ data: Any) -> ParsedAnchor? {
-        // Handle both dictionary and JSON string formats
-        let dict: [String: Any]
-        if let d = data as? [String: Any] {
+    static func parseAnchor(_ data: JSONValue) -> ParsedAnchor? {
+        // Handle both object and JSON string formats
+        let dict: [String: JSONValue]
+        if let d = data.object {
             dict = d
-        } else if let jsonString = data as? String,
+        } else if let jsonString = data.string,
                   let jsonData = jsonString.data(using: .utf8),
-                  let d = try? JSONSerialization.jsonObject(with: jsonData) as? [String: Any] {
+                  let parsed = try? JSONValue(jsonData: jsonData),
+                  let d = parsed.object {
             dict = d
         } else {
             return nil
         }
 
-        guard let text = dict["text"] as? String else {
+        guard let text = dict["text"]?.string else {
             return nil
         }
 
         return ParsedAnchor(
-            pageIndex: dict["pageIndex"] as? Int,
+            pageIndex: dict["pageIndex"]?.integer,
             quads: parseQuads(dict["quads"]),
-            characterStart: dict["characterStart"] as? Int,
-            characterEnd: dict["characterEnd"] as? Int,
+            characterStart: dict["characterStart"]?.integer,
+            characterEnd: dict["characterEnd"]?.integer,
             text: text,
-            textBefore: dict["textBefore"] as? String,
-            textAfter: dict["textAfter"] as? String
+            textBefore: dict["textBefore"]?.string,
+            textAfter: dict["textAfter"]?.string
         )
     }
 
-    /// Parses quad coordinate data.
+    /// Parses quad coordinate data from JSONValue.
     /// - Note: Internal for testing.
-    static func parseQuads(_ data: Any?) -> [[CGPoint]]? {
-        guard let quadsArray = data as? [[[String: Double]]] else {
+    static func parseQuads(_ data: JSONValue?) -> [[CGPoint]]? {
+        guard let quadsArray = data?.array else {
             return nil
         }
 
         return quadsArray.compactMap { quad -> [CGPoint]? in
-            guard quad.count == 4 else { return nil }
+            guard let quadPoints = quad.array, quadPoints.count == 4 else { return nil }
 
-            let points = quad.compactMap { point -> CGPoint? in
-                guard let x = point["x"], let y = point["y"] else { return nil }
+            let points = quadPoints.compactMap { point -> CGPoint? in
+                guard let pointDict = point.object,
+                      let x = pointDict["x"]?.double,
+                      let y = pointDict["y"]?.double
+                else { return nil }
                 return CGPoint(x: x, y: y)
             }
 
-            // Require exactly 4 valid points
             guard points.count == 4 else { return nil }
             return points
         }

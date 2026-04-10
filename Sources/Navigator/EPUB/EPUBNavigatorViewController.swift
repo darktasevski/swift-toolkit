@@ -1246,7 +1246,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         let selectionLocator = locator.copy(
             locations: { locations in
                 if let domRange = domRange {
-                    locations = locations.adding("domRange", value: domRange.json)
+                    locations = locations.adding("domRange", value: domRange.jsonValue)
                 }
             },
             text: { $0 = text }

@@ -29,7 +29,7 @@ public struct PDFAnchorExtractor: Loggable {
     public static func extractAnchor(
         from selection: PDFSelection,
         on page: PDFPage
-    ) -> [String: Any]? {
+    ) -> JSONValue? {
         guard let pageIndex = page.document?.index(for: page),
               let selectedText = selection.string,
               !selectedText.isEmpty
@@ -38,9 +38,9 @@ public struct PDFAnchorExtractor: Loggable {
             return nil
         }
 
-        var anchor: [String: Any] = [
-            "pageIndex": pageIndex,
-            "text": selectedText
+        var anchor: [String: JSONValue] = [
+            "pageIndex": .integer(pageIndex),
+            "text": .string(selectedText),
         ]
 
         // Extract coordinate quads
@@ -51,8 +51,8 @@ public struct PDFAnchorExtractor: Loggable {
         // Extract character range
         if let pageText = page.string,
            let range = extractCharacterRange(for: selectedText, in: pageText, selection: selection, page: page) {
-            anchor["characterStart"] = range.lowerBound
-            anchor["characterEnd"] = range.upperBound
+            anchor["characterStart"] = .integer(range.lowerBound)
+            anchor["characterEnd"] = .integer(range.upperBound)
 
             // Extract context
             let (before, after) = extractContext(
@@ -61,43 +61,45 @@ public struct PDFAnchorExtractor: Loggable {
                 contextLength: contextCharacterCount
             )
             if let before = before {
-                anchor["textBefore"] = before
+                anchor["textBefore"] = .string(before)
             }
             if let after = after {
-                anchor["textAfter"] = after
+                anchor["textAfter"] = .string(after)
             }
         }
 
-        log(.debug, "PDF anchor extracted: page=\(pageIndex), chars=\(anchor["characterStart"] ?? "nil")-\(anchor["characterEnd"] ?? "nil"), quads=\(anchor["quads"] != nil)")
+        let hasChars = anchor["characterStart"] != nil
+        let hasQuads = anchor["quads"] != nil
+        log(.debug, "PDF anchor extracted: page=\(pageIndex), hasChars=\(hasChars), hasQuads=\(hasQuads)")
 
-        return anchor
+        return .object(anchor)
     }
 
     /// Extracts quadrilateral bounds for each line of the selection.
     private static func extractQuads(
         from selection: PDFSelection,
         on page: PDFPage
-    ) -> [[[String: Double]]]? {
+    ) -> JSONValue? {
         let lineSelections = selection.selectionsByLine()
         guard !lineSelections.isEmpty else { return nil }
 
-        var quads: [[[String: Double]]] = []
+        var quads: [JSONValue] = []
 
         for lineSelection in lineSelections {
             let bounds = lineSelection.bounds(for: page)
             guard !bounds.isNull, !bounds.isEmpty else { continue }
 
             // Convert CGRect to quad (4 corner points)
-            let quad: [[String: Double]] = [
-                ["x": Double(bounds.minX), "y": Double(bounds.minY)],  // bottomLeft
-                ["x": Double(bounds.maxX), "y": Double(bounds.minY)],  // bottomRight
-                ["x": Double(bounds.maxX), "y": Double(bounds.maxY)],  // topRight
-                ["x": Double(bounds.minX), "y": Double(bounds.maxY)]   // topLeft
-            ]
+            let quad: JSONValue = .array([
+                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.minY))]),  // bottomLeft
+                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.minY))]),  // bottomRight
+                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.maxY))]),  // topRight
+                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.maxY))]),  // topLeft
+            ])
             quads.append(quad)
         }
 
-        return quads.isEmpty ? nil : quads
+        return quads.isEmpty ? nil : .array(quads)
     }
 
     /// Extracts the character range of the selection within the page text.

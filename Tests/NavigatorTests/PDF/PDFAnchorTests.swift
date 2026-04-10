@@ -97,14 +97,14 @@ class PDFAnchorResolverTests: XCTestCase {
     // MARK: - Anchor Parsing Tests
 
     func testParseAnchorFromDictionary() {
-        let data: [String: Any] = [
-            "pageIndex": 0,
-            "text": "Hello World",
-            "characterStart": 10,
-            "characterEnd": 21,
-            "textBefore": "Say ",
-            "textAfter": " to everyone"
-        ]
+        let data: JSONValue = .object([
+            "pageIndex": .integer(0),
+            "text": .string("Hello World"),
+            "characterStart": .integer(10),
+            "characterEnd": .integer(21),
+            "textBefore": .string("Say "),
+            "textAfter": .string(" to everyone"),
+        ])
 
         let anchor = PDFAnchorResolver.parseAnchor(data)
 
@@ -122,7 +122,7 @@ class PDFAnchorResolverTests: XCTestCase {
         {"pageIndex":1,"text":"Test text","characterStart":5,"characterEnd":14}
         """
 
-        let anchor = PDFAnchorResolver.parseAnchor(jsonString)
+        let anchor = PDFAnchorResolver.parseAnchor(.string(jsonString))
 
         XCTAssertNotNil(anchor)
         XCTAssertEqual(anchor?.pageIndex, 1)
@@ -132,17 +132,17 @@ class PDFAnchorResolverTests: XCTestCase {
     }
 
     func testParseAnchorWithQuads() {
-        let data: [String: Any] = [
-            "text": "Highlighted",
-            "quads": [
-                [
-                    ["x": 10.0, "y": 20.0],
-                    ["x": 110.0, "y": 20.0],
-                    ["x": 110.0, "y": 40.0],
-                    ["x": 10.0, "y": 40.0]
-                ]
-            ]
-        ]
+        let data: JSONValue = .object([
+            "text": .string("Highlighted"),
+            "quads": .array([
+                .array([
+                    .object(["x": .double(10.0), "y": .double(20.0)]),
+                    .object(["x": .double(110.0), "y": .double(20.0)]),
+                    .object(["x": .double(110.0), "y": .double(40.0)]),
+                    .object(["x": .double(10.0), "y": .double(40.0)]),
+                ]),
+            ]),
+        ])
 
         let anchor = PDFAnchorResolver.parseAnchor(data)
 
@@ -154,10 +154,10 @@ class PDFAnchorResolverTests: XCTestCase {
     }
 
     func testParseAnchorWithMissingTextReturnsNil() {
-        let data: [String: Any] = [
-            "pageIndex": 0,
-            "characterStart": 10
-        ]
+        let data: JSONValue = .object([
+            "pageIndex": .integer(0),
+            "characterStart": .integer(10),
+        ])
 
         let anchor = PDFAnchorResolver.parseAnchor(data)
 
@@ -165,27 +165,25 @@ class PDFAnchorResolverTests: XCTestCase {
     }
 
     func testParseAnchorWithInvalidDataReturnsNil() {
-        let anchor = PDFAnchorResolver.parseAnchor(12345)
+        let anchor = PDFAnchorResolver.parseAnchor(.integer(12345))
         XCTAssertNil(anchor)
     }
 
     // MARK: - Quads Parsing Tests
 
+    private func jsonPoint(_ x: Double, _ y: Double) -> JSONValue {
+        .object(["x": .double(x), "y": .double(y)])
+    }
+
+    private func jsonQuad(_ p1: JSONValue, _ p2: JSONValue, _ p3: JSONValue, _ p4: JSONValue) -> JSONValue {
+        .array([p1, p2, p3, p4])
+    }
+
     func testParseQuadsWithValidData() {
-        let quadsData: [[[String: Double]]] = [
-            [
-                ["x": 0.0, "y": 0.0],
-                ["x": 100.0, "y": 0.0],
-                ["x": 100.0, "y": 20.0],
-                ["x": 0.0, "y": 20.0]
-            ],
-            [
-                ["x": 0.0, "y": 25.0],
-                ["x": 80.0, "y": 25.0],
-                ["x": 80.0, "y": 45.0],
-                ["x": 0.0, "y": 45.0]
-            ]
-        ]
+        let quadsData: JSONValue = .array([
+            jsonQuad(jsonPoint(0, 0), jsonPoint(100, 0), jsonPoint(100, 20), jsonPoint(0, 20)),
+            jsonQuad(jsonPoint(0, 25), jsonPoint(80, 25), jsonPoint(80, 45), jsonPoint(0, 45)),
+        ])
 
         let quads = PDFAnchorResolver.parseQuads(quadsData)
 
@@ -201,26 +199,21 @@ class PDFAnchorResolverTests: XCTestCase {
     }
 
     func testParseQuadsWithInvalidFormatReturnsNil() {
-        let quads = PDFAnchorResolver.parseQuads("invalid")
+        let quads = PDFAnchorResolver.parseQuads(.string("invalid"))
         XCTAssertNil(quads)
     }
 
     func testParseQuadsWithMissingPointDataReturnsNilForThatQuad() {
         // One valid quad, one with missing y coordinate
-        let quadsData: [[[String: Double]]] = [
-            [
-                ["x": 0.0, "y": 0.0],
-                ["x": 100.0, "y": 0.0],
-                ["x": 100.0, "y": 20.0],
-                ["x": 0.0, "y": 20.0]
-            ],
-            [
-                ["x": 0.0, "y": 25.0],
-                ["x": 80.0],  // Missing "y"
-                ["x": 80.0, "y": 45.0],
-                ["x": 0.0, "y": 45.0]
-            ]
-        ]
+        let quadsData: JSONValue = .array([
+            jsonQuad(jsonPoint(0, 0), jsonPoint(100, 0), jsonPoint(100, 20), jsonPoint(0, 20)),
+            .array([
+                jsonPoint(0, 25),
+                .object(["x": .double(80.0)]), // Missing "y"
+                jsonPoint(80, 45),
+                jsonPoint(0, 45),
+            ]),
+        ])
 
         let quads = PDFAnchorResolver.parseQuads(quadsData)
 

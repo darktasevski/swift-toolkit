@@ -205,7 +205,7 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
                         $0.position = pageNumber
                         $0.progression = pageProgression
                         $0.otherLocations = [
-                            "pageNumber": pageNumber,
+                            "pageNumber": .integer(pageNumber),
                         ]
                     },
                     text: {
@@ -245,8 +245,8 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
                             locations: {
                                 $0.progression = paraProgression
                                 $0.otherLocations = [
-                                    "pageNumber": pageNumber,
-                                    "paragraphIndex": paraIndex,
+                                    "pageNumber": .integer(pageNumber),
+                                    "paragraphIndex": .integer(paraIndex),
                                 ]
                             },
                             text: {
@@ -261,15 +261,15 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
 
                         // Extract sentences for segments
                         let sentences = SentenceExtractor.extractSentences(from: paragraph)
-                        let segments: [TextContentElement.Segment] = sentences.enumerated().map { sentenceIndex, sentence in
+                        let segments: [TextContentElement.Segment] = sentences.enumerated().map { (sentenceIndex: Int, sentence: String) -> TextContentElement.Segment in
                             let sentenceProgression = paraProgression + (Double(sentenceIndex) / Double(sentences.count)) / Double(paragraphs.count) / Double(pageCount)
                             let sentenceLocator = paraLocator.copy(
                                 locations: {
                                     $0.progression = sentenceProgression
                                     $0.otherLocations = [
-                                        "pageNumber": pageNumber,
-                                        "paragraphIndex": paraIndex,
-                                        "sentenceIndex": sentenceIndex,
+                                        "pageNumber": .integer(pageNumber),
+                                        "paragraphIndex": .integer(paraIndex),
+                                        "sentenceIndex": .integer(sentenceIndex),
                                     ]
                                 },
                                 text: {
@@ -301,12 +301,12 @@ public class PDFResourceContentIterator: ContentIterator, Loggable {
             let startIndex: Int = {
                 // Priority 1: Match by position AND paragraphIndex (most precise)
                 if let position = locator.locations.position,
-                   let savedParaIndex = locator.locations.otherLocations["paragraphIndex"] as? Int
+                   let savedParaIndex = locator.locations.otherLocations["paragraphIndex"]?.integer
                 {
                     // First try to find exact match by paragraphIndex
                     if let index = elements.firstIndex(where: { element in
                         element.locator.locations.position == position &&
-                            element.locator.locations.otherLocations["paragraphIndex"] as? Int == savedParaIndex
+                            element.locator.locations.otherLocations["paragraphIndex"]?.integer == savedParaIndex
                     }) {
                         return index
                     }

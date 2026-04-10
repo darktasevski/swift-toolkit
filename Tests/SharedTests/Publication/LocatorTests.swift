@@ -208,13 +208,13 @@ class LocatorLocationsTests: XCTestCase {
 
     func testAddingCreatesNewLocationWithOtherLocation() {
         let locations = Locator.Locations(progression: 0.5, position: 42)
-        let newLocations = locations.adding("customKey", value: "customValue")
+        let newLocations = locations.adding("customKey", value: .string("customValue"))
 
         // Original should be unchanged
         XCTAssertNil(locations["customKey"])
 
         // New locations should have the added value
-        XCTAssertEqual(newLocations["customKey"] as? String, "customValue")
+        XCTAssertEqual(newLocations["customKey"]?.string, "customValue")
         // Original properties should be preserved
         XCTAssertEqual(newLocations.progression, 0.5)
         XCTAssertEqual(newLocations.position, 42)
@@ -222,19 +222,19 @@ class LocatorLocationsTests: XCTestCase {
 
     func testAddingWithDomRange() {
         let locations = Locator.Locations(progression: 0.5)
-        let domRangeDict: [String: Any] = [
-            "start": [
-                "cssSelector": "p.intro",
-                "textNodeIndex": 0,
-                "charOffset": 5,
-            ] as [String: Any],
-            "end": [
-                "cssSelector": "p.intro",
-                "textNodeIndex": 0,
-                "charOffset": 20,
-            ],
-        ]
-        let newLocations = locations.adding("domRange", value: domRangeDict)
+        let domRangeValue: JSONValue = .object([
+            "start": .object([
+                "cssSelector": .string("p.intro"),
+                "textNodeIndex": .integer(0),
+                "charOffset": .integer(5),
+            ]),
+            "end": .object([
+                "cssSelector": .string("p.intro"),
+                "textNodeIndex": .integer(0),
+                "charOffset": .integer(20),
+            ]),
+        ])
+        let newLocations = locations.adding("domRange", value: domRangeValue)
 
         XCTAssertNotNil(newLocations["domRange"])
         XCTAssertEqual(newLocations.progression, 0.5)
@@ -248,10 +248,10 @@ class LocatorLocationsTests: XCTestCase {
         )
 
         // Add it to locations via JSON
-        let locations = Locator.Locations(progression: 0.25).adding("domRange", value: originalDomRange.json)
+        let locations = Locator.Locations(progression: 0.25).adding("domRange", value: originalDomRange.jsonValue)
 
         // Serialize to JSON and parse back
-        let locationsJson = locations.json
+        let locationsJson = locations.jsonValue
         let parsedLocations = try Locator.Locations(json: locationsJson)
 
         // Extract domRange and verify round-trip
@@ -269,22 +269,22 @@ class LocatorLocationsTests: XCTestCase {
     func testAddingPreservesExistingOtherLocations() {
         let locations = Locator.Locations(
             progression: 0.5,
-            otherLocations: ["existing": "value"]
+            otherLocations: ["existing": .string("value")]
         )
-        let newLocations = locations.adding("newKey", value: "newValue")
+        let newLocations = locations.adding("newKey", value: .string("newValue"))
 
-        XCTAssertEqual(newLocations["existing"] as? String, "value")
-        XCTAssertEqual(newLocations["newKey"] as? String, "newValue")
+        XCTAssertEqual(newLocations["existing"]?.string, "value")
+        XCTAssertEqual(newLocations["newKey"]?.string, "newValue")
     }
 
     func testAddingOverwritesExistingKey() {
         let locations = Locator.Locations(
             progression: 0.5,
-            otherLocations: ["key": "original"]
+            otherLocations: ["key": .string("original")]
         )
-        let newLocations = locations.adding("key", value: "updated")
+        let newLocations = locations.adding("key", value: .string("updated"))
 
-        XCTAssertEqual(newLocations["key"] as? String, "updated")
+        XCTAssertEqual(newLocations["key"]?.string, "updated")
     }
 }
 

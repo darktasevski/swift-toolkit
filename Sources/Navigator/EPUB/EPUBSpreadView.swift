@@ -369,7 +369,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         // Parse domRange from JavaScript (optional, used for precise highlight anchoring)
         let domRange: DOMRange?
         do {
-            domRange = try DOMRange(json: selection["domRange"])
+            domRange = try DOMRange(json: JSONValue(selection["domRange"]))
         } catch {
             log(.debug, "Failed to parse domRange: \(error)")
             domRange = nil
