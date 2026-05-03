@@ -21,8 +21,7 @@ final class PDFViewController: VisualReaderViewController<PDFNavigatorViewContro
         bookmarks: BookmarkRepository,
         highlights: HighlightRepository,
         initialPreferences: PDFPreferences,
-        preferencesStore: AnyUserPreferencesStore<PDFPreferences>,
-        httpServer: HTTPServer
+        preferencesStore: AnyUserPreferencesStore<PDFPreferences>
     ) throws {
         self.preferencesStore = preferencesStore
 
@@ -41,8 +40,7 @@ final class PDFViewController: VisualReaderViewController<PDFNavigatorViewContro
                 editingActions: customActions,
                 enableCustomActionRouting: true, // Enable routing for our custom Highlight action
                 preventDefaultAnnotationMenu: true // We have our own color picker menu
-            ),
-            httpServer: httpServer
+            )
         )
 
         super.init(navigator: navigator, publication: publication, bookId: bookId, books: books, bookmarks: bookmarks, highlights: highlights)
