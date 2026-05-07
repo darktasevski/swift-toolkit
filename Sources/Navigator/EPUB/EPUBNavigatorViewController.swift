@@ -33,8 +33,8 @@ public extension EPUBNavigatorDelegate {
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
 open class EPUBNavigatorViewController: InputObservableViewController,
-    VisualNavigator, ViewportObservingNavigator, SelectableNavigator,
-    DecorableNavigator, Configurable, Loggable
+    VisualNavigator, ViewportObservingNavigator, VisibleAnchorObservingNavigator,
+    SelectableNavigator, DecorableNavigator, Configurable, Loggable
 {
     public enum EPUBError: Error {
         /// The provided publication is restricted. Check that any DRM was
@@ -286,7 +286,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         publication: Publication,
         initialLocation: Locator?,
         readingOrder: [Link]? = nil,
-        config: Configuration = .init()
+        config: Configuration = .init(),
+        visibleAnchorTargets: [String: [String]] = [:]
     ) throws {
         precondition(readingOrder.map { !$0.isEmpty } ?? true)
 
@@ -299,6 +300,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             readingOrder: readingOrder ?? publication.readingOrder,
             config: config
         )
+        viewModel.updateVisibleAnchorTargets(visibleAnchorTargets)
 
         self.init(
             viewModel: viewModel,
@@ -914,6 +916,62 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         applySettings()
 
         delegate?.navigator(self, presentationDidChange: presentation)
+    }
+
+    /// Updates the anchor-target list and re-issues `initAnchorTracking`
+    /// against every currently-loaded spread. Intended for the late-bind
+    /// path: navigator construction happens before the host-app's async
+    /// `chapterWordCountsLoaded` completes, so spreads loaded with `[:]`
+    /// targets need their anchor list re-pushed once the host app
+    /// finishes building the lookup table.
+    ///
+    /// Fans out concurrently via `withTaskGroup` so iPad multi-window
+    /// with N loaded spreads converges in ~one IPC round-trip rather
+    /// than N sequential awaits. Per-spread failures (e.g., WebView
+    /// process termination mid-call) are logged but do not abort the
+    /// batch.
+    public func updateVisibleAnchorTargets(_ targets: [String: [String]]) async {
+        viewModel.updateVisibleAnchorTargets(targets)
+        // Sendable-correct fan-out: capture only Sendable keys (AnyURL is
+        // Sendable per Sources/Shared/Toolkit/URL/URLProtocol.swift; UIView
+        // is NOT). Re-resolve the spread view inside the @MainActor task
+        // body via the existing loadedSpreadViewForHREF<T: URLConvertible>(_:)
+        // helper.
+        let hrefs: [AnyURL] = (paginationView?.loadedViews ?? [:])
+            .values.compactMap {
+                ($0 as? EPUBSpreadView)?
+                    .spread.first.link.url(relativeTo: viewModel.publicationBaseURL)
+            }
+        await withTaskGroup(of: Void.self) { group in
+            for href in hrefs {
+                group.addTask { @MainActor [weak self] in
+                    guard let self,
+                          let spread = self.loadedSpreadViewForHREF(href) else { return }
+                    await self.reinjectAnchorTracking(into: spread)
+                }
+            }
+        }
+    }
+
+    private func reinjectAnchorTracking(into spread: EPUBSpreadView) async {
+        let anchorIds = viewModel.anchorIds(forResourceAt: spread.spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
+        guard anchorIds.count <= 256 else {
+            log(.warning, "anchor tracking reinjection skipped: list size=\(anchorIds.count)")
+            return
+        }
+        do {
+            _ = try await spread.webView.callAsyncJavaScript(
+                "readium.initAnchorTracking(anchorIds);",
+                arguments: ["anchorIds": anchorIds],
+                in: nil,
+                contentWorld: .page
+            )
+        } catch is CancellationError {
+            return
+        } catch {
+            let ns = error as NSError
+            log(.warning, "anchor tracking reinjection failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+        }
     }
 
     public func editor(of preferences: EPUBPreferences) -> EPUBPreferencesEditor {
