@@ -43,6 +43,33 @@ enum EPUBScriptScope {
 
     let readingOrder: ReadingOrder
 
+    /// Cache of NCX-anchor lists per spine href (key = AnyURL.normalized.string).
+    /// Populated by ``updateVisibleAnchorTargets(_:)`` from the host app's
+    /// reducer once `chapterWordCountsLoaded` completes. Capped at 256 entries
+    /// per resource — oversized entries are dropped at write time so neither
+    /// the WebKit IPC marshaller nor the JS-side observer receives 1M strings
+    /// from a malicious EPUB.
+    private var visibleAnchorTargets: [String: [String]] = [:]
+
+    /// Returns the anchor-id list for the resource at `href`, or `nil` if no
+    /// targets have been registered. Lookup is O(1).
+    func anchorIds(forResourceAt href: AnyURL) -> [String]? {
+        visibleAnchorTargets[href.normalized.string]
+    }
+
+    /// Replaces the anchor-target cache. Caller is responsible for re-issuing
+    /// `initAnchorTracking` against currently-loaded spreads — this method
+    /// only updates storage. See ``EPUBNavigatorViewController/updateVisibleAnchorTargets(_:)``
+    /// for the orchestrator.
+    func updateVisibleAnchorTargets(_ targets: [String: [String]]) {
+        // Defence-in-depth: drop entries with >256 anchors before they reach
+        // the JS observer (paired with the Swift-side guard at spreadDidLoad
+        // and the JS-side guard in initAnchorTracking).
+        visibleAnchorTargets = targets.compactMapValues {
+            $0.count > 256 ? nil : $0
+        }
+    }
+
     convenience init(
         publication: Publication,
         readingOrder: ReadingOrder,
