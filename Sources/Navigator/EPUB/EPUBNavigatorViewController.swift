@@ -12,7 +12,7 @@ import UIKit
 import WebKit
 
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
-    ViewportObservingNavigatorDelegate
+    ViewportObservingNavigatorDelegate, VisibleAnchorObservingNavigatorDelegate
 {
     // MARK: - WebView Customization
 
