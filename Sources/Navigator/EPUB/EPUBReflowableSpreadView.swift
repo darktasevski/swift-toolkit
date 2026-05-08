@@ -155,14 +155,52 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // correctly before attempting to scroll to the target progression, otherwise we might end up at the wrong spot.
         // 0.2 seconds seems like a good value for it to work on an iPhone 5s.
         try? await Task.sleep(seconds: 0.2)
+        if Task.isCancelled { return }
 
         let location = pendingLocation
         await go(to: location.location, animated: location.animated)
+        if Task.isCancelled { return }
 
         // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
         // a generous delay before showing the spread again.
         let delayed = !location.location.isStart
         try? await Task.sleep(seconds: delayed ? 0.3 : 0)
+        if Task.isCancelled { return }
+
+        // Anchor-tracking init: pull the per-resource anchor list from the
+        // view model and call into the JS module. Even on oversized/invalid
+        // input, we MUST call into JS so the always-teardown-first contract
+        // runs on re-injection — otherwise a stale observer from a prior
+        // page survives. Size and per-element caps are checked AFTER we
+        // commit to dispatching the init (with empty list when invalid).
+        let rawAnchorIds = viewModel.anchorIds(forResourceAt: spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
+        let anchorIds: [String] = {
+            if rawAnchorIds.count > 256 {
+                log(.warning, "anchor tracking init: list size=\(rawAnchorIds.count) exceeds cap, dispatching empty for teardown")
+                return []
+            }
+            if !rawAnchorIds.allSatisfy({ $0.utf8.count <= 4_096 }) {
+                log(.warning, "anchor tracking init: oversized element, dispatching empty for teardown")
+                return []
+            }
+            return rawAnchorIds
+        }()
+        do {
+            _ = try await webView.callAsyncJavaScript(
+                "readium.initAnchorTracking(anchorIds);",
+                arguments: ["anchorIds": anchorIds],
+                in: nil,
+                contentWorld: .page
+            )
+        } catch is CancellationError {
+            // Spread teardown — not a failure.
+            return
+        } catch {
+            // type+domain+code only — never bare \(error). WKErrorDomain.userInfo
+            // can echo script source + arguments.
+            let ns = error as NSError
+            log(.warning, "anchor tracking init failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+        }
     }
 
     override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
