@@ -47,6 +47,14 @@ protocol EPUBSpreadViewDelegate: AnyObject {
 
     /// Called when WKWebview terminates
     func spreadViewDidTerminate()
+
+    /// Called when the IntersectionObserver in the spread reports a new anchor
+    /// crossing the viewport top.
+    func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String)
+}
+
+extension EPUBSpreadViewDelegate {
+    func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String) {}
 }
 
 class EPUBSpreadView: UIView, Loggable, PageView {
