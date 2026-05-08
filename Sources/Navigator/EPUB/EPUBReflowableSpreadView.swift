@@ -460,14 +460,26 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // WKScriptMessage.body decode is privacy-safe by silence: we never
         // log the raw body. anchorId can embed publisher-controlled chapter
         // titles (see docs/AGENT_PLAYBOOK.md § Logging).
+        guard let anchorId = Self.decodeVisibleAnchorBody(body) else { return }
+        delegate?.spreadView(self, visibleAnchorDidChange: anchorId)
+    }
+
+    /// Pure decoder for the `visibleAnchorChanged` JS message body. Returns
+    /// `nil` for any malformed/oversized/empty input — silence is the
+    /// privacy mechanism (decode-failure logs would name the offending
+    /// publisher-controlled value). Static + `nonisolated` so unit tests can
+    /// exercise it without constructing a heavy `EPUBReflowableSpreadView`
+    /// instance (the enclosing class is `@MainActor`-isolated via `UIView`).
+    @_spi(Testing)
+    public nonisolated static func decodeVisibleAnchorBody(_ body: Any) -> String? {
         guard let dict = body as? [String: Any],
               let anchorId = dict["anchorId"] as? String,
               !anchorId.isEmpty,
               anchorId.utf8.count <= 4_096   // DoS guard — IPC payload size cap
         else {
-            return
+            return nil
         }
-        delegate?.spreadView(self, visibleAnchorDidChange: anchorId)
+        return anchorId
     }
 
     // MARK: - WKNavigationDelegate
