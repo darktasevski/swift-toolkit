@@ -7,6 +7,7 @@
 // Script used for reflowable resources.
 
 import "./index";
+import "./anchor-tracking";
 
 window.readium.isReflowable = true;
 
