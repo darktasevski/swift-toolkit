@@ -415,6 +415,21 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func registerJSMessages() {
         super.registerJSMessages()
         registerJSMessage(named: "progressionChanged") { [weak self] in self?.progressionDidChange($0) }
+        registerJSMessage(named: "visibleAnchorChanged") { [weak self] in self?.visibleAnchorDidChange($0) }
+    }
+
+    private func visibleAnchorDidChange(_ body: Any) {
+        // WKScriptMessage.body decode is privacy-safe by silence: we never
+        // log the raw body. anchorId can embed publisher-controlled chapter
+        // titles (see docs/AGENT_PLAYBOOK.md § Logging).
+        guard let dict = body as? [String: Any],
+              let anchorId = dict["anchorId"] as? String,
+              !anchorId.isEmpty,
+              anchorId.utf8.count <= 4_096   // DoS guard — IPC payload size cap
+        else {
+            return
+        }
+        delegate?.spreadView(self, visibleAnchorDidChange: anchorId)
     }
 
     // MARK: - WKNavigationDelegate
