@@ -252,7 +252,7 @@ class LocatorLocationsTests: XCTestCase {
 
         // Serialize to JSON and parse back
         let locationsJson = locations.jsonValue
-        let parsedLocations = try Locator.Locations(json: locationsJson)
+        let parsedLocations = try XCTUnwrap(Locator.Locations(json: locationsJson))
 
         // Extract domRange and verify round-trip
         let domRangeJson = parsedLocations["domRange"]
