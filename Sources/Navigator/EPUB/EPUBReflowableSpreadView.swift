@@ -175,11 +175,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // commit to dispatching the init (with empty list when invalid).
         let rawAnchorIds = viewModel.anchorIds(forResourceAt: spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
         let anchorIds: [String] = {
-            if rawAnchorIds.count > 256 {
+            if rawAnchorIds.count > AnchorTrackingLimits.maxAnchorIdsPerResource {
                 log(.warning, "anchor tracking init: list size=\(rawAnchorIds.count) exceeds cap, dispatching empty for teardown")
                 return []
             }
-            if !rawAnchorIds.allSatisfy({ $0.utf8.count <= 4_096 }) {
+            if !rawAnchorIds.allSatisfy({ $0.utf8.count <= AnchorTrackingLimits.maxAnchorIdByteLength }) {
                 log(.warning, "anchor tracking init: oversized element, dispatching empty for teardown")
                 return []
             }
@@ -459,7 +459,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private func visibleAnchorDidChange(_ body: Any) {
         // WKScriptMessage.body decode is privacy-safe by silence: we never
         // log the raw body. anchorId can embed publisher-controlled chapter
-        // titles (see docs/AGENT_PLAYBOOK.md § Logging).
+        // titles.
+        //
+        // Threat model: EPUB 3 publications MAY ship `<script>` blocks. Such
+        // a script can call `webkit.messageHandlers.visibleAnchorChanged.postMessage(...)`
+        // directly with a forged payload — `WKUserContentController` registers
+        // handlers on the page world, not an isolated world. Blast radius is
+        // bounded: the receiving reducer's lookup-miss arm in `.visibleAnchorChanged`
+        // (see `ReaderFeature+Persistence.swift`) treats the fragmentId as
+        // untrusted and only writes `currentChapterId` if the (href, fragmentId)
+        // pair is present in `visibleAnchorLookup` — which is sourced from the
+        // NCX, not the script. At worst, an attacker with a `<script>` block
+        // can lie about which sub-chapter the user is reading WITHIN the same
+        // spread.
         guard let anchorId = Self.decodeVisibleAnchorBody(body) else { return }
         delegate?.spreadView(self, visibleAnchorDidChange: anchorId)
     }
@@ -475,7 +487,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard let dict = body as? [String: Any],
               let anchorId = dict["anchorId"] as? String,
               !anchorId.isEmpty,
-              anchorId.utf8.count <= 4_096   // DoS guard — IPC payload size cap
+              anchorId.utf8.count <= AnchorTrackingLimits.maxAnchorIdByteLength
         else {
             return nil
         }

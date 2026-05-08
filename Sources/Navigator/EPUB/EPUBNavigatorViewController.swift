@@ -955,7 +955,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     private func reinjectAnchorTracking(into spread: EPUBSpreadView) async {
         let anchorIds = viewModel.anchorIds(forResourceAt: spread.spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
-        guard anchorIds.count <= 256 else {
+        guard anchorIds.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else {
             log(.warning, "anchor tracking reinjection skipped: list size=\(anchorIds.count)")
             return
         }

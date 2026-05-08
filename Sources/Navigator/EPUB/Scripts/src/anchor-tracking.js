@@ -180,27 +180,31 @@ function whenStylesheetsApplied(callback) {
 }
 
 function emitInitialAnchorIfApplicable() {
-  // Synchronous selection-rule pass: find the topmost tracked anchor whose
-  // top edge is at or above the viewport top. Bypasses scrollend debounce
-  // because this fires once on spread load — no rapid-update coalescing
-  // needed.
+  // Synchronous selection-rule pass: find the FIRST (lowest doc-order)
+  // tracked anchor whose top edge is at or above the viewport top.
+  // Bypasses scrollend debounce because this fires once on spread load.
+  //
+  // Iterate in document order and break on first in-band hit so we don't
+  // pay 256 sequential `getBoundingClientRect()` layout-forcing reads on
+  // a fresh spread (the array is already in NCX-emit order, which matches
+  // doc-order for fragment-anchored chapters within a spine resource).
+  const isVertical = isVerticalWritingMode();
   let topmost = null;
-  let topmostOrder = Infinity;
-  trackedAnchorIds.forEach((id, order) => {
+  for (const id of trackedAnchorIds) {
     const el = document.getElementById(id);
-    if (!el) return;
+    if (!el) continue;
     const rect = el.getBoundingClientRect();
     // "At or above the top of the viewport" — horizontal writing mode
     // collapses to rect.top <= 0; vertical-rl collapses to
     // rect.right >= window.innerWidth. Mirror the rootMargin shape.
-    const inBand = isVerticalWritingMode()
+    const inBand = isVertical
       ? rect.right >= window.innerWidth
       : rect.top <= 0;
-    if (inBand && order < topmostOrder) {
+    if (inBand) {
       topmost = id;
-      topmostOrder = order;
+      break;
     }
-  });
+  }
   if (topmost !== null) notifyAnchor(topmost);
 }
 

@@ -62,11 +62,15 @@ enum EPUBScriptScope {
     /// only updates storage. See ``EPUBNavigatorViewController/updateVisibleAnchorTargets(_:)``
     /// for the orchestrator.
     func updateVisibleAnchorTargets(_ targets: [String: [String]]) {
-        // Defence-in-depth: drop entries with >256 anchors before they reach
-        // the JS observer (paired with the Swift-side guard at spreadDidLoad
-        // and the JS-side guard in initAnchorTracking).
-        visibleAnchorTargets = targets.compactMapValues {
-            $0.count > 256 ? nil : $0
+        // Single chokepoint for both list-size and per-id-length caps —
+        // both `spreadDidLoad` and `EPUBNavigatorViewController.reinjectAnchorTracking`
+        // read from this cache, so enforcing here means callers never see
+        // an oversized payload. Empty-targets call (`[:]`) clears the cache,
+        // which is the book-close / book-switch reset path.
+        visibleAnchorTargets = targets.compactMapValues { ids in
+            guard ids.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else { return nil }
+            guard ids.allSatisfy({ $0.utf8.count <= AnchorTrackingLimits.maxAnchorIdByteLength }) else { return nil }
+            return ids
         }
     }
 
