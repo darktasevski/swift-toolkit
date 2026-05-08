@@ -43,16 +43,20 @@ enum EPUBScriptScope {
 
     let readingOrder: ReadingOrder
 
-    /// Cache of NCX-anchor lists per spine href (key = AnyURL.normalized.string).
-    /// Populated by ``updateVisibleAnchorTargets(_:)`` from the host app's
-    /// reducer once `chapterWordCountsLoaded` completes. Capped at 256 entries
-    /// per resource — oversized entries are dropped at write time so neither
-    /// the WebKit IPC marshaller nor the JS-side observer receives 1M strings
-    /// from a malicious EPUB.
+    /// Cache of anchor-id lists per spine href (key = AnyURL.normalized.string).
+    /// Populated by ``updateVisibleAnchorTargets(_:)`` once the conformer's
+    /// anchor-list build pipeline completes. Capped at
+    /// ``AnchorTrackingLimits/maxAnchorIdsPerResource`` entries per resource
+    /// and ``AnchorTrackingLimits/maxAnchorIdByteLength`` bytes per id —
+    /// oversized entries are dropped at write time so neither the WebKit IPC
+    /// marshaller nor the JS-side observer receives a pathological payload
+    /// from a malicious publication.
     private var visibleAnchorTargets: [String: [String]] = [:]
 
     /// Returns the anchor-id list for the resource at `href`, or `nil` if no
-    /// targets have been registered. Lookup is O(1).
+    /// targets have been registered. Hashes a normalised path (O(path-length)
+    /// string work) and does an O(1) dictionary read; not a hot-path concern
+    /// at typical EPUB href lengths but not free.
     func anchorIds(forResourceAt href: AnyURL) -> [String]? {
         visibleAnchorTargets[href.normalized.string]
     }
@@ -61,6 +65,8 @@ enum EPUBScriptScope {
     /// `initAnchorTracking` against currently-loaded spreads — this method
     /// only updates storage. See ``EPUBNavigatorViewController/updateVisibleAnchorTargets(_:)``
     /// for the orchestrator.
+    ///
+    /// Passing `[:]` clears the cache (book-close / book-switch path).
     func updateVisibleAnchorTargets(_ targets: [String: [String]]) {
         // Single chokepoint for both list-size and per-id-length caps —
         // both `spreadDidLoad` and `EPUBNavigatorViewController.reinjectAnchorTracking`

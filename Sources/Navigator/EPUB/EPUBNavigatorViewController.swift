@@ -920,16 +920,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Updates the anchor-target list and re-issues `initAnchorTracking`
     /// against every currently-loaded spread. Intended for the late-bind
-    /// path: navigator construction happens before the host-app's async
-    /// `chapterWordCountsLoaded` completes, so spreads loaded with `[:]`
-    /// targets need their anchor list re-pushed once the host app
-    /// finishes building the lookup table.
+    /// path: navigator construction may happen before the conformer's
+    /// asynchronous anchor-list build completes, so spreads loaded with
+    /// an empty cache need their anchor list re-pushed once the cache
+    /// populates.
     ///
-    /// Fans out concurrently via `withTaskGroup` so iPad multi-window
-    /// with N loaded spreads converges in ~one IPC round-trip rather
-    /// than N sequential awaits. Per-spread failures (e.g., WebView
-    /// process termination mid-call) are logged but do not abort the
-    /// batch.
+    /// Concurrent so multi-spread layouts (e.g., iPad split view) finish
+    /// in roughly one round-trip instead of N sequential awaits. Per-
+    /// spread failures (e.g., WebView process termination mid-call) are
+    /// logged but do not abort the batch.
     public func updateVisibleAnchorTargets(_ targets: [String: [String]]) async {
         viewModel.updateVisibleAnchorTargets(targets)
         // Sendable-correct fan-out: capture only Sendable keys (AnyURL is
@@ -954,6 +953,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func reinjectAnchorTracking(into spread: EPUBSpreadView) async {
+        guard !Task.isCancelled, spread.isSpreadLoaded else { return }
         let anchorIds = viewModel.anchorIds(forResourceAt: spread.spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
         guard anchorIds.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else {
             log(.warning, "anchor tracking reinjection skipped: list size=\(anchorIds.count)")

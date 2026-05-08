@@ -6,26 +6,31 @@
 
 import ReadiumShared
 
-/// A navigator that reports the most recently NCX-anchored chapter heading
-/// the user has scrolled into, for shared-spine (omnibus) EPUBs where a
-/// single spine resource carries multiple chapters distinguished by `[id]`
-/// anchors referenced from the NCX.
+/// A navigator that reports the most recently observed anchor (an element
+/// `id` within a spine resource) the user has scrolled past, for
+/// publications where a single spine resource carries multiple logical
+/// sections distinguished by `[id]` anchors. The classic case is an EPUB
+/// with NCX-driven omnibus chapters, but the protocol contract is neutral
+/// to the anchor source: the conformer is responsible for nominating the
+/// anchor list, and the protocol exposes no state of its own (the anchor
+/// list is supplied at construction; per-spread observation is conformer-
+/// internal).
 ///
 /// This is a fork-only sibling of upstream's ``ViewportObservingNavigator``
 /// (Readium 3.8.0). The composition shape — a sibling protocol that
 /// `EPUBNavigatorDelegate` also inherits from — mirrors the upstream
 /// pattern so a future upstream PR can be a one-line bridge instead of a
 /// refactor.
-public protocol VisibleAnchorObservingNavigator: VisualNavigator {
-    /// The anchor list is supplied at navigator construction; the navigator
-    /// has no other state to expose (per-spread observation is JS-side).
-}
+public protocol VisibleAnchorObservingNavigator: VisualNavigator {}
 
 /// Delegate for receiving visible-anchor updates from any
 /// ``VisibleAnchorObservingNavigator``.
 @MainActor public protocol VisibleAnchorObservingNavigatorDelegate: AnyObject {
-    /// Called when the IntersectionObserver in the spread's WebView reports
-    /// a new anchor crossing the viewport top.
+    /// Called when the visible anchor changes — i.e., the most-recently-
+    /// crossed anchor in the conformer's configured anchor list updates.
+    /// The EPUB navigator drives this from an IntersectionObserver in the
+    /// spread's WebView; conformers for other formats (PDF, FXL) would
+    /// drive it from format-appropriate signals.
     func navigator(
         _ navigator: any VisibleAnchorObservingNavigator,
         didChangeVisibleAnchor anchor: VisibleAnchor

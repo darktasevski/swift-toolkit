@@ -4,10 +4,13 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-// IntersectionObserver-based "what NCX-mapped anchor is at the viewport
-// top" reporter for reflowable EPUBs. See
-// docs/superpowers/specs/2026-05-03-readium-visible-anchor-tracking-design.md
-// (in the host app's repo) for the full design rationale.
+// IntersectionObserver-based "what anchor is at the viewport top" reporter
+// for reflowable EPUBs. The conformer (currently the Reader app) supplies
+// the anchor-id list at navigator construction; this module owns observation
+// and reports topmost-crossing events back to Swift via the
+// `visibleAnchorChanged` message handler. Full design rationale lives in
+// the conformer's docs (Readium 3.x Reader-app fork: see ADR-0106 in the
+// host repository).
 
 // Module-scoped state — held at module scope so teardown can clear it.
 // Closure-captured handles leak across rapid initAnchorTracking calls.
@@ -15,7 +18,6 @@
 // scheduleEmit etc. are invoked synchronously from observer install.
 let observer = null;
 let stylesheetPollInterval = null;
-let stylesheetPollAttempts = 0;
 let emitDebounceListener = null;
 let pagehideListener = null;
 let lastReportedAnchorId = null;
@@ -143,7 +145,8 @@ function scheduleEmit(anchorId) {
   emitDebounceListener = function () {
     const id = pendingAnchorId;
     pendingAnchorId = null;
-    window.removeEventListener("scrollend", emitDebounceListener);
+    // { once: true } below auto-removes; no explicit removeEventListener
+    // needed here.
     emitDebounceListener = null;
     if (id !== null) notifyAnchor(id);
   };
@@ -164,14 +167,14 @@ function whenStylesheetsApplied(callback) {
     callback();
     return;
   }
-  stylesheetPollAttempts = 0;
+  let pollAttempts = 0;
   stylesheetPollInterval = setInterval(() => {
-    stylesheetPollAttempts++;
+    pollAttempts++;
     // Cap at ~1.5s (≈90 attempts × 16ms). RAIL-model "feels instant"
     // threshold; a malformed CSS or attacker-slow <link> URL would
     // otherwise mask the bug being fixed (header lag) for the entire
     // poll window. Fail-open after the cap.
-    if (allReady() || stylesheetPollAttempts > 90) {
+    if (allReady() || pollAttempts > 90) {
       clearInterval(stylesheetPollInterval);
       stylesheetPollInterval = null;
       callback();
@@ -265,7 +268,13 @@ window.readium.initAnchorTracking = function (anchorIds) {
     id.length <= 4096 &&
     !hasForbiddenChar(id)
   );
-    if (trackedAnchorIds.length === 0) return;
+  if (trackedAnchorIds.length < anchorIds.length) {
+    // Privacy-safe diagnostic: count only, no anchor content.
+    console.warn(
+      "anchor tracking: " + (anchorIds.length - trackedAnchorIds.length) + " ids rejected by filter"
+    );
+  }
+  if (trackedAnchorIds.length === 0) return;
   installPagehideListener();
   whenStylesheetsApplied(function () {
     installObserver();
