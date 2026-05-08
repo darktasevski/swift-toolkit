@@ -1319,6 +1319,15 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     func spreadViewDidTerminate() {
         reloadSpreads()
     }
+
+    /// Forwards the JS-side anchor change to the host's
+    /// `VisibleAnchorObservingNavigatorDelegate`, packaged as a `VisibleAnchor`
+    /// keyed on the spread's resource href.
+    func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String) {
+        let link = spreadView.spread.first.link
+        let href = link.url(relativeTo: viewModel.publicationBaseURL)
+        delegate?.navigator(self, didChangeVisibleAnchor: VisibleAnchor(href: href, fragmentId: anchorId))
+    }
 }
 
 extension EPUBNavigatorViewController: EditingActionsControllerDelegate {
