@@ -235,7 +235,15 @@ window.readium.initAnchorTracking = function (anchorIds) {
     return;
   }
   // Defensive charset filter — defence-in-depth against malicious /
-  // malformed publisher input. Rejects:
+  // malformed publisher input. Reference: W3C XML 1.0 § 2.3 (Name
+  // production); EPUB 3 NCX restricts ids to XML 1.0 NameChar so any
+  // character XML rejects is also forbidden in a well-formed publication.
+  // The filter is intentionally over-conservative: it rejects some legal
+  // NameChar code points (e.g., DEL+C1, U+2028/29) that XML doesn't
+  // explicitly forbid, on the grounds that legitimate NCX ids in the
+  // wild use a small subset of NameChar (alphanumerics, `-`, `_`, `.`).
+  //
+  // Rejects:
   //   - C0 controls         U+0000–U+001F (XML 1.0 forbids in Name).
   //   - DEL + C1 controls   U+007F–U+009F (XML 1.0 forbids in Name).
   //   - Lone surrogate halves U+D800–U+DFFF (UTF-16 code units that
