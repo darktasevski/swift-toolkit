@@ -46,18 +46,26 @@ function teardownAnchorTracking() {
   trackedAnchorIds = [];
 }
 
-function isVerticalWritingMode() {
-  const wm = getComputedStyle(document.documentElement).writingMode || "";
-  return wm.startsWith("vertical");
-}
-
 function rootMarginForViewport() {
-  // rootMargin is interpreted in physical (top/right/bottom/left) coords.
-  // Horizontal writing-mode (default): collapse bottom → 0px sentinel band at top.
-  // Vertical-rl: collapse right → 0px sentinel band at the leading (right) edge.
-  // RTL alone (text reversed but horizontal writing mode) is irrelevant —
-  // page top is still page top.
-  return isVerticalWritingMode() ? "0px -100% 0px 0px" : "0px 0px -100% 0px";
+  // Track every anchor visible anywhere in the viewport (no shrink).
+  //
+  // Pre-fix this returned a 0px-thick band at the viewport's leading edge
+  // ("0px 0px -100% 0px" / "0px -100% 0px 0px"). The intent was to fire
+  // only when an anchor "crossed" the leading edge — fine for vertical
+  // scroll where headings cross y=0, broken for paginated horizontal mode
+  // where column-top headings have `rect.top ≈ 20px` (body padding) and
+  // their bounding box never straddles y=0 regardless of which column is
+  // visible. The observer would install, fire once on the initial pass,
+  // then never fire again — header stuck on whatever the first emit
+  // picked (often the wrong anchor due to layout quirks).
+  //
+  // Full-viewport tracking: `intersectingIds` contains every currently-
+  // visible anchor; the picker in the IO callback selects the most
+  // recently-passed one (largest document-order). Works for paginated
+  // (horizontal page turns) and scroll (vertical) modes uniformly,
+  // including vertical writing modes where document order still encodes
+  // reading order regardless of visual flow.
+  return "0px";
 }
 
 function notifyAnchor(anchorId) {
@@ -104,19 +112,29 @@ function installObserver() {
           intersectingIds.delete(id);
         }
       }
-      // Topmost intersecting anchor = lowest document-order index that
-      // is currently in the sentinel band.
-      let topmost = null;
-      let topmostOrder = Infinity;
+      // "Current chapter" = the LARGEST document-order anchor currently
+      // visible in the viewport. For forward reading (LTR or RTL — document
+      // order matches reading order regardless of visual direction), this
+      // is the most recently-passed heading. For iPad two-column spreads
+      // where two headings may be simultaneously visible, the later one
+      // wins — the user has progressed into it.
+      //
+      // Pre-fix this picked the SMALLEST doc-order, which under the
+      // 0px-band geometry rarely mattered (the set was usually empty or
+      // singleton). With the full-viewport tracking the set is non-trivial,
+      // and "first visible chapter" is the wrong semantic — it gets stuck
+      // on whichever earlier heading happens to be co-visible.
+      let current = null;
+      let currentOrder = -1;
       for (const id of intersectingIds) {
         const order = orderById.get(id);
-        if (order !== undefined && order < topmostOrder) {
-          topmost = id;
-          topmostOrder = order;
+        if (order !== undefined && order > currentOrder) {
+          current = id;
+          currentOrder = order;
         }
       }
-      if (topmost !== null) {
-        scheduleEmit(topmost);
+      if (current !== null) {
+        scheduleEmit(current);
       }
     },
     {
@@ -183,32 +201,40 @@ function whenStylesheetsApplied(callback) {
 }
 
 function emitInitialAnchorIfApplicable() {
-  // Synchronous selection-rule pass: find the FIRST (lowest doc-order)
-  // tracked anchor whose top edge is at or above the viewport top.
-  // Bypasses scrollend debounce because this fires once on spread load.
+  // Synchronous initial selection on spread load: pick the LARGEST
+  // doc-order anchor whose bounding box overlaps the viewport. Bypasses
+  // the scrollend debounce because no scroll event fires on first paint —
+  // and IO's first callback isn't reliably synchronous on observer.observe
+  // for elements present at install time.
   //
-  // Iterate in document order and break on first in-band hit so we don't
-  // pay 256 sequential `getBoundingClientRect()` layout-forcing reads on
-  // a fresh spread (the array is already in NCX-emit order, which matches
-  // doc-order for fragment-anchored chapters within a spine resource).
-  const isVertical = isVerticalWritingMode();
-  let topmost = null;
-  for (const id of trackedAnchorIds) {
+  // Walk reverse doc-order so the FIRST visible match is the largest-
+  // order one; break early to bound the worst-case `getBoundingClientRect`
+  // reads (which force layout). For the common case of 20–80 anchors per
+  // spine and ~1–2 visible at a time, this is ~2–80 layout reads, paid
+  // once per spread load.
+  //
+  // Pre-fix this iterated forward and required `rect.top <= 0` (or the
+  // vertical-rl equivalent on the right edge). Under paginated horizontal
+  // mode that condition was almost never satisfied (anchors at column-top
+  // sit at `rect.top ≈ 20px` due to body padding), so initial emit either
+  // misfired on a layout-quirk anchor or didn't fire at all.
+  const vpW = window.innerWidth;
+  const vpH = window.innerHeight;
+  let current = null;
+  for (let i = trackedAnchorIds.length - 1; i >= 0; i--) {
+    const id = trackedAnchorIds[i];
     const el = document.getElementById(id);
     if (!el) continue;
     const rect = el.getBoundingClientRect();
-    // "At or above the top of the viewport" — horizontal writing mode
-    // collapses to rect.top <= 0; vertical-rl collapses to
-    // rect.right >= window.innerWidth. Mirror the rootMargin shape.
-    const inBand = isVertical
-      ? rect.right >= window.innerWidth
-      : rect.top <= 0;
-    if (inBand) {
-      topmost = id;
+    // Any overlap with viewport rect [0, 0, vpW, vpH]. Off-screen anchors
+    // (scrolled past horizontally on a previous spread, or not yet
+    // reached) have rect.right ≤ 0 or rect.left ≥ vpW respectively.
+    if (rect.right > 0 && rect.left < vpW && rect.bottom > 0 && rect.top < vpH) {
+      current = id;
       break;
     }
   }
-  if (topmost !== null) notifyAnchor(topmost);
+  if (current !== null) notifyAnchor(current);
 }
 
 function installPagehideListener() {

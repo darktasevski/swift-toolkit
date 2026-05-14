@@ -57,14 +57,31 @@ enum EPUBScriptScope {
     /// targets have been registered. Hashes a normalised path (O(path-length)
     /// string work) and does an O(1) dictionary read; not a hot-path concern
     /// at typical EPUB href lengths but not free.
+    ///
+    /// The lookup key strips scheme + authority from the normalised URL so
+    /// the conformer (host app) can populate `visibleAnchorTargets` using
+    /// manifest-relative hrefs (e.g. `OEBPS/c02.html` — the form
+    /// `Chapter.startCfi` carries) while the fork looks up using absolute
+    /// `readium://…` URLs built via `link.url(relativeTo: publicationBaseURL)`.
+    /// Without this symmetry the fork's lookup misses, `anchorIds` returns
+    /// `nil`, and JS-side `initAnchorTracking` is called with an empty
+    /// array — the observer never installs and `visibleAnchorChanged`
+    /// never fires. See the host-side counterpart in
+    /// `ReaderFeature.State.normalizedBaseKey(_:)`.
     func anchorIds(forResourceAt href: AnyURL) -> [String]? {
-        visibleAnchorTargets[href.normalized.string]
+        visibleAnchorTargets[Self.pathOnlyKey(from: href.normalized.string)]
     }
 
     /// Replaces the anchor-target cache. Caller is responsible for re-issuing
     /// `initAnchorTracking` against currently-loaded spreads — this method
     /// only updates storage. See ``EPUBNavigatorViewController/updateVisibleAnchorTargets(_:)``
     /// for the orchestrator.
+    ///
+    /// Storage keys are normalised through the same scheme+authority strip
+    /// that ``anchorIds(forResourceAt:)`` applies to lookup queries — so
+    /// callers that pass absolute or relative forms both resolve correctly,
+    /// and the lookup is idempotent regardless of how the host built its
+    /// keys.
     ///
     /// Passing `[:]` clears the cache (book-close / book-switch path).
     func updateVisibleAnchorTargets(_ targets: [String: [String]]) {
@@ -73,11 +90,35 @@ enum EPUBScriptScope {
         // read from this cache, so enforcing here means callers never see
         // an oversized payload. Empty-targets call (`[:]`) clears the cache,
         // which is the book-close / book-switch reset path.
-        visibleAnchorTargets = targets.compactMapValues { ids in
-            guard ids.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else { return nil }
-            guard ids.allSatisfy({ $0.utf8.count <= AnchorTrackingLimits.maxAnchorIdByteLength }) else { return nil }
-            return ids
+        var normalised: [String: [String]] = [:]
+        normalised.reserveCapacity(targets.count)
+        for (rawKey, ids) in targets {
+            guard ids.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else { continue }
+            guard ids.allSatisfy({ $0.utf8.count <= AnchorTrackingLimits.maxAnchorIdByteLength }) else { continue }
+            normalised[Self.pathOnlyKey(from: rawKey)] = ids
         }
+        visibleAnchorTargets = normalised
+    }
+
+    /// Strips `scheme://authority/` from a normalised URL string, returning
+    /// the path-only form. Idempotent for relative inputs (no `://`
+    /// separator), so callers can pass any URL shape and the lookup
+    /// converges. Mirrors `ReaderFeature.State.normalizedBaseKey(_:)` in
+    /// the host app — keep the two implementations in lock-step.
+    ///
+    /// `nonisolated` so unit tests on a non-`@MainActor` `XCTestCase` can
+    /// exercise it directly. Mirrors the same pattern as
+    /// `EPUBReflowableSpreadView.decodeVisibleAnchorBody`.
+    @_spi(Testing)
+    public nonisolated static func pathOnlyKey(from normalized: String) -> String {
+        guard let schemeSep = normalized.range(of: "://") else {
+            return normalized
+        }
+        let afterAuthority = normalized[schemeSep.upperBound...]
+        guard let pathStart = afterAuthority.firstIndex(of: "/") else {
+            return ""
+        }
+        return String(afterAuthority[afterAuthority.index(after: pathStart)...])
     }
 
     convenience init(
