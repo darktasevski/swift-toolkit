@@ -43,7 +43,10 @@ enum EPUBScriptScope {
 
     let readingOrder: ReadingOrder
 
-    /// Cache of anchor-id lists per spine href (key = AnyURL.normalized.string).
+    /// Cache of anchor-id lists per spine href. Keys are the result of
+    /// ``pathOnlyKey(from:)`` applied to the caller's URL — scheme +
+    /// authority stripped — so manifest-relative storage keys and absolute
+    /// `readium://…` lookup keys collapse to the same bucket.
     /// Populated by ``updateVisibleAnchorTargets(_:)`` once the conformer's
     /// anchor-list build pipeline completes. Capped at
     /// ``AnchorTrackingLimits/maxAnchorIdsPerResource`` entries per resource
