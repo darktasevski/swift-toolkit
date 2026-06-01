@@ -40,6 +40,30 @@ Adds an IntersectionObserver-driven "topmost visible anchor" reporter so omnibus
 | --- | --- | --- |
 | `3f3dd8bc` | `Tests/SharedTests/Publication/LocatorTests.swift` | `try Locator.Locations(json:)` returns optional; the test was subscripting the optional directly without unwrapping. Switched to `try XCTUnwrap`. Pre-existed before this fork branch; surfaced when D5's new tests forced a full test-target build. Worth submitting upstream as a one-line PR. |
 
+## PDF content normalization
+
+Carried since the v3.9.0 sync. Upstream #792 added the official `PDFResourceContentIterator` (one `TextContentElement` per page) and `ContentSearchService`. The fork's earlier duplicate PDF iterator + sentence extractor were deleted in favour of upstream's; the only retained fork value is column-break rejoin + de-hyphenation, applied as a thin decorator at the content-iterator seam so it benefits both TTS and PDF search.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Streamer/Parser/PDF/PDFTextNormalizer.swift` | `public enum` pure-function normalizer: rejoins lines broken at PDF column width, preserves paragraph breaks, de-hyphenates words split at a line ending. `public` so the host app's own PDFKit-based search-indexing path can reuse the exact rules. | Yes — would complement the upstream Content API; worth pitching upstream (their 3.9.0 note flags sentence segmentation as still-unrefined). |
+| `Sources/Streamer/Parser/PDF/NormalizingPDFContentIterator.swift` | `ContentIterator` decorator (+ nested `Factory: ResourceContentIteratorFactory`) wrapping `PDFResourceContentIterator`; rewrites each `TextContentElement`'s segment text + highlight through `PDFTextNormalizer`, preserving locator positions/fragments/progressions. | Yes (matches upstream decorator/factory shape). |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Streamer/Parser/PDF/PDFParser.swift` | Wraps the content-iterator factory: `NormalizingPDFContentIterator.Factory(wrapping: PDFResourceContentIterator.Factory())`. The sibling `search: ContentSearchService.makeFactory()` and `content:`/`positions:` wiring are upstream #792's. | Decorator wiring is fork-only; the rest is upstream. |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/StreamerTests/Parser/PDF/PDFTextNormalizerTests.swift` | 6 tests: within-paragraph join, paragraph-break preservation, hyphenation, multiple blank lines, empty, single-line. |
+| `Tests/StreamerTests/Parser/PDF/NormalizingPDFContentIteratorTests.swift` | 6 tests: segment+highlight rejoin, hyphenation, locator preservation, end-of-iteration nil, non-text pass-through, `previous()` normalization. |
+
 ## Upstream-rebase guidance
 
 When merging upstream `develop` into `fork-extensions`:
@@ -49,5 +73,6 @@ When merging upstream `develop` into `fork-extensions`:
 3. Conflicts in `EPUBSpreadView.swift` — preserve the new protocol method + default-impl extension.
 4. After merge, regenerate the JS bundle (`pnpm run bundle` from `Sources/Navigator/EPUB/Scripts/`) — all four `Assets/Static/scripts/*.js` files will need re-staging due to the chunk-id shift.
 5. Run the fork-side test suite: `xcodebuild test -scheme Readium-Package -destination 'platform=iOS Simulator,name=iPhone 17' -only-testing:ReadiumNavigatorTests/EPUBReflowableSpreadViewVisibleAnchorTests` should pass 9/9.
+6. In `PDFParser.swift`, preserve the `NormalizingPDFContentIterator.Factory(wrapping:)` wrapper around the content-iterator factory; the two `Sources/Streamer/Parser/PDF/` files (`PDFTextNormalizer.swift`, `NormalizingPDFContentIterator.swift`) are fork-only — keep both. If upstream adopts a normalizing pass on `PDFResourceContentIterator` directly, the decorator + `PDFTextNormalizer` can be deleted and the host app's `DatabaseRebuilder+PDF` reuse re-pointed at upstream's symbol.
 
 If upstream introduces a `VisibleAnchorObservingNavigator`-equivalent API, this fork's protocol can be deleted and the class conformance can switch to upstream's. The host app's `Coordinator` already speaks via `(@MainActor @Sendable (String, String) -> Void)?` closures so the wire shape is upstream-agnostic.

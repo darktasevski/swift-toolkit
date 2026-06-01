@@ -72,16 +72,14 @@ final class NormalizingPDFContentIterator: ContentIterator {
             var segment = segment
             let normalized = PDFTextNormalizer.normalize(segment.text)
             segment.text = normalized
-            segment.locator = segment.locator.copy(text: {
-                $0 = Locator.Text(after: $0.after, before: $0.before, highlight: normalized)
-            })
+            // Mutate only `highlight` in place so any other `Locator.Text` field
+            // (before/after, and anything upstream adds later) survives untouched.
+            segment.locator = segment.locator.copy(text: { $0.highlight = normalized })
             return segment
         }
 
         let highlight = text.locator.text.highlight.map(PDFTextNormalizer.normalize)
-        text.locator = text.locator.copy(text: {
-            $0 = Locator.Text(after: $0.after, before: $0.before, highlight: highlight)
-        })
+        text.locator = text.locator.copy(text: { $0.highlight = highlight })
 
         return text
     }

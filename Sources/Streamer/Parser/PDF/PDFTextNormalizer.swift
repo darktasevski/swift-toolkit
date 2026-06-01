@@ -55,6 +55,15 @@ public enum PDFTextNormalizer {
     }
 
     /// Joins lines intelligently, handling hyphenation and proper spacing.
+    ///
+    /// Known limitation: the hyphen-join is unconditional, so a word that
+    /// legitimately carries a hyphen and happens to fall at a line break
+    /// ("well-\nbeing", "Spider-\nMan") is fused ("wellbeing", "SpiderMan").
+    /// PDF text extraction cannot distinguish a soft (layout) hyphen from a
+    /// hard (lexical) one, and no reliable heuristic exists without a
+    /// dictionary. This is accepted: the output feeds search indexing and TTS,
+    /// where the cost is a recall miss / mispronunciation on the rare
+    /// line-broken compound, not data loss.
     private static func joinLines(_ lines: [String]) -> String {
         guard !lines.isEmpty else { return "" }
         guard lines.count > 1 else { return lines[0] }
@@ -69,13 +78,16 @@ public enum PDFTextNormalizer {
 
             let previousLine = lines[index - 1]
 
-            // Handle hyphenation: if previous line ends with hyphen, join without space
+            // Handle hyphenation: if previous line ends with hyphen, join without space.
+            // Mutate `result` in place (removeLast / append) rather than
+            // `String(result.dropLast()) + line`, which reallocates the whole
+            // accumulated string on every hyphenated join (O(n²) per paragraph).
             if previousLine.hasSuffix("-") {
-                // Remove the trailing hyphen and join directly
-                result = String(result.dropLast()) + line
+                result.removeLast()
+                result += line
             } else {
-                // Normal case: join with space
-                result += " " + line
+                result += " "
+                result += line
             }
         }
 

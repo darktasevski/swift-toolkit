@@ -193,25 +193,20 @@ PDF publications with extractable text can be read aloud using TTS. The implemen
 
 - **PDFKit availability**: PDF TTS requires PDFKit and is only available on iOS, macOS, and Mac Catalyst.
 - **Extractable text**: The PDF must contain actual text (not scanned images). OCR is not performed automatically.
-- **Parser integration**: The `PDFParser` automatically registers the `PDFResourceContentIterator` to enable TTS support.
+- **Parser integration**: The `PDFParser` registers a `NormalizingPDFContentIterator` that wraps upstream's `PDFResourceContentIterator` to enable TTS support.
 
 ### Text Extraction Strategy
 
-The `PDFResourceContentIterator` extracts text from PDFs with intelligent paragraph detection:
+`PDFResourceContentIterator` emits one `TextContentElement` per page (the page text as a single segment). The wrapping `NormalizingPDFContentIterator` runs that text through `PDFTextNormalizer`, which rejoins column-broken lines and de-hyphenates words split across a line break. Sentence-level granularity is not produced by the iterator — `PublicationSpeechSynthesizer`'s default tokenizer splits each element into sentence utterances downstream, so feeding it clean, rejoined page text is what makes the utterances coherent.
 
-1. **Double newlines** - Splits by `\n\n` for clear paragraph breaks
-2. **Single newlines with empty lines** - Groups consecutive non-empty lines, treating empty lines as paragraph breaks
-3. **Sentence grouping** - Falls back to grouping 3-5 sentences when paragraph breaks aren't detected
-
-This approach provides better TTS granularity, allowing users to skip between meaningful text chunks rather than entire pages.
+The same `NormalizingPDFContentIterator` seam also feeds `ContentSearchService`, so in-book PDF search benefits from the same rejoin/de-hyphenation pass.
 
 ### Locator Precision
 
-The PDF TTS implementation provides precise navigation:
+The PDF TTS implementation navigates at page granularity:
 
-- **Page-level positioning** - Each text element includes the page number (1-based)
-- **Paragraph-level positioning** - When paragraphs are detected, each has a `paragraphIndex` in `otherLocations`
-- **Progression values** - Accurate progression values within pages for smooth navigation
+- **Page-level positioning** - Each element carries the page number (1-based) as a `page=N` fragment plus `position`.
+- **Progression values** - Accurate progression values within the resource for smooth navigation.
 
 ### Limitations
 
