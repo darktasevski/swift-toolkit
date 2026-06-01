@@ -6,7 +6,7 @@ To bump the minimum required iOS version, update these files:
 
 - `README.md`, section "Minimum Requirements"
 - `Package.swift`
-- `Support/CocoaPods/*.podspec` — edit `iosTarget` in `Support/CocoaPods/Specs.swift`, then run `make podspecs` and commit the generated files
+- `Support/CocoaPods/*.podspec` – edit `iosTarget` in `Support/CocoaPods/Specs.swift`, then run `make podspecs` and commit the generated files
 
 ## Creating a New Package
 
@@ -47,48 +47,51 @@ You are ready to release a new version of the Swift toolkit? Great, follow these
     2. Clone the `swift-toolkit` from the previous version (`main` branch).
     3. Under `TestApp`, initialize it with the next toolkit version:
         ```shell
-        make spm version=3.0.1 lcp=...
+        make spm version=VERSION lcp=...
         ```
     4. Try to run the Test App, adjusting the integration if needed.
     5. Delete the Git tag created previously.
-3. Update the localized strings (`make update-locales`).
-4. Review the list of supported features in `README.md`.
-5. Update the [migration guide](Documentation/Migration%20Guide.md) in case of breaking changes.
-6. Issue the new release.
-    1. Create a branch with the same name as the future tag, from `develop`.
-    2. Bump `version` in `Support/CocoaPods/Specs.swift`, run `make podspecs`, and commit the generated files.
-    3. Bump the version numbers in `README.md`, and check the "Minimum Requirements" section.
-    4. Bump the version numbers in `TestApp/Sources/Info.plist`.
-    5. Close the version in the `CHANGELOG.md`, [for example](https://github.com/readium/swift-toolkit/pull/353/commits/a0714589b3da928dd923ba78f379116715797333#diff-06572a96a58dc510037d5efa622f9bec8519bc1beab13c9f251e97e657a9d4ed).
-    6. Create a PR to merge in `develop` and verify the CI workflows.
-    7. Release the updated Podspecs:
-        ```shell
-        cd Support/CocoaPods
+3. Review the list of supported features in `README.md`.
+4. Update the [migration guide](docs/Migration%20Guide.md) in case of breaking changes.
+5. Prepare the release.
+    ```shell
+    scripts/release-prepare.sh VERSION
+    ```
+    This script does the following:
 
-        pod repo add readium git@github.com:readium/podspecs.git
-
-        pod repo push readium ReadiumInternal.podspec
-
-        pod repo push readium ReadiumShared.podspec
-        
-        pod repo push readium ReadiumStreamer.podspec
-        pod repo push readium ReadiumNavigator.podspec
-        pod repo push readium ReadiumOPDS.podspec
-        pod repo push readium ReadiumLCP.podspec
-        pod repo push readium ReadiumAdapterGCDWebServer.podspec
-        pod repo push readium ReadiumAdapterLCPSQLite.podspec
-        ```
-    8. Squash and merge the PR.
-    9. Tag the new version from `develop`.
-        ```shell
-        git checkout develop
-        git pull
-        git tag -a 3.0.1 -m 3.0.1
-        git push --tags
-        ```
-7. Verify you can fetch the new version from the latest Test App with `make spm|cocoapods version=3.0.1`
-8. Announce the release.
+    1. Creates a branch with the same name as the future tag, from `develop`.
+    2. Bumps `version` in `Support/CocoaPods/Specs.swift`, then runs `make podspecs`.
+    3. Bumps the version numbers in `README.md`, and checks the "Minimum Requirements" section.
+    4. Bumps the version numbers in `TestApp/Sources/Info.plist`.
+    5. Closes the version in the `CHANGELOG.md`, [for example](https://github.com/readium/swift-toolkit/pull/353/commits/a0714589b3da928dd923ba78f379116715797333#diff-06572a96a58dc510037d5efa622f9bec8519bc1beab13c9f251e97e657a9d4ed).
+    6. Updates the localized strings (`make update-locales`).
+    7. Creates a PR to merge in `develop`.
+6. Verify the CI checks pass for the PR. **Do not merge it yet**.
+7. Release the updated Podspecs.
+    ```shell
+    scripts/release-publish-podspecs.sh
+    ```
+8. Squash and merge the release PR on GitHub.
+9. Tag the new version from `develop`.
+    ```shell
+    scripts/release-tag.sh
+    ```
+    This script does the following:
+    ```shell
+    git checkout develop
+    git pull
+    git tag -a VERSION -m VERSION
+    git push --tags
+    ```
+10. Verify you can fetch the new version from the latest Test App with `make spm|cocoapods version=VERSION`
+11. Announce the release.
     1. Create a new release on GitHub.
+        ```shell
+        scripts/release-github.sh
+        ```
+        The script creates a draft release pre-filled with documentation links and the formatted changelog. Edit the draft on GitHub to add the "What's Changed" section via "Generate release notes".
     2. Write a high-level summary of the changelog for the blog.
     3. Post the blog summary on Discord's `#announcement`, with a link to the GitHub release.
-9. Merge `develop` into `main`.
+12. > **Note:** Before merging, verify that SPM and CocoaPods builds succeed against the new tag.
+
+   Merge `develop` into `main`.

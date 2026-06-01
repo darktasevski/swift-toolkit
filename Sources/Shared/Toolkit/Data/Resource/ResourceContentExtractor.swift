@@ -8,41 +8,42 @@ import Foundation
 import SwiftSoup
 
 /// Extracts pure content from a marked-up (e.g. HTML) or binary (e.g. PDF) resource.
-///
-/// **WARNING:** This API is experimental and may change or be removed in a future release without
-/// notice. Use with caution.
-public protocol _ResourceContentExtractor {
+public protocol ResourceContentExtractor {
     /// Extracts the text content of the given `resource`.
     func extractText(of resource: Resource) async -> ReadResult<String>
 }
 
-/// **WARNING:** This API is experimental and may change or be removed in a future release without
-/// notice. Use with caution.
-public protocol _ResourceContentExtractorFactory {
+@available(*, unavailable, renamed: "ResourceContentExtractor")
+public typealias _ResourceContentExtractor = ResourceContentExtractor
+
+/// Creates a `ResourceContentExtractor` for a given resource and media type.
+public protocol ResourceContentExtractorFactory {
     /// Creates a `ResourceContentExtractor` instance for the given `resource`.
-    /// Returns null if the resource format is not supported.
-    func makeExtractor(for resource: Resource, mediaType: MediaType) -> _ResourceContentExtractor?
+    /// Returns nil if the resource format is not supported.
+    func makeExtractor(for resource: Resource, mediaType: MediaType) -> ResourceContentExtractor?
 }
 
-/// **WARNING:** This API is experimental and may change or be removed in a future release without
-/// notice. Use with caution.
-public class _DefaultResourceContentExtractorFactory: _ResourceContentExtractorFactory {
+@available(*, unavailable, renamed: "ResourceContentExtractorFactory")
+public typealias _ResourceContentExtractorFactory = ResourceContentExtractorFactory
+
+/// Default `ResourceContentExtractorFactory` supporting HTML resources.
+public class DefaultResourceContentExtractorFactory: ResourceContentExtractorFactory {
     public init() {}
 
-    public func makeExtractor(for resource: Resource, mediaType: MediaType) -> _ResourceContentExtractor? {
+    public func makeExtractor(for resource: Resource, mediaType: MediaType) -> ResourceContentExtractor? {
         if mediaType.isHTML {
-            return _HTMLResourceContentExtractor()
+            return HTMLResourceContentExtractor()
         } else {
             return nil
         }
     }
 }
 
+@available(*, unavailable, renamed: "DefaultResourceContentExtractorFactory")
+public typealias _DefaultResourceContentExtractorFactory = DefaultResourceContentExtractorFactory
+
 /// `ResourceContentExtractor` implementation for HTML resources.
-///
-/// **WARNING:** This API is experimental and may change or be removed in a future release without
-/// notice. Use with caution.
-class _HTMLResourceContentExtractor: _ResourceContentExtractor {
+class HTMLResourceContentExtractor: ResourceContentExtractor {
     private let xmlFactory = DefaultXMLDocumentFactory()
 
     func extractText(of resource: Resource) async -> ReadResult<String> {

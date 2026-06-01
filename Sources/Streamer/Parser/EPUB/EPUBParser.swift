@@ -79,7 +79,7 @@ public final class EPUBParser: PublicationParser {
                     ),
                     guidedNavigation: SMILGuidedNavigationService.makeFactory(),
                     positions: EPUBPositionsService.makeFactory(reflowableStrategy: reflowablePositionsStrategy),
-                    search: StringSearchService.makeFactory()
+                    search: ContentSearchService.makeFactory()
                 )
             ))
         } catch {

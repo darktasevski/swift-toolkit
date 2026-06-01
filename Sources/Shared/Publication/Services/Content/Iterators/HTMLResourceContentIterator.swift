@@ -29,7 +29,7 @@ public class HTMLResourceContentIterator: ContentIterator {
             resource: Resource,
             locator: Locator
         ) -> ContentIterator? {
-            guard publication.readingOrder.getOrNil(readingOrderIndex)?.mediaType?.isHTML == true else {
+            guard locator.mediaType.isHTML else {
                 return nil
             }
 
@@ -55,7 +55,7 @@ public class HTMLResourceContentIterator: ContentIterator {
     private let resource: Resource
     private let locator: Locator
     private let beforeMaxLength: Int = 50
-    private let totalProgressionRange: Task<ClosedRange<Double>?, Never>
+    private let fetchTotalProgressionRange: () async -> ClosedRange<Double>?
 
     public init(
         resource: Resource,
@@ -64,7 +64,7 @@ public class HTMLResourceContentIterator: ContentIterator {
     ) {
         self.resource = resource
         self.locator = locator
-        self.totalProgressionRange = Task { await totalProgressionRange() }
+        fetchTotalProgressionRange = totalProgressionRange
     }
 
     public func previous() async throws -> ContentElement? {
@@ -98,13 +98,14 @@ public class HTMLResourceContentIterator: ContentIterator {
     }
 
     private lazy var elementsTask = Task {
-        await resource
+        let range = await fetchTotalProgressionRange()
+        return await resource
             .read()
             .asString()
             .eraseToAnyError()
             .tryMap { try SwiftSoup.parse($0) }
             .tryMap { try parse(document: $0, locator: locator, beforeMaxLength: beforeMaxLength) }
-            .asyncMap { await adjustProgressions(of: $0) }
+            .asyncMap { await adjustProgressions(of: $0, totalProgressionRange: range) }
     }
 
     private func parse(document: Document, locator: Locator, beforeMaxLength: Int) throws -> ParsedElements {
@@ -125,7 +126,7 @@ public class HTMLResourceContentIterator: ContentIterator {
         return parser.result
     }
 
-    private func adjustProgressions(of elements: ParsedElements) async -> ParsedElements {
+    private func adjustProgressions(of elements: ParsedElements, totalProgressionRange: ClosedRange<Double>?) async -> ParsedElements {
         let count = Double(elements.elements.count)
         guard count > 0 else {
             return elements
@@ -134,9 +135,9 @@ public class HTMLResourceContentIterator: ContentIterator {
         var elements = elements
         elements.elements = await elements.elements.enumerated().asyncMap { index, element in
             let progression = Double(index) / count
-            return await element.copy(
+            return element.copy(
                 progression: progression,
-                totalProgression: totalProgressionRange.value.map { range in
+                totalProgression: totalProgressionRange.map { range in
                     range.lowerBound + progression * (range.upperBound - range.lowerBound)
                 }
             )
@@ -225,12 +226,22 @@ public class HTMLResourceContentIterator: ContentIterator {
 
         private var selectorGenerator = CSSSelectorGenerator()
 
+        /// Stack of ancestor elements whose subtrees should be skipped during
+        /// content extraction (e.g. audio/video whose children are fallback content).
+        private var skippedAncestors: [Element] = []
+
+        private var isInsideSkippedElement: Bool {
+            !skippedAncestors.isEmpty
+        }
+
         func head(_ node: Node, _ depth: Int) throws {
             if let node = node as? Element {
                 let parent = ParentElement(element: node, cssSelector: selectorGenerator.cssSelector(for: node))
                 if node.isBlock() {
                     flushText()
-                    breadcrumbs.append(parent)
+                    if !isInsideSkippedElement {
+                        breadcrumbs.append(parent)
+                    }
                 }
 
                 let tag = node.tagNameNormal()
@@ -266,6 +277,7 @@ public class HTMLResourceContentIterator: ContentIterator {
 
                 } else if tag == "audio" || tag == "video" {
                     flushText()
+                    skippedAncestors.append(node)
 
                     let link: Link? = try {
                         if let href = try node.srcRelativeToHREF(baseHREF) {
@@ -308,6 +320,8 @@ public class HTMLResourceContentIterator: ContentIterator {
 
         func tail(_ node: Node, _ depth: Int) throws {
             if let node = node as? TextNode {
+                guard !isInsideSkippedElement else { return }
+
                 guard let wholeText = node.getWholeText().orNilIfBlank() else {
                     return
                 }
@@ -323,7 +337,11 @@ public class HTMLResourceContentIterator: ContentIterator {
                 try appendNormalisedText(text)
 
             } else if let node = node as? Element {
-                if node.isBlock() {
+                if skippedAncestors.last === node {
+                    skippedAncestors.removeLast()
+                }
+
+                if node.isBlock(), !isInsideSkippedElement {
                     assert(breadcrumbs.last?.element == node)
                     flushText()
                     breadcrumbs.removeLast()
