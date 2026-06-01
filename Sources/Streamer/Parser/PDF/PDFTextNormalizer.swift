@@ -18,12 +18,16 @@ import Foundation
 ///
 /// Applied at the content-iterator seam (see `NormalizingPDFContentIterator`),
 /// it benefits every Content API consumer — TTS and search alike.
-enum PDFTextNormalizer {
+///
+/// Public so consumers outside the Streamer module (e.g. a host app's own
+/// PDFKit-based text-extraction path for search indexing) can reuse the same
+/// rejoin/de-hyphenation rules rather than duplicating them.
+public enum PDFTextNormalizer {
     /// Normalizes the given PDF text.
     /// - Parameter text: Raw text extracted from a PDF page.
     /// - Returns: Normalized text with column-broken lines rejoined and
     ///   paragraph breaks preserved.
-    static func normalize(_ text: String) -> String {
+    public static func normalize(_ text: String) -> String {
         let lines = text.components(separatedBy: .newlines)
         var result: [String] = []
         var currentParagraph: [String] = []
