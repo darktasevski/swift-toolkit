@@ -9,6 +9,7 @@ import WebKit
 
 /// A custom web view which:
 ///  - Forwards copy: menu action to an EditingActionsController.
+///  - Routes configured custom editing actions to the responder chain.
 final class WebView: WKWebView {
     private let editingActions: EditingActionsController
 
@@ -47,7 +48,11 @@ final class WebView: WKWebView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        super.canPerformAction(action, withSender: sender)
+        if editingActions.handlesAction(action) {
+            return editingActions.canPerformAction(action)
+        }
+
+        return super.canPerformAction(action, withSender: sender)
             && editingActions.canPerformAction(action)
     }
 
@@ -60,6 +65,22 @@ final class WebView: WKWebView {
     override func didMoveToWindow() {
         super.didMoveToWindow()
         setupDragAndDrop()
+    }
+
+    override func target(forAction action: Selector, withSender sender: Any?) -> Any? {
+        guard editingActions.handlesAction(action) else {
+            return super.target(forAction: action, withSender: sender)
+        }
+
+        var responder = next
+        while let currentResponder = responder {
+            if currentResponder.responds(to: action) {
+                return currentResponder
+            }
+            responder = currentResponder.next
+        }
+
+        return super.target(forAction: action, withSender: sender)
     }
 
     private func setupDragAndDrop() {

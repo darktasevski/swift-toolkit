@@ -838,18 +838,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return
             }
 
+            let source = self.decorations[group] ?? []
+            let target = decorations.map {
+                var d = $0
+                d.locator = self.publication.normalizeLocator(d.locator)
+                return DiffableDecoration(decoration: d)
+            }
+            let transaction = DecorationApplyTransaction(group: group, source: source, target: target)
+
             await withTaskGroup(of: Void.self) { tasks in
                 guard !Task.isCancelled else { return }
-
-                let source = self.decorations[group] ?? []
-                let target = decorations.map {
-                    var d = $0
-                    d.locator = self.publication.normalizeLocator(d.locator)
-                    return DiffableDecoration(decoration: d)
-                }
-                self.decorations[group] = target
-
-                if decorations.isEmpty {
+                if transaction.target.isEmpty {
                     for (_, pageView) in paginationView.loadedViews {
                         tasks.addTask {
                             guard !Task.isCancelled else { return }
@@ -862,7 +861,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         }
                     }
                 } else {
-                    for (href, changes) in target.changesByHREF(from: source) {
+                    for (href, changes) in transaction.changesByHREF {
                         guard let script = changes.javascript(forGroup: group, styles: self.config.decorationTemplates) else {
                             continue
                         }
@@ -879,6 +878,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     }
                 }
             }
+
+            guard !Task.isCancelled else { return }
+            transaction.commit(to: &self.decorations)
         }
         decorationTasks[group] = task
     }

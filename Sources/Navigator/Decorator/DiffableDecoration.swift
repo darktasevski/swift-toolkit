@@ -21,6 +21,22 @@ enum DecorationChange {
     case update(Decoration)
 }
 
+struct DecorationApplyTransaction {
+    let group: DecorationGroup
+    let target: [DiffableDecoration]
+    let changesByHREF: [AnyURL: [DecorationChange]]
+
+    init(group: DecorationGroup, source: [DiffableDecoration], target: [DiffableDecoration]) {
+        self.group = group
+        self.target = target
+        changesByHREF = target.changesByHREF(from: source)
+    }
+
+    func commit(to decorations: inout [DecorationGroup: [DiffableDecoration]]) {
+        decorations[group] = target
+    }
+}
+
 extension Array where Element == DiffableDecoration {
     func changesByHREF(from source: [DiffableDecoration]) -> [AnyURL: [DecorationChange]] {
         let changeset = StagedChangeset(source: source, target: self)
