@@ -254,6 +254,17 @@ enum EPUBScriptScope {
             return nil
         }
         let mediaType = await resolveMediaType(for: resource, at: href)
+        // ADR-0145 (host fork): repair malformed XHTML well-formedness BEFORE CSS
+        // injection, gated on isHTML only (fixed-layout XHTML is strict-parsed
+        // too). The closure runs inside TransformingResource, which the toolkit
+        // invokes off the main actor; the host's client hops via Task.detached
+        // for the blocking Rust call. Data-level so non-UTF-8 resources pass
+        // through unchanged.
+        if mediaType.isHTML, let repair = config.xhtmlRepairTransform {
+            resource = TransformingResource(resource) { result in
+                await result.asyncMap { data in await repair(href, data) }
+            }
+        }
         resource = injectReadiumCSS(in: resource, at: href)
         return (resource, mediaType)
     }

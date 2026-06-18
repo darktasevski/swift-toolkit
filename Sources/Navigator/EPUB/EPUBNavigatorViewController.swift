@@ -103,6 +103,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// Logs the state changes when true.
         public var debugState: Bool
 
+        /// Tolerant XHTML well-formedness repair (host fork, ADR-0145), applied
+        /// to HTML resources in `serve(href:)` BEFORE Readium CSS injection.
+        /// `href` is the served resource (the host keys the per-resource
+        /// `anchor_order_preserved` signal on it). The closure owns the UTF-8
+        /// decode and returns the original `Data` on any failure. `nil` ⇒
+        /// disabled (no cost). The host runs the blocking FFI off the main actor.
+        public var xhtmlRepairTransform: (@Sendable (RelativeURL, Data) async -> Data)?
+
         public init(
             preferences: EPUBPreferences = .empty,
             defaults: EPUBDefaults = EPUBDefaults(),
@@ -117,7 +125,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             decorationTemplates: [Decoration.Style.Id: HTMLDecorationTemplate] = HTMLDecorationTemplate.defaultTemplates(),
             fontFamilyDeclarations: [AnyHTMLFontFamilyDeclaration] = [],
             readiumCSSRSProperties: CSSRSProperties = CSSRSProperties(),
-            debugState: Bool = false
+            debugState: Bool = false,
+            xhtmlRepairTransform: (@Sendable (RelativeURL, Data) async -> Data)? = nil
         ) {
             self.preferences = preferences
             self.defaults = defaults
@@ -130,6 +139,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             self.fontFamilyDeclarations = fontFamilyDeclarations
             self.readiumCSSRSProperties = readiumCSSRSProperties
             self.debugState = debugState
+            self.xhtmlRepairTransform = xhtmlRepairTransform
         }
 
         func contentInset(for sizeClass: UIUserInterfaceSizeClass) -> EPUBContentInsets {
