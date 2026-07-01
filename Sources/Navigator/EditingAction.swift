@@ -66,6 +66,7 @@ public struct EditingAction: Hashable {
         }
     }
 
+    /// The `UIMenuItem` backing a custom action, or nil for native actions.
     var menuItem: UIMenuItem? {
         switch kind {
         case .native:
@@ -75,10 +76,9 @@ public struct EditingAction: Hashable {
         }
     }
 
+    /// Whether this is a custom (non-native) action.
     var isCustom: Bool {
-        if case .custom = kind {
-            return true
-        }
+        if case .custom = kind { return true }
         return false
     }
 }
@@ -160,6 +160,23 @@ final class EditingActionsController {
         }
     }
 
+    /// Whether a custom `action` should be inserted into the iOS 16+ edit menu
+    /// built by `buildMenu(with:)`.
+    ///
+    /// The EPUB text selection is delivered asynchronously: the JS
+    /// `selectionchange` event is debounced (~50 ms) and posted over the
+    /// WKWebView message bridge, so on a double-tap (single-word) selection the
+    /// edit menu can be built *before* `selection` is populated. During that
+    /// window the action is shown unconditionally — preserving the double-tap
+    /// fix — and the host app's menu suppression (`shouldShowMenuForSelection`)
+    /// and per-action gating (`canPerformAction(_:for:)`) take effect once the
+    /// selection is known.
+    func shouldShowCustomAction(_ action: EditingAction) -> Bool {
+        guard action.isCustom else { return false }
+        guard selection != nil else { return true }
+        return canPerformAction(action)
+    }
+
     /// Verifies that the user has the rights to use the given `action`.
     private func isActionAllowed(_ action: EditingAction) -> Bool {
         switch action {
@@ -184,83 +201,54 @@ final class EditingActionsController {
         // To reproduce, comment out and select Japanese text on a PDF.
         builder.remove(menu: .learn)
 
-        // iOS 16+ enhancement: Add custom actions as UICommand items to the edit menu.
-        // This ensures custom actions (like "Highlight") appear properly in the modern
-        // UIEditMenuInteraction on iOS 16+, fixing the issue where custom actions
-        // wouldn't show up or wouldn't route correctly to the responder chain.
-        if #available(iOS 16.0, *) {
-            addCustomActionsToMenu(builder)
-        }
-    }
+        // Custom actions are inserted into the selection edit menu via
+        // `buildMenu` only on iOS 16+, where `UIEditMenuInteraction` consults
+        // it synchronously — fixing the double-tap race where the menu appeared
+        // before the async JS→native selection pipeline populated the legacy
+        // `UIMenuController` items. On iOS 15 they are provided through
+        // `updateSharedMenuController()` instead.
+        //
+        // `shouldShowCustomAction` honors the host app's suppression /
+        // per-action gating once the selection is known, while still showing
+        // the actions during the async-selection window (see its doc comment).
+        guard #available(iOS 16.0, *) else { return }
 
-    /// Adds custom editing actions to the menu builder for iOS 16+.
-    ///
-    /// This method converts custom `UIMenuItem` actions into `UICommand` items,
-    /// which properly integrate with iOS 16's `UIEditMenuInteraction` system.
-    /// It maintains backward compatibility by only affecting iOS 16+ behavior.
-    @available(iOS 16.0, *)
-    private func addCustomActionsToMenu(_ builder: UIMenuBuilder) {
-        // Extract custom actions and convert them to UICommand
-        let customElements: [UIMenuElement] = actions.compactMap { action in
-            switch action.kind {
-            case let .custom(menuItem):
-                return UICommand(
-                    title: menuItem.title,
-                    image: nil,
-                    action: menuItem.action,
-                    propertyList: nil
-                )
-            case .native:
-                return nil
+        let customActions: [UIAction] = actions
+            .filter(shouldShowCustomAction)
+            .compactMap(\.menuItem)
+            .map { item in
+                UIAction(title: item.title) { _ in
+                    // Dispatch through the responder chain (starting at the
+                    // current first responder), so the host app's selector
+                    // implementation is reached.
+                    UIApplication.shared.sendAction(item.action, to: nil, from: nil, for: nil)
+                }
             }
+
+        if !customActions.isEmpty {
+            let menu = UIMenu(title: "", options: .displayInline, children: customActions)
+            builder.insertChild(menu, atStartOfMenu: .standardEdit)
         }
-
-        guard !customElements.isEmpty else {
-            return
-        }
-
-        // Check if we have any native actions (copy, lookup, translate, share)
-        let hasNativeActions = actions.contains {
-            if case .native = $0.kind {
-                return true
-            }
-            return false
-        }
-
-        // Get existing menu items
-        var standardChildren = builder.menu(for: .standardEdit)?.children ?? []
-
-        if hasNativeActions {
-            // If we have native actions, prepend custom actions to preserve
-            // standard system actions (copy, lookup, etc.)
-            standardChildren.insert(contentsOf: customElements, at: 0)
-        } else {
-            // If only custom actions, replace the menu to avoid clutter
-            // This gives integrators full control when they don't use native actions
-            standardChildren = customElements
-        }
-
-        builder.replaceChildren(ofMenu: .standardEdit) { _ in standardChildren }
     }
 
     func updateSharedMenuController() {
         if #available(iOS 16.0, *) {
-            // On iOS 16+, UIMenuController is deprecated in favor of UIEditMenuInteraction.
-            // Clear the shared menu items to avoid conflicts between the old and new systems.
-            // Custom actions are now handled via buildMenu(with:) and UICommand.
-            UIMenuController.shared.menuItems = nil
-            return
+            // The text-selection edit menu (`UIEditMenuInteraction`) is built
+            // through `buildMenu(with:)`, so custom actions are inserted there.
+            // `UIMenuController` is unused; clear any stale items.
+            UIMenuController.shared.menuItems = []
+        } else {
+            // On iOS 15 the selection callout still uses `UIMenuController`,
+            // which is not consulted by `buildMenu`. Populate its items here.
+            var items: [UIMenuItem] = []
+            if isEnabled, let selection = selection {
+                items = actions
+                    .filter { delegate?.editingActions(self, canPerformAction: $0, for: selection) ?? true }
+                    .compactMap(\.menuItem)
+            }
+            UIMenuController.shared.menuItems = items
+            UIMenuController.shared.update()
         }
-
-        // iOS 15 and earlier: Use legacy UIMenuController system
-        var items: [UIMenuItem] = []
-        if isEnabled, let selection = selection {
-            items = actions
-                .filter { delegate?.editingActions(self, canPerformAction: $0, for: selection) ?? true }
-                .compactMap(\.menuItem)
-        }
-        UIMenuController.shared.menuItems = items
-        UIMenuController.shared.update()
     }
 
     // MARK: - Copy
