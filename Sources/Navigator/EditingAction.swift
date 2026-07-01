@@ -74,6 +74,13 @@ public struct EditingAction: Hashable {
             return item
         }
     }
+
+    var isCustom: Bool {
+        if case .custom = kind {
+            return true
+        }
+        return false
+    }
 }
 
 protocol EditingActionsControllerDelegate: AnyObject {
@@ -145,6 +152,12 @@ final class EditingActionsController {
     /// - Returns: `true` if any editing action handles this selector, `false` otherwise.
     func handlesAction(_ selector: Selector) -> Bool {
         actions.contains { $0.actions.contains(selector) }
+    }
+
+    func handlesCustomAction(_ selector: Selector) -> Bool {
+        actions.contains { action in
+            action.isCustom && action.actions.contains(selector)
+        }
     }
 
     /// Verifies that the user has the rights to use the given `action`.

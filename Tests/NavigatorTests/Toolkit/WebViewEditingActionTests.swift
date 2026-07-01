@@ -37,7 +37,28 @@ final class WebViewEditingActionTests: XCTestCase {
         )
     }
 
+    func testNativeEditingActionsRequireSuperclassSupport() throws {
+        let editingActions = try makeEditingActions(actions: [
+            .lookup,
+            .translate,
+        ])
+        let webView = WebView(editingActions: editingActions)
+
+        for selector in [Selector(("_lookup:")), Selector(("translate:"))] {
+            XCTAssertFalse(
+                webView.canPerformAction(selector, withSender: nil),
+                "Native EPUB editing action \(selector) must not be authorized solely by EditingActionsController when WKWebView's superclass cannot perform it."
+            )
+        }
+    }
+
     private func makeEditingActions(customSelector selector: Selector) throws -> EditingActionsController {
+        try makeEditingActions(actions: [
+            EditingAction(title: "Highlight", action: selector),
+        ])
+    }
+
+    private func makeEditingActions(actions: [EditingAction]) throws -> EditingActionsController {
         let href = try XCTUnwrap(RelativeURL(string: "chapter.xhtml"))
         let publication = Publication(
             manifest: Manifest(
@@ -46,7 +67,7 @@ final class WebViewEditingActionTests: XCTestCase {
             )
         )
         let editingActions = EditingActionsController(
-            actions: [EditingAction(title: "Highlight", action: selector)],
+            actions: actions,
             publication: publication
         )
         editingActions.selection = Selection(

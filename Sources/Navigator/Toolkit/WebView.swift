@@ -48,7 +48,7 @@ final class WebView: WKWebView {
     }
 
     override func canPerformAction(_ action: Selector, withSender sender: Any?) -> Bool {
-        if editingActions.handlesAction(action) {
+        if editingActions.handlesCustomAction(action) {
             return editingActions.canPerformAction(action)
         }
 
@@ -68,7 +68,7 @@ final class WebView: WKWebView {
     }
 
     override func target(forAction action: Selector, withSender sender: Any?) -> Any? {
-        guard editingActions.handlesAction(action) else {
+        guard editingActions.handlesCustomAction(action) else {
             return super.target(forAction: action, withSender: sender)
         }
 
