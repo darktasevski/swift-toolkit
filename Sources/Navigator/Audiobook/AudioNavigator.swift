@@ -154,6 +154,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public nonisolated let publication: Publication
     private let initialLocation: Locator?
     private let config: Configuration
+    private let audioSession: AudioSessionManaging
 
     public var audioConfiguration: AudioSession.Configuration {
         config.audioSession
@@ -165,11 +166,13 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public init(
         publication: Publication,
         initialLocation: Locator? = nil,
-        config: Configuration = Configuration()
+        config: Configuration = Configuration(),
+        audioSession: AudioSessionManaging = AudioSession.shared
     ) {
         self.publication = publication
         self.initialLocation = initialLocation
         self.config = config
+        self.audioSession = audioSession
 
         let durations = publication.readingOrder.map { $0.duration ?? 0 }
         let totalDuration = durations.reduce(0, +)
@@ -200,9 +203,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     deinit {
         playTask?.cancel()
 
-        // AudioSession.end(for:) is nonisolated and only captures ObjectIdentifier,
-        // so it's safe to call from deinit
-        AudioSession.shared.end(for: self)
+        audioSession.end(for: self)
 
         // Engine cleanup must run on main thread. We capture the engine reference
         // and dispatch async. The engine will clean up its observers.
@@ -222,7 +223,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public func close() {
         playTask?.cancel()
         playTask = nil
-        AudioSession.shared.end(for: self)
+        audioSession.end(for: self)
         engine.stop()
     }
 
@@ -293,7 +294,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// Resumes or start the playback.
     public func play() {
         playTask = Task { @MainActor in
-            AudioSession.shared.start(with: self, isPlaying: false)
+            audioSession.start(with: self, isPlaying: false)
 
             if !hasLoadedAsset {
                 if let location = initialLocation {
@@ -530,12 +531,11 @@ extension AudioNavigator: AudioPlaybackEngineDelegate {
     }
 
     public func engine(_ engine: any AudioPlaybackEngine, didChangeState engineState: AudioEnginePlaybackState) {
-        let session = AudioSession.shared
         switch engineState {
         case .stopped, .paused:
-            session.user(self, didChangePlaying: false)
+            audioSession.user(self, didChangePlaying: false)
         case .loading, .playing:
-            session.user(self, didChangePlaying: true)
+            audioSession.user(self, didChangePlaying: true)
         }
         playbackDidChange()
     }
