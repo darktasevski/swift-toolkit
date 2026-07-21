@@ -35,6 +35,7 @@ const TEXT_KEYS = new Set(["before", "highlight", "after"]);
 const DOM_RANGE_KEYS = new Set(["start", "end"]);
 const DOM_POINT_KEYS = new Set(["cssSelector", "textNodeIndex", "charOffset"]);
 const NAVIGATE_KEYS = new Set(["kind", "payload", "animated"]);
+const VALIDATE_UNIQUE_TEXT_KEYS = new Set(["kind", "payload", "cssSelector"]);
 const REPLACE_DECORATIONS_KEYS = new Set([
   "kind",
   "groupID",
@@ -48,7 +49,7 @@ const DECORATION_STYLE_KEYS = new Set([
   "element",
   "stylesheet",
 ]);
-const OPERATION_KINDS = new Set(["navigation", "decoration"]);
+const OPERATION_KINDS = new Set(["navigation", "decoration", "validation"]);
 const DECORATION_LAYOUTS = new Set(["bounds", "boxes"]);
 const DECORATION_WIDTHS = new Set(["wrap", "bounds", "viewport", "page"]);
 
@@ -499,7 +500,7 @@ function rangeFromDOMRange(locator) {
   const startOffset = value.start.charOffset ?? 0;
   const endOffset = value.end.charOffset ?? 0;
   if (startOffset > startNode.length || endOffset > endNode.length) {
-    reject("invalidDOMRange");
+    return null;
   }
 
   try {
@@ -570,6 +571,100 @@ function resolveLocator(locator) {
     rangeFromDOMRange(locator) ||
     rangeFromQuote(locator) ||
     rangeFromElement(locator)
+  );
+}
+
+function textContentExcludingUnrenderedSubtrees(root) {
+  if (root.matches("script,style,noscript")) {
+    return "";
+  }
+  if (!root.querySelector("script,style,noscript")) {
+    return root.textContent || "";
+  }
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      for (
+        let element = node.parentElement;
+        element && element !== root;
+        element = element.parentElement
+      ) {
+        const tag = element.tagName;
+        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
+          return NodeFilter.FILTER_REJECT;
+        }
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  const parts = [];
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    parts.push(node.nodeValue);
+  }
+  return parts.join("");
+}
+
+function normalizeDOMText(value) {
+  return value
+    .replace(/[\u202A-\u202E\u2066-\u2069\uFEFF\u200B]/g, "")
+    .normalize("NFC")
+    .replace(/[\s\u0085]+/g, " ");
+}
+
+function validateUniqueTextMatch(command, token) {
+  requireOnlyKeys(command, VALIDATE_UNIQUE_TEXT_KEYS);
+  if (
+    command.kind !== "validateUniqueTextMatch" ||
+    token.operationKind !== "validation"
+  ) {
+    reject("invalidCommand");
+  }
+  const locator = decodeLocator(command.payload);
+  const highlight = locator.text?.highlight;
+  if (!highlight) {
+    reject("invalidField");
+  }
+  const selector =
+    command.cssSelector === undefined
+      ? undefined
+      : requireString(
+          command.cssSelector,
+          LIMITS.selectorUTF16,
+          "selectorTooLong"
+        );
+  if (!isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  const root = selector === undefined ? document.body : uniqueElement(selector);
+  if (!root) {
+    return commandResult(token, "miss", "notFound");
+  }
+  const rawText = textContentExcludingUnrenderedSubtrees(root);
+  if (rawText.length > 1_000_000) {
+    return commandResult(token, "miss", "matchRootTooLarge");
+  }
+  const text = normalizeDOMText(rawText);
+  const quote = normalizeDOMText(highlight);
+  if (!quote) {
+    return commandResult(token, "miss", "invalidField");
+  }
+  let count = 0;
+  for (
+    let index = text.indexOf(quote);
+    index !== -1;
+    index = text.indexOf(quote, index + quote.length)
+  ) {
+    count += 1;
+    if (count > 1) {
+      break;
+    }
+  }
+  if (!isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  return commandResult(
+    token,
+    count === 1 ? "applied" : "miss",
+    count === 1 ? "none" : "notUnique"
   );
 }
 
@@ -999,6 +1094,8 @@ async function execute(commandValue, tokenValue) {
         return await navigateLocator(commandValue, token);
       case "replaceDecorationGroup":
         return await replaceDecorationGroup(commandValue, token);
+      case "validateUniqueTextMatch":
+        return validateUniqueTextMatch(commandValue, token);
       default:
         reject("invalidCommand");
     }

@@ -204,11 +204,11 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, Error> {
         await spreadLoaded()
 
-        log(.trace, "Evaluate script: \(script)")
         return await withCheckedContinuation { continuation in
             webView.evaluateJavaScript(script) { [weak self] res, error in
                 if let error = error {
-                    self?.log(.error, error)
+                    let ns = error as NSError
+                    self?.log(.error, "JavaScript evaluation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
                     continuation.resume(returning: .failure(error))
                 } else {
                     continuation.resume(returning: .success(res ?? ()))
@@ -554,7 +554,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return locator.copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
 
         } catch {
-            log(.error, error)
+            log(.error, "Visible locator decoding failed")
             return nil
         }
     }
@@ -703,7 +703,8 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        log(.error, error)
+        let ns = error as NSError
+        log(.error, "Web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {

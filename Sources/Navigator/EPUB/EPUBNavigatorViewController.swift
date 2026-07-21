@@ -32,6 +32,13 @@ public extension EPUBNavigatorDelegate {
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
+/// The observable result of a render-faithful locator command.
+public enum LocatorNavigationOutcome: Equatable, Sendable {
+    case landed
+    case miss
+    case cancelled
+}
+
 open class EPUBNavigatorViewController: InputObservableViewController,
     VisualNavigator, ViewportObservingNavigator, VisibleAnchorObservingNavigator,
     SelectableNavigator, DecorableNavigator, Configurable, Loggable
@@ -762,6 +769,135 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             delegate?.navigator(self, didJumpTo: locator)
         }
         return success
+    }
+
+    /// Navigates with the bounded, fixed-source locator command bridge and
+    /// reports the command's actual landing result.
+    public func navigateToLocatorJSON(
+        _ locatorJSON: String,
+        animated: Bool
+    ) async -> LocatorNavigationOutcome {
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+        guard
+            let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
+            let decoded = try? Locator(json: payload.locator)
+        else {
+            return .miss
+        }
+        let locator = publication.normalizeLocator(decoded)
+        guard
+            let paginationView,
+            let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href),
+            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(readingOrderIndex)
+        else {
+            return .miss
+        }
+
+        let spreadView: EPUBSpreadView
+        if
+            paginationView.currentIndex == spreadIndex,
+            let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
+            loaded.isSpreadLoaded
+        {
+            spreadView = loaded
+        } else {
+            let resourceOnly = Locator(href: locator.href, mediaType: locator.mediaType)
+            guard await go(to: resourceOnly, options: NavigatorGoOptions(animated: animated)) else {
+                return Task.isCancelled ? .cancelled : .miss
+            }
+            guard let loaded = await waitForLoadedSpread(at: spreadIndex) else {
+                return Task.isCancelled ? .cancelled : .miss
+            }
+            spreadView = loaded
+        }
+
+        let result = await spreadView.locatorCommandBridge.navigate(
+            locatorJSON: locatorJSON,
+            targetHREF: locator.href,
+            animated: animated
+        )
+        switch result.outcome {
+        case .applied:
+            return .landed
+        case .miss:
+            return .miss
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
+    /// Checks the transient-highlight uniqueness rule inside the isolated
+    /// command world. Only a closed command outcome crosses back to native.
+    public func isLocatorTextUnique(
+        _ locatorJSON: String,
+        cssSelector: String?
+    ) async -> Bool {
+        guard
+            !Task.isCancelled,
+            let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
+            let decoded = try? Locator(json: payload.locator)
+        else {
+            return false
+        }
+        let locator = publication.normalizeLocator(decoded)
+        guard
+            let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href),
+            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(readingOrderIndex),
+            let paginationView,
+            paginationView.currentIndex == spreadIndex,
+            let spreadView = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
+            spreadView.isSpreadLoaded
+        else {
+            return false
+        }
+        let result = await spreadView.locatorCommandBridge.validateUniqueTextMatch(
+            locatorJSON: locatorJSON,
+            targetHREF: locator.href,
+            cssSelector: cssSelector
+        )
+        return result.outcome == .applied
+    }
+
+    /// Extracts a bounded visible excerpt through fixed source in the isolated
+    /// content world. Publisher content is returned only to the local caller.
+    public func extractVisibleText(maximumLength: Int) async -> String? {
+        guard
+            let paginationView,
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            spreadView.isSpreadLoaded
+        else {
+            return nil
+        }
+        let targetHREF = currentLocation?.href ?? spreadView.spread.first.link.url()
+        return await spreadView.locatorCommandBridge.visibleText(
+            targetHREF: targetHREF,
+            maximumLength: maximumLength
+        )
+    }
+
+    private func waitForLoadedSpread(at index: Int) async -> EPUBSpreadView? {
+        for _ in 0 ..< 200 {
+            guard !Task.isCancelled else {
+                return nil
+            }
+            guard let paginationView, paginationView.currentIndex == index else {
+                return nil
+            }
+            if
+                let spreadView = paginationView.loadedViews[index] as? EPUBSpreadView,
+                spreadView.isSpreadLoaded
+            {
+                return spreadView
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(10))
+            } catch {
+                return nil
+            }
+        }
+        return nil
     }
 
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {

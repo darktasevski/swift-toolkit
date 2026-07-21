@@ -420,7 +420,8 @@ enum EPUBScriptScope {
                 }
                 return content
             } catch {
-                log(.error, error)
+                let ns = error as NSError
+                log(.error, "Publication CSS load failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
                 return content
             }
         }

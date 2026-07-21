@@ -105,6 +105,7 @@ struct EPUBLocatorFrameRegistry: Sendable {
 enum EPUBLocatorCommandOperationKind: String, Hashable, Sendable {
     case navigation
     case decoration
+    case validation
 }
 
 struct EPUBLocatorCommandToken: Equatable, Sendable {
@@ -160,6 +161,8 @@ enum EPUBLocatorCommandReason: String, Sendable {
     case invalidCommand
     case staleToken
     case notFound
+    case notUnique
+    case matchRootTooLarge
     case paintTimeout
     case notScrollable
     case internalError
@@ -227,6 +230,12 @@ final class EPUBLocatorCommandBridge: NSObject {
     private static let frameReadyMessageName = "readerLocatorFrameReady"
     private static let decorationActivatedMessageName = "readerLocatorDecorationActivated"
     private static let commandScript = "return await readerLocatorCommands.execute(command, token);"
+    private static let visibleTextScript = """
+    const range = document.caretRangeFromPoint(globalThis.innerWidth / 2, globalThis.innerHeight / 2);
+    if (!range) return '';
+    const text = range.commonAncestorContainer.textContent || '';
+    return text.slice(0, maximumLength);
+    """
     private static let commandSource: String = Bundle.module
         .url(
             forResource: "readium-reader-locator-commands",
@@ -487,6 +496,119 @@ final class EPUBLocatorCommandBridge: NSObject {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
         return Self.decodeResult(rawResult, expectedToken: token)
+    }
+
+    func validateUniqueTextMatch(
+        locatorJSON: String,
+        targetHREF: AnyURL,
+        cssSelector: String?
+    ) async -> EPUBLocatorCommandResult {
+        let token = nextToken(for: .validation)
+
+        guard !Task.isCancelled else {
+            return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
+        }
+        let payload: EPUBLocatorCommandPayload
+        do {
+            payload = try EPUBLocatorCommandDecoder.decode(locatorJSON)
+        } catch let rejection as EPUBLocatorCommandRejection {
+            return EPUBLocatorCommandResult(
+                token: token,
+                outcome: .miss,
+                reason: EPUBLocatorCommandReason(rawValue: rejection.rawValue) ?? .invalidResult
+            )
+        } catch {
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidResult)
+        }
+        guard
+            cssSelector?.utf16.count ?? 0 <= 8 * 1024,
+            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
+            let targetKey = frameKey(for: targetURL),
+            locatorHREF(payload.href, targets: targetKey)
+        else {
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField)
+        }
+
+        let selectedID: String
+        switch registry.select(href: targetKey, documentEpoch: token.documentEpoch) {
+        case let .selected(id):
+            selectedID = id
+        case let .miss(reason):
+            return EPUBLocatorCommandResult(
+                token: token,
+                outcome: .miss,
+                reason: EPUBLocatorCommandReason(rawValue: reason.rawValue) ?? .invalidResult
+            )
+        }
+        guard
+            let storedFrame = framesByID[selectedID],
+            storedFrame.documentEpoch == token.documentEpoch,
+            let webView
+        else {
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .staleDocument)
+        }
+
+        var command: [String: Any] = [
+            "kind": "validateUniqueTextMatch",
+            "payload": locatorJSON,
+        ]
+        if let cssSelector {
+            command["cssSelector"] = cssSelector
+        }
+        let rawResult: Any?
+        do {
+            rawResult = try await webView.callAsyncJavaScript(
+                Self.commandScript,
+                arguments: ["command": command, "token": token.javascriptValue],
+                in: storedFrame.info,
+                contentWorld: Self.contentWorld
+            )
+        } catch {
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .webKitFailure)
+        }
+        guard !Task.isCancelled, isCurrent(token) else {
+            return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
+        }
+        return Self.decodeResult(rawResult, expectedToken: token)
+    }
+
+    func visibleText(targetHREF: AnyURL, maximumLength: Int) async -> String? {
+        guard
+            (1 ... 4096).contains(maximumLength),
+            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
+            let targetKey = frameKey(for: targetURL)
+        else {
+            return nil
+        }
+        let selectedID: String
+        switch registry.select(href: targetKey, documentEpoch: documentEpoch) {
+        case let .selected(id):
+            selectedID = id
+        case .miss:
+            return nil
+        }
+        guard
+            let storedFrame = framesByID[selectedID],
+            storedFrame.documentEpoch == documentEpoch,
+            let webView
+        else {
+            return nil
+        }
+        let rawValue: Any?
+        do {
+            rawValue = try await webView.callAsyncJavaScript(
+                Self.visibleTextScript,
+                arguments: ["maximumLength": maximumLength],
+                in: storedFrame.info,
+                contentWorld: Self.contentWorld
+            )
+        } catch {
+            return nil
+        }
+        guard let text = rawValue as? String, text.utf16.count <= maximumLength else {
+            return nil
+        }
+        return text
     }
 
     private func nextToken(
