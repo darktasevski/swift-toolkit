@@ -249,43 +249,32 @@ enum EPUBScriptScope {
 
     // MARK: - Web View Server
 
-    private func serve(href: RelativeURL) async -> (Resource, MediaType)? {
+    @_spi(Testing)
+    public func serve(href: RelativeURL) async -> (Resource, MediaType)? {
         guard var resource = publication.get(href) else {
             return nil
         }
-        let mediaType = await resolveMediaType(for: resource, at: href)
+        let resolution = await EPUBServedResourcePolicy.resolve(
+            manifestMediaType: publication.linkWithHREF(href)?.mediaType,
+            resource: resource,
+            at: href.anyURL,
+            formatSniffer: formatSniffer
+        )
         // ADR-0145 (host fork): repair malformed XHTML well-formedness BEFORE CSS
-        // injection, gated on isHTML only (fixed-layout XHTML is strict-parsed
-        // too). The closure runs inside TransformingResource, which the toolkit
-        // invokes off the main actor; the host's client hops via Task.detached
-        // for the blocking Rust call. Data-level so non-UTF-8 resources pass
-        // through unchanged.
-        if mediaType.isHTML, let repair = config.xhtmlRepairTransform {
+        // injection. The policy's closed document kind requires repair for XHTML
+        // and HTML, and forbids it for binary resources. The closure runs inside
+        // TransformingResource, which the toolkit invokes off the main actor; the
+        // host's client hops via Task.detached for the blocking Rust call.
+        // Data-level so non-UTF-8 resources pass through unchanged.
+        if resolution.documentKind.requiresCanonicalRepair,
+           let repair = config.xhtmlRepairTransform
+        {
             resource = TransformingResource(resource) { result in
                 await result.asyncMap { data in await repair(href, data) }
             }
         }
         resource = injectReadiumCSS(in: resource, at: href)
-        return (resource, mediaType)
-    }
-
-    /// Resolves the media type to use to serve the given `resource`.
-    ///
-    /// The media type declared in the manifest takes precedence, before falling
-    /// back on the `Resource` properties and sniffing the `href`.
-    ///
-    /// The manifest takes precedence because a file with a `.xml` extension
-    /// might be declared as `application/xhtml+xml` in the OPF.
-    private func resolveMediaType(for resource: Resource, at href: RelativeURL) async -> MediaType {
-        if let mediaType = publication.linkWithHREF(href)?.mediaType {
-            return mediaType
-        }
-        if let mediaType = await resource.properties().getOrNil()?.mediaType {
-            return mediaType
-        }
-
-        return href.pathExtension.flatMap { formatSniffer.sniffHints(.init(fileExtension: $0))?.mediaType }
-            ?? .binary
+        return (resource, resolution.mediaType)
     }
 
     // MARK: - User preferences
