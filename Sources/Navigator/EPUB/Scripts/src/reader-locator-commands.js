@@ -3,6 +3,7 @@
 // available in the top-level LICENSE file of the project.
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
+import { getClientRectsNoOverlap } from "./rect";
 
 const LIMITS = Object.freeze({
   payloadBytes: 64 * 1024,
@@ -34,7 +35,22 @@ const TEXT_KEYS = new Set(["before", "highlight", "after"]);
 const DOM_RANGE_KEYS = new Set(["start", "end"]);
 const DOM_POINT_KEYS = new Set(["cssSelector", "textNodeIndex", "charOffset"]);
 const NAVIGATE_KEYS = new Set(["kind", "payload", "animated"]);
+const REPLACE_DECORATIONS_KEYS = new Set([
+  "kind",
+  "groupID",
+  "decorations",
+  "activable",
+]);
+const DECORATION_KEYS = new Set(["id", "locator", "style"]);
+const DECORATION_STYLE_KEYS = new Set([
+  "layout",
+  "width",
+  "element",
+  "stylesheet",
+]);
 const OPERATION_KINDS = new Set(["navigation", "decoration"]);
+const DECORATION_LAYOUTS = new Set(["bounds", "boxes"]);
+const DECORATION_WIDTHS = new Set(["wrap", "bounds", "viewport", "page"]);
 
 const utf8Encoder = new TextEncoder();
 const requestFrame = globalThis.requestAnimationFrame.bind(globalThis);
@@ -42,6 +58,7 @@ const scheduleTimeout = globalThis.setTimeout.bind(globalThis);
 const cancelTimeout = globalThis.clearTimeout.bind(globalThis);
 const FRAME_DEADLINE_MILLISECONDS = 250;
 const latestSequences = new Map();
+const decorationGroups = new Map();
 let documentIdentity = null;
 
 class CommandRejection {
@@ -556,6 +573,220 @@ function resolveLocator(locator) {
   );
 }
 
+function validateDecorationStyle(value) {
+  requireOnlyKeys(value, DECORATION_STYLE_KEYS);
+  const layout = requireString(value.layout, 16);
+  const width = requireString(value.width, 16);
+  const element = requireString(value.element, LIMITS.payloadBytes);
+  const stylesheet =
+    value.stylesheet === undefined
+      ? ""
+      : requireString(value.stylesheet, LIMITS.payloadBytes);
+  if (!DECORATION_LAYOUTS.has(layout) || !DECORATION_WIDTHS.has(width)) {
+    reject("invalidField");
+  }
+  return { layout, width, element, stylesheet };
+}
+
+function validateReplaceDecorations(command, token) {
+  requireOnlyKeys(command, REPLACE_DECORATIONS_KEYS);
+  if (
+    command.kind !== "replaceDecorationGroup" ||
+    token.operationKind !== "decoration" ||
+    typeof command.activable !== "boolean" ||
+    !Array.isArray(command.decorations)
+  ) {
+    reject("invalidCommand");
+  }
+  const groupID = requireString(command.groupID, LIMITS.hrefOrTitleUTF16);
+  if (token.groupID !== groupID || command.decorations.length > 4096) {
+    reject("invalidToken");
+  }
+
+  const identifiers = new Set();
+  let stringUnits = groupID.length;
+  const decorations = command.decorations.map((value) => {
+    requireOnlyKeys(value, DECORATION_KEYS);
+    const id = requireString(value.id, LIMITS.hrefOrTitleUTF16);
+    if (identifiers.has(id)) {
+      reject("duplicateField");
+    }
+    identifiers.add(id);
+    const locatorSource = requireString(value.locator, LIMITS.payloadBytes);
+    const locator = decodeLocator(locatorSource);
+    const style = validateDecorationStyle(value.style);
+    stringUnits +=
+      id.length +
+      locatorSource.length +
+      style.element.length +
+      style.stylesheet.length;
+    if (stringUnits > 2 * 1024 * 1024) {
+      reject("payloadTooLarge");
+    }
+    return { id, locator, style };
+  });
+  return { groupID, decorations, activable: command.activable };
+}
+
+function decorationWritingMode() {
+  return globalThis.getComputedStyle(document.body).writingMode;
+}
+
+function positionDecorationElement(element, rect, bounds, style) {
+  const scrollingElement = document.scrollingElement;
+  if (!scrollingElement) {
+    reject("notScrollable");
+  }
+  const writingMode = decorationWritingMode();
+  const isVertical = writingMode.startsWith("vertical");
+  const isVerticalRL = writingMode === "vertical-rl";
+  const viewportWidth = isVertical
+    ? globalThis.innerHeight
+    : globalThis.innerWidth;
+  const viewportHeight = isVertical
+    ? globalThis.innerWidth
+    : globalThis.innerHeight;
+  const columnCount =
+    Number.parseInt(
+      globalThis
+        .getComputedStyle(document.documentElement)
+        .getPropertyValue("column-count")
+    ) || 1;
+  const pageSize = (isVertical ? viewportHeight : viewportWidth) / columnCount;
+  const xOffset = scrollingElement.scrollLeft;
+  const yOffset = scrollingElement.scrollTop;
+
+  element.style.position = "absolute";
+  element.style.pointerEvents = "none";
+  element.dataset.writingMode = writingMode;
+
+  if (isVertical) {
+    let source = rect;
+    if (style.width === "wrap") {
+      element.style.width = `${rect.width}px`;
+      element.style.height = `${rect.height}px`;
+      element.style.top = `${rect.top + yOffset}px`;
+    } else if (style.width === "viewport") {
+      element.style.width = `${rect.height}px`;
+      element.style.height = `${viewportWidth}px`;
+      element.style.top = `${
+        Math.floor(rect.top / viewportWidth) * viewportWidth + yOffset
+      }px`;
+    } else if (style.width === "page") {
+      element.style.width = `${rect.height}px`;
+      element.style.height = `${pageSize}px`;
+      element.style.top = `${
+        Math.floor(rect.top / pageSize) * pageSize + yOffset
+      }px`;
+    } else {
+      source = bounds;
+      element.style.width = `${bounds.height}px`;
+      element.style.height = `${viewportWidth}px`;
+      element.style.top = `${bounds.top + yOffset}px`;
+    }
+    if (isVerticalRL) {
+      element.style.right = `${
+        -source.right - xOffset + scrollingElement.clientWidth
+      }px`;
+    } else {
+      element.style.left = `${source.left + xOffset}px`;
+    }
+    return;
+  }
+
+  const source = style.width === "bounds" ? bounds : rect;
+  if (style.width === "viewport") {
+    element.style.width = `${viewportWidth}px`;
+    element.style.left = `${
+      Math.floor(rect.left / viewportWidth) * viewportWidth + xOffset
+    }px`;
+  } else if (style.width === "page") {
+    element.style.width = `${pageSize}px`;
+    element.style.left = `${
+      Math.floor(rect.left / pageSize) * pageSize + xOffset
+    }px`;
+  } else {
+    element.style.width = `${source.width}px`;
+    element.style.left = `${source.left + xOffset}px`;
+  }
+  element.style.height = `${source.height}px`;
+  element.style.top = `${source.top + yOffset}px`;
+}
+
+function buildDecorationGroup(value, token) {
+  if (!document.body) {
+    reject("notFound");
+  }
+  const container = document.createElement("div");
+  container.dataset.readerDecorationGroup = value.groupID;
+  container.style.pointerEvents = "none";
+
+  const stylesheets = new Set(
+    value.decorations
+      .map((decoration) => decoration.style.stylesheet)
+      .filter((stylesheet) => stylesheet.length > 0)
+  );
+  if (stylesheets.size > 0) {
+    const styleElement = document.createElement("style");
+    styleElement.textContent = Array.from(stylesheets).join("\n");
+    container.append(styleElement);
+  }
+
+  const items = [];
+  for (const decoration of value.decorations) {
+    if (!isCurrent(token)) {
+      return { status: "stale" };
+    }
+    const range = resolveLocator(decoration.locator);
+    if (!range) {
+      return { status: "notFound" };
+    }
+    const bounds = range.getBoundingClientRect();
+    const rects =
+      decoration.style.layout === "boxes"
+        ? getClientRectsNoOverlap(
+            range,
+            !decorationWritingMode().startsWith("vertical")
+          )
+        : [bounds];
+    if (rects.length === 0) {
+      return { status: "notFound" };
+    }
+
+    const template = document.createElement("template");
+    template.innerHTML = decoration.style.element.trim();
+    const elementTemplate = template.content.firstElementChild;
+    if (!elementTemplate) {
+      return { status: "invalid" };
+    }
+
+    const itemContainer = document.createElement("div");
+    itemContainer.dataset.readerDecorationID = decoration.id;
+    itemContainer.style.pointerEvents = "none";
+    const clickableElements = [];
+    for (const rect of rects) {
+      const element = elementTemplate.cloneNode(true);
+      positionDecorationElement(element, rect, bounds, decoration.style);
+      itemContainer.append(element);
+      clickableElements.push(element);
+    }
+    container.append(itemContainer);
+    items.push({ id: decoration.id, range, clickableElements });
+  }
+  return { status: "ready", container, items };
+}
+
+function restoreDecorationGroup(groupID, state) {
+  const current = decorationGroups.get(groupID);
+  current?.container?.remove();
+  if (state) {
+    document.body.append(state.container);
+    decorationGroups.set(groupID, state);
+  } else {
+    decorationGroups.delete(groupID);
+  }
+}
+
 function isScrollModeEnabled() {
   return (
     globalThis
@@ -700,6 +931,59 @@ async function navigateLocator(command, token) {
   return commandResult(token, "applied", "none");
 }
 
+async function replaceDecorationGroup(command, token) {
+  const value = validateReplaceDecorations(command, token);
+  if (!isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+
+  const built = buildDecorationGroup(value, token);
+  if (built.status === "stale") {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  if (built.status === "notFound") {
+    return commandResult(token, "miss", "notFound");
+  }
+  if (built.status !== "ready") {
+    return commandResult(token, "miss", "invalidField");
+  }
+
+  const prePaintFrame = await nextFrame(token);
+  if (prePaintFrame === "timeout") {
+    return commandResult(token, "miss", "paintTimeout");
+  }
+  if (prePaintFrame !== "current" || !isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+
+  const previous = decorationGroups.get(value.groupID);
+  previous?.container?.remove();
+  document.body.append(built.container);
+  const state = {
+    token,
+    command,
+    container: built.container,
+    items: built.items,
+    activable: value.activable,
+  };
+  decorationGroups.set(value.groupID, state);
+
+  for (let frame = 0; frame < 2; frame += 1) {
+    const paintFrame = await nextFrame(token);
+    if (paintFrame !== "current" || !isCurrent(token)) {
+      if (decorationGroups.get(value.groupID) === state) {
+        restoreDecorationGroup(value.groupID, previous);
+      }
+      return commandResult(
+        token,
+        paintFrame === "timeout" ? "miss" : "cancelled",
+        paintFrame === "timeout" ? "paintTimeout" : "staleToken"
+      );
+    }
+  }
+  return commandResult(token, "applied", "none");
+}
+
 async function execute(commandValue, tokenValue) {
   let token;
   try {
@@ -707,10 +991,17 @@ async function execute(commandValue, tokenValue) {
     if (!acceptToken(token)) {
       return commandResult(token, "cancelled", "staleToken");
     }
-    if (!isObject(commandValue) || commandValue.kind !== "navigateLocator") {
+    if (!isObject(commandValue)) {
       reject("invalidCommand");
     }
-    return await navigateLocator(commandValue, token);
+    switch (commandValue.kind) {
+      case "navigateLocator":
+        return await navigateLocator(commandValue, token);
+      case "replaceDecorationGroup":
+        return await replaceDecorationGroup(commandValue, token);
+      default:
+        reject("invalidCommand");
+    }
   } catch (error) {
     const reasonCode =
       error instanceof CommandRejection ? error.reasonCode : "internalError";
