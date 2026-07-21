@@ -225,6 +225,7 @@ final class EPUBLocatorCommandBridge: NSObject {
 
     static let contentWorld = WKContentWorld.world(name: "ReaderLocatorCommands")
     private static let frameReadyMessageName = "readerLocatorFrameReady"
+    private static let decorationActivatedMessageName = "readerLocatorDecorationActivated"
     private static let commandScript = "return await readerLocatorCommands.execute(command, token);"
     private static let commandSource: String = Bundle.module
         .url(
@@ -243,6 +244,7 @@ final class EPUBLocatorCommandBridge: NSObject {
     private weak var webView: WKWebView?
     private weak var userContentController: WKUserContentController?
     private var isMessageHandlerEnabled = false
+    var onDecorationActivated: ((Any) -> Void)?
 
     init(layout: EPUBLocatorFrameLayout, publicationBaseURL: AbsoluteURL) {
         self.publicationBaseURL = publicationBaseURL
@@ -275,6 +277,11 @@ final class EPUBLocatorCommandBridge: NSObject {
             contentWorld: Self.contentWorld,
             name: Self.frameReadyMessageName
         )
+        userContentController.add(
+            self,
+            contentWorld: Self.contentWorld,
+            name: Self.decorationActivatedMessageName
+        )
         isMessageHandlerEnabled = true
     }
 
@@ -284,6 +291,10 @@ final class EPUBLocatorCommandBridge: NSObject {
         }
         userContentController.removeScriptMessageHandler(
             forName: Self.frameReadyMessageName,
+            contentWorld: Self.contentWorld
+        )
+        userContentController.removeScriptMessageHandler(
+            forName: Self.decorationActivatedMessageName,
             contentWorld: Self.contentWorld
         )
         isMessageHandlerEnabled = false
@@ -594,6 +605,10 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
         _ userContentController: WKUserContentController,
         didReceive message: WKScriptMessage
     ) {
+        if message.name == Self.decorationActivatedMessageName {
+            onDecorationActivated?(message.body)
+            return
+        }
         guard
             message.name == Self.frameReadyMessageName,
             let body = message.body as? [String: Any],

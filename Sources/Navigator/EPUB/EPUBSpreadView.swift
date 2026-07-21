@@ -108,6 +108,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         locatorCommandBridge.attach(to: webView)
 
         super.init(frame: .zero)
+        locatorCommandBridge.onDecorationActivated = { [weak self] body in
+            self?.decorationDidActivate(body)
+        }
 
         isOpaque = false
         backgroundColor = .clear
@@ -631,7 +634,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let groupName = decoration["group"] as? String,
             var frame = CGRect(json: decoration["rect"])
         else {
-            log(.warning, "Invalid body for decorationDidActivate: \(body)")
+            log(.warning, "Invalid decoration activation body")
             return
         }
 

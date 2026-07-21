@@ -1009,6 +1009,66 @@ async function execute(commandValue, tokenValue) {
   }
 }
 
+function decorationAtPoint(x, y) {
+  const groups = Array.from(decorationGroups.entries()).reverse();
+  for (const [groupID, state] of groups) {
+    if (!state.activable || !isCurrent(state.token)) {
+      continue;
+    }
+    for (const item of [...state.items].reverse()) {
+      for (const element of item.clickableElements) {
+        const rect = element.getBoundingClientRect();
+        if (
+          x >= rect.left - 1 &&
+          x <= rect.right + 1 &&
+          y >= rect.top - 1 &&
+          y <= rect.bottom + 1
+        ) {
+          return { groupID, item, rect };
+        }
+      }
+    }
+  }
+  return null;
+}
+
+document.addEventListener(
+  "click",
+  (event) => {
+    if (!globalThis.getSelection()?.isCollapsed) {
+      return;
+    }
+    const target = decorationAtPoint(event.clientX, event.clientY);
+    if (!target) {
+      return;
+    }
+    try {
+      globalThis.webkit?.messageHandlers?.readerLocatorDecorationActivated?.postMessage(
+        {
+          id: target.item.id,
+          group: target.groupID,
+          rect: {
+            left: target.rect.left,
+            top: target.rect.top,
+            width: target.rect.width,
+            height: target.rect.height,
+          },
+          click: {
+            defaultPrevented: event.defaultPrevented,
+            x: event.clientX,
+            y: event.clientY,
+            targetElement: "",
+          },
+        }
+      );
+    } catch (_) {
+      // Activation delivery is best-effort. Painting state is independent of
+      // native callback availability.
+    }
+  },
+  true
+);
+
 Object.defineProperty(globalThis, "readerLocatorCommands", {
   configurable: false,
   enumerable: false,

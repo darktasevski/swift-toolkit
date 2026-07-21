@@ -7,51 +7,34 @@
 import Foundation
 import ReadiumShared
 
-extension Array where Element == DecorationChange {
-    /// Generates the JavaScript used to apply the receiver list of `DecorationChange` in a web view.
-    func javascript(forGroup group: String, styles: [Decoration.Style.Id: HTMLDecorationTemplate]) -> String? {
-        guard !isEmpty else {
-            return nil
-        }
+extension Array where Element == DiffableDecoration {
+    /// Converts a complete native decoration group into bounded, typed values
+    /// for the isolated command world. A single invalid item rejects the whole
+    /// group so native and rendered state cannot diverge through partial work.
+    func commandItems(styles: [Decoration.Style.Id: HTMLDecorationTemplate]) -> [EPUBDecorationCommandItem]? {
+        var items: [EPUBDecorationCommandItem] = []
+        items.reserveCapacity(count)
 
-        return
-            """
-            // Using requestAnimationFrame helps to make sure the page is fully laid out before adding the
-            // decorations.
-            requestAnimationFrame(function () {
-                let group = readium.getDecorations('\(group)');
-                \(compactMap { $0.javascript(styles: styles) }.joined(separator: "\n"))
-            });
-            """
-    }
-}
-
-extension DecorationChange {
-    /// Generates the JavaScript used to apply the receiver `DecorationChange` in a web view.
-    func javascript(styles: [Decoration.Style.Id: HTMLDecorationTemplate]) -> String? {
-        func serializeJSON(of decoration: Decoration) -> String? {
-            guard let style = styles[decoration.style.id] else {
-                EPUBNavigatorViewController.log(.error, "Decoration style not registered: \(decoration.style.id)")
+        for value in self {
+            let decoration = value.decoration
+            guard
+                let template = styles[decoration.style.id],
+                let locatorJSON = try? decoration.locator.jsonString()
+            else {
+                EPUBNavigatorViewController.log(.error, "Decoration command encoding failed")
                 return nil
             }
-            var json = decoration.jsonObject
-            json["element"] = .string(style.element(decoration))
-            guard let jsonString = try? json.jsonString() else {
-                EPUBNavigatorViewController.log(.error, "Can't serialize decoration to JSON: \(json)")
-                return nil
-            }
-            return jsonString
+            items.append(EPUBDecorationCommandItem(
+                id: decoration.id,
+                locatorJSON: locatorJSON,
+                style: EPUBDecorationCommandStyle(
+                    layout: template.layout.rawValue,
+                    width: template.width.rawValue,
+                    element: template.element(decoration),
+                    stylesheet: template.stylesheet ?? ""
+                )
+            ))
         }
-
-        switch self {
-        case let .add(decoration):
-            return serializeJSON(of: decoration)
-                .map { "group.add(\($0));" }
-        case let .remove(identifier):
-            return "group.remove('\(identifier)');"
-        case let .update(decoration):
-            return serializeJSON(of: decoration)
-                .map { "group.update(\($0));" }
-        }
+        return items
     }
 }
