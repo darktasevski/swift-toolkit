@@ -11,6 +11,7 @@
   </metadata>
   <manifest>
     <item id="titlepage" href="titlepage.xhtml"/>
+    <item id="stylesheet" href="styles/book.css"/>
   </manifest>
   <spine>
     <itemref idref="titlepage"/>
