@@ -276,6 +276,117 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
     }
 
+    func testCancellingNavigationCancelsExactTargetCommandAndPreventsLateLanding() async {
+        let initial = TestPageView()
+        let target = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [0: initial, 1: target])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let navigation = Task { @MainActor in
+            await pagination.goToIndex(
+                1,
+                location: .end,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        await waitUntil { target.goCallCount == 1 }
+
+        navigation.cancel()
+        await waitUntil { target.cancellationObserved }
+        target.finishGo()
+
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(target.landingCount, 0)
+    }
+
+    func testCancellingStaleNavigationDoesNotCancelNewGenerationCommand() async {
+        let initial = TestPageView()
+        let firstTarget = TestPageView(blocksGo: true)
+        let latestTarget = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [
+            0: initial,
+            1: firstTarget,
+            2: latestTarget,
+        ])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 3, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let staleNavigationID = UUID()
+        let staleNavigation = Task { @MainActor in
+            await pagination.goToIndex(
+                1,
+                location: .end,
+                options: NavigatorGoOptions(animated: false),
+                navigationID: staleNavigationID
+            )
+        }
+        await waitUntil { firstTarget.goCallCount == 1 }
+
+        let latestNavigation = Task { @MainActor in
+            await pagination.goToIndex(
+                2,
+                location: .end,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        await waitUntil { firstTarget.cancellationObserved }
+        firstTarget.finishGo()
+        await waitUntil { latestTarget.goCallCount == 1 }
+
+        _ = pagination.cancelNavigationRequest(staleNavigationID)
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertFalse(latestTarget.cancellationObserved)
+
+        latestTarget.finishGo()
+        _ = await staleNavigation.value
+        let latestOutcome = await latestNavigation.value
+        XCTAssertEqual(latestOutcome, .succeeded)
+        XCTAssertEqual(latestTarget.landingCount, 1)
+    }
+
+    func testCancellingNavigationDuringTransitionDoesNotCancelNeighborPreload() async {
+        let initial = TestPageView()
+        let target = TestPageView()
+        let neighbor = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [0: initial])
+        let pagination = makePaginationView()
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 3, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+        await waitUntil { delegate.requestedIndices.contains(1) }
+        delegate.pages[1] = target
+        delegate.pages[2] = neighbor
+
+        let navigation = Task { @MainActor in
+            await pagination.goToIndex(
+                1,
+                location: .start,
+                options: NavigatorGoOptions(animated: true)
+            )
+        }
+        await waitUntil { neighbor.goCallCount == 1 }
+
+        navigation.cancel()
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertFalse(neighbor.cancellationObserved)
+
+        neighbor.finishGo()
+        await waitUntil { neighbor.landingCount == 1 }
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(neighbor.landingCount, 1)
+    }
+
     private func makePaginationView(preloadPositionCount: Int = 1) -> PaginationView {
         PaginationView(
             frame: CGRect(x: 0, y: 0, width: 320, height: 480),
@@ -343,6 +454,7 @@ private final class TestPageView: UIView, PageView {
     private(set) var maximumConcurrentGoCount = 0
     private(set) var cancellationObserved = false
     private(set) var commandSupersessionAcknowledgementCount = 0
+    private(set) var landingCount = 0
 
     var goStarted: Bool {
         goCallCount > 0
@@ -367,9 +479,14 @@ private final class TestPageView: UIView, PageView {
         activeGoCount += 1
         maximumConcurrentGoCount = max(maximumConcurrentGoCount, activeGoCount)
         defer { activeGoCount -= 1 }
-        guard blocksGo else { return commandOutcome }
+        guard blocksGo else {
+            if commandOutcome == .succeeded {
+                landingCount += 1
+            }
+            return commandOutcome
+        }
 
-        return await withTaskCancellationHandler {
+        let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 goContinuations.append(continuation)
             }
@@ -378,6 +495,11 @@ private final class TestPageView: UIView, PageView {
                 self?.cancellationObserved = true
             }
         }
+        guard !Task.isCancelled else { return .cancelled }
+        if outcome == .succeeded {
+            landingCount += 1
+        }
+        return outcome
     }
 
     func acknowledgeCommandSupersession() {

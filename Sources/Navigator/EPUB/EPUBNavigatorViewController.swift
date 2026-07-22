@@ -43,6 +43,47 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     VisualNavigator, ViewportObservingNavigator, VisibleAnchorObservingNavigator,
     SelectableNavigator, DecorableNavigator, Configurable, Loggable
 {
+    enum PageCommandNavigationDisposition: Equatable {
+        case landed
+        case miss
+        case cancelled
+    }
+
+    static func navigationDisposition(
+        for outcome: PageCommandOutcome
+    ) -> PageCommandNavigationDisposition {
+        switch outcome {
+        case .succeeded:
+            return .landed
+        case .failed:
+            return .miss
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
+    enum PageTurnNavigationDisposition: Equatable {
+        case moved
+        case crossResource
+        case failed
+        case cancelled
+    }
+
+    static func pageTurnNavigationDisposition(
+        for outcome: EPUBSpreadView.PageTurnOutcome
+    ) -> PageTurnNavigationDisposition {
+        switch outcome {
+        case .succeeded:
+            return .moved
+        case .boundary:
+            return .crossResource
+        case .failed:
+            return .failed
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
     public enum EPUBError: Error {
         /// The provided publication is restricted. Check that any DRM was
         /// properly unlocked using a Content Protection.
@@ -544,12 +585,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
-        if
-            let spreadView = paginationView.currentView as? EPUBSpreadView,
-            await spreadView.go(to: direction, options: options)
-        {
-            on(.moved)
-            return true
+        if let spreadView = paginationView.currentView as? EPUBSpreadView {
+            let pageTurnOutcome = await spreadView.go(to: direction, options: options)
+            switch Self.pageTurnNavigationDisposition(for: pageTurnOutcome) {
+            case .moved:
+                on(.moved)
+                return true
+            case .failed, .cancelled:
+                on(.moved)
+                return false
+            case .crossResource:
+                break
+            }
         }
 
         let isRTL = (viewModel.readingProgression == .rtl)
@@ -566,7 +613,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }()
 
         on(.moved)
-        return outcome == .succeeded
+        return Self.navigationDisposition(for: outcome) == .landed
     }
 
     // MARK: - Pagination and spreads
@@ -778,7 +825,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             options: options
         )
         on(.jumped)
-        if outcome == .succeeded {
+        if Self.navigationDisposition(for: outcome) == .landed {
             delegate?.navigator(self, didJumpTo: locator)
         }
         return outcome
@@ -827,13 +874,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             spreadView = loaded
         } else {
             let resourceOnly = Locator(href: locator.href, mediaType: locator.mediaType)
-            switch await goToLocator(
+            let resourceOutcome = await goToLocator(
                 resourceOnly,
                 options: NavigatorGoOptions(animated: animated)
-            ) {
-            case .succeeded:
+            )
+            switch Self.navigationDisposition(for: resourceOutcome) {
+            case .landed:
                 break
-            case .failed:
+            case .miss:
                 return .miss
             case .cancelled:
                 return .cancelled

@@ -567,9 +567,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
-    func go(to direction: Direction, options: NavigatorGoOptions) async -> Bool {
+    enum PageTurnOutcome: Equatable, Sendable {
+        case succeeded
+        case boundary
+        case failed
+        case cancelled
+    }
+
+    func go(
+        to direction: Direction,
+        options: NavigatorGoOptions
+    ) async -> PageTurnOutcome {
         // The default implementation of a spread view considers that its content is entirely visible on screen.
-        false
+        .boundary
     }
 
     func findFirstVisibleElementLocator() async -> Locator? {

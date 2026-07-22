@@ -99,8 +99,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
     private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
-    private var activeCommandMutationGeneration: EPUBSpreadReadiness.Generation?
-    private var isActiveCommandSupersessionAcknowledged = false
+    private final class PositionCommandOwnership {
+        var isSupersessionAcknowledged = false
+    }
+
+    private struct PositionCommandEntry {
+        let ownership: PositionCommandOwnership
+        let task: Task<PageTurnOutcome, Never>
+    }
+
+    private var activePositionCommand: PositionCommandEntry?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -123,8 +131,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func clear() {
         settingsLayoutTask?.cancel()
         settingsLayoutTask = nil
-        activeCommandMutationGeneration = nil
-        isActiveCommandSupersessionAcknowledged = false
+        activePositionCommand?.task.cancel()
+        activePositionCommand = nil
         super.clear()
         scrollAnimationCoordinator.finish()
     }
@@ -375,50 +383,36 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
-    override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+    override func go(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> PageTurnOutcome {
         guard !viewModel.scroll else {
             return await super.go(to: direction, options: options)
         }
 
-        guard let writerLease = readiness.acquirePositionWriter() else {
-            return false
-        }
-        defer { readiness.release(writerLease) }
-
-        let factor: CGFloat = {
-            switch direction {
-            case .left:
-                return -1
-            case .right:
-                return 1
+        if !readiness.isCommandReady, activePositionCommand == nil {
+            guard !Task.isCancelled else { return .cancelled }
+            let generation = readiness.generation
+            switch await readiness.waitForCommandReadiness(for: generation) {
+            case .ready:
+                guard !Task.isCancelled else { return .cancelled }
+            case .cancelled:
+                return .cancelled
+            case .documentAvailable, .invalidated, .timedOut:
+                return .failed
             }
-        }()
-
-        guard scrollView.bounds.width > 0 else { return false }
-        let offsetX = scrollView.bounds.width * factor
-        let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
-        guard 0 ..< scrollView.contentSize.width ~= targetX else {
-            return false
         }
 
-        // We use JavaScript instead of `UIScrollView.setContentOffset()` to
-        // prevent glitches when turning pages without animation.
-        // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
-        //
-        // `scrollBy` is used instead of `scrollTo` because RTL content uses
-        // negative `window.scrollX` values in WKWebView, whereas UIKit's
-        // `contentOffset.x` is always non-negative. A relative displacement
-        // (`offsetX`) is coordinate-system agnostic and works for both LTR and
-        // RTL.
-        let behavior = options.animated ? "smooth" : "instant"
-        await evaluateDocumentScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
+        return await runPositionCommand(.pageTurn(PendingPageTurn(
+            direction: direction,
+            animated: options.animated
+        )))
+    }
 
-        if options.animated {
-            // Waits for the scroll animation to finish.
-            await scrollAnimationCoordinator.waitUntilSettled()
-        }
-
-        return true
+    private struct PendingPageTurn {
+        let direction: EPUBSpreadView.Direction
+        let animated: Bool
     }
 
     private struct PendingLocation {
@@ -426,14 +420,21 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         let animated: Bool
     }
 
+    private enum PendingPositionCommand {
+        case location(PendingLocation)
+        case pageTurn(PendingPageTurn)
+    }
+
     /// Location to scroll to in the resource once the page is loaded.
     private let pendingLocationMutation = EPUBLatestMutation(
         initialValue: PendingLocation(location: .start, animated: false)
     )
+    private let pendingPositionMutation = EPUBLatestMutation<PendingPositionCommand>(
+        initialValue: .location(PendingLocation(location: .start, animated: false))
+    )
 
     func acknowledgeCommandSupersession() {
-        guard activeCommandMutationGeneration != nil else { return }
-        isActiveCommandSupersessionAcknowledged = true
+        activePositionCommand?.ownership.isSupersessionAcknowledged = true
     }
 
     override func go(
@@ -445,7 +446,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             animated: animated
         ))
 
-        guard readiness.isCommandReady else {
+        guard readiness.isCommandReady || activePositionCommand != nil else {
             let generation = readiness.generation
             switch await readiness.waitForCommandReadiness(for: generation) {
             case .ready:
@@ -457,35 +458,169 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
+        let outcome = await runPositionCommand(.location(PendingLocation(
+            location: location,
+            animated: animated
+        )))
+        switch outcome {
+        case .succeeded:
+            return .succeeded
+        case .cancelled:
+            return .cancelled
+        case .boundary, .failed:
+            return .failed
+        }
+    }
+
+    private func runPositionCommand(
+        _ command: PendingPositionCommand
+    ) async -> PageTurnOutcome {
+        pendingPositionMutation.update(command)
+
+        let predecessor = activePositionCommand?.task
+        activePositionCommand?.ownership.isSupersessionAcknowledged = true
+        predecessor?.cancel()
+
+        let ownership = PositionCommandOwnership()
+        let task = Task { @MainActor [weak self, ownership] in
+            if let predecessor {
+                _ = await predecessor.value
+            }
+            guard let self else { return PageTurnOutcome.cancelled }
+            let outcome = await self.executePositionCommand(ownership: ownership)
+            if self.activePositionCommand?.ownership === ownership {
+                self.activePositionCommand = nil
+            }
+            return outcome
+        }
+        activePositionCommand = PositionCommandEntry(
+            ownership: ownership,
+            task: task
+        )
+
+        return await withTaskCancellationHandler {
+            let outcome = await task.value
+            guard Task.isCancelled else { return outcome }
+            cancelPositionCommand(ownedBy: ownership)
+            _ = await task.value
+            return .cancelled
+        } onCancel: {
+            Task { @MainActor [weak self, ownership] in
+                self?.cancelPositionCommand(ownedBy: ownership)
+            }
+        }
+    }
+
+    private func cancelPositionCommand(
+        ownedBy ownership: PositionCommandOwnership
+    ) {
+        guard activePositionCommand?.ownership === ownership else { return }
+        activePositionCommand?.task.cancel()
+    }
+
+    private func executePositionCommand(
+        ownership: PositionCommandOwnership
+    ) async -> PageTurnOutcome {
+        guard !Task.isCancelled else {
+            if !ownership.isSupersessionAcknowledged {
+                readiness.invalidate()
+            }
+            return .cancelled
+        }
         guard let writerLease = readiness.acquirePositionWriter() else {
             return Task.isCancelled ? .cancelled : .failed
         }
-        activeCommandMutationGeneration = writerLease.generation
-        isActiveCommandSupersessionAcknowledged = false
-        defer {
-            if activeCommandMutationGeneration == writerLease.generation {
-                activeCommandMutationGeneration = nil
-                isActiveCommandSupersessionAcknowledged = false
-            }
-        }
-        let succeeded = await pendingLocationMutation.applyLatest { [weak self] location in
+
+        var appliedOutcome = PageTurnOutcome.failed
+        let succeeded = await pendingPositionMutation.applyLatest { [weak self] command in
             guard let self else { return false }
-            guard await self.apply(location) else { return false }
-            return await self.waitForLayoutStability()
+            appliedOutcome = await self.apply(command)
+            return appliedOutcome == .succeeded || appliedOutcome == .boundary
         }
+
         let mutationOutcome: EPUBSpreadReadiness.MutationOutcome
         if succeeded {
             mutationOutcome = .succeeded
-        } else if Task.isCancelled, isActiveCommandSupersessionAcknowledged {
+        } else if Task.isCancelled, ownership.isSupersessionAcknowledged {
             mutationOutcome = .superseded
         } else {
             mutationOutcome = .failed
         }
         readiness.finishMutation(writerLease, outcome: mutationOutcome)
+
         if succeeded {
-            return .succeeded
+            return appliedOutcome
         }
         return Task.isCancelled ? .cancelled : .failed
+    }
+
+    private func apply(
+        _ command: PendingPositionCommand
+    ) async -> PageTurnOutcome {
+        switch command {
+        case let .location(location):
+            guard await apply(location) else { return .failed }
+            return await waitForLayoutStability() ? .succeeded : .failed
+        case let .pageTurn(turn):
+            return await apply(turn)
+        }
+    }
+
+    private func apply(_ turn: PendingPageTurn) async -> PageTurnOutcome {
+        let factor: CGFloat
+        switch turn.direction {
+        case .left:
+            factor = -1
+        case .right:
+            factor = 1
+        }
+        guard scrollView.bounds.width > 0 else { return .failed }
+        let offsetX = scrollView.bounds.width * factor
+        let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
+        guard 0 ..< scrollView.contentSize.width ~= targetX else {
+            return .boundary
+        }
+
+        // We use JavaScript instead of `UIScrollView.setContentOffset()` to
+        // prevent glitches when turning pages without animation.
+        // See https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
+        //
+        // `scrollBy` is used instead of `scrollTo` because RTL content uses
+        // negative `window.scrollX` values in WKWebView, whereas UIKit's
+        // `contentOffset.x` is always non-negative. A relative displacement
+        // (`offsetX`) is coordinate-system agnostic and works for both LTR and
+        // RTL.
+        let behavior = turn.animated ? "smooth" : "instant"
+        let result = await evaluateDocumentScript(
+            "window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });"
+        )
+        guard case .success = result else {
+            return .failed
+        }
+
+        let settlement = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            if turn.animated {
+                await scrollAnimationCoordinator.waitUntilSettled()
+            }
+            guard await waitForLayoutStability() else { return false }
+            return await waitForScrollPosition(targetX)
+        }
+        let didSettle = await settlement.value
+        guard didSettle else { return .failed }
+        return Task.isCancelled ? .cancelled : .succeeded
+    }
+
+    private func waitForScrollPosition(_ targetX: CGFloat) async -> Bool {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(1))
+        while clock.now < deadline {
+            if abs(scrollView.contentOffset.x - targetX) <= 1 {
+                return true
+            }
+            try? await clock.sleep(for: .milliseconds(10))
+        }
+        return false
     }
 
     private func apply(_ location: PendingLocation) async -> Bool {

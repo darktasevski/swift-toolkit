@@ -10,6 +10,268 @@ import XCTest
 
 @MainActor
 final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
+    func testSuccessfulReflowablePageTurnReturnsSucceededAndRemainsReady() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+
+        let outcome = await spreadView.go(
+            to: .right,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testReflowablePageTurnAtBoundaryReturnsBoundaryAndRemainsReady() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+
+        let outcome = await spreadView.go(
+            to: .left,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .boundary)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testReflowablePageTurnScriptFailureInvalidatesReadiness() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+        _ = try await spreadView.webView.callAsyncJavaScript(
+            "window.scrollBy = () => { throw new Error('page turn failed'); }; return true;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+
+        let outcome = await spreadView.go(
+            to: .right,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertFalse(spreadView.readiness.isCommandReady)
+        guard case .unavailable = spreadView.readiness.state else {
+            return XCTFail("Failed page turn republished command readiness")
+        }
+    }
+
+    func testCancellingReflowablePageTurnReturnsCancelledAndInvalidatesReadiness() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+
+        let turn = Task { @MainActor in
+            await spreadView.go(
+                to: .right,
+                options: NavigatorGoOptions(animated: true)
+            )
+        }
+        try await waitUntil {
+            if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
+                return true
+            }
+            return false
+        }
+        turn.cancel()
+
+        let outcome = await turn.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertFalse(spreadView.readiness.isCommandReady)
+        guard case .unavailable = spreadView.readiness.state else {
+            return XCTFail("Cancelled page turn retained frame capability")
+        }
+    }
+
+    func testPaginationCallerCancellationInvalidatesActualReflowableCommand() async throws {
+        let spreadView = makeReflowableSpreadView(scroll: true)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+
+        let delegate = ReflowablePaginationDelegate(spreadView: spreadView)
+        let pagination = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 600, height: 800),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true
+        )
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: 1,
+            readingProgression: .ltr
+        )
+        try await waitUntil { delegate.updateCount == 1 }
+        try await blockAnimationFrames(in: spreadView)
+
+        let navigation = Task { @MainActor in
+            await pagination.goToIndex(
+                0,
+                location: .end,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        try await waitUntil {
+            if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
+                return true
+            }
+            return false
+        }
+        let offsetAtCancellation = spreadView.scrollView.contentOffset
+
+        navigation.cancel()
+        try await releaseAnimationFrames(in: spreadView)
+
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .cancelled)
+        XCTAssertEqual(spreadView.scrollView.contentOffset, offsetAtCancellation)
+        XCTAssertFalse(spreadView.readiness.isCommandReady)
+        guard case .unavailable = spreadView.readiness.state else {
+            return XCTFail("Pagination caller cancellation retained reflow capability")
+        }
+    }
+
+    func testRapidReflowablePageTurnsSupersedeAndSerializePositionWriters() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+        try await blockAnimationFrames(in: spreadView)
+
+        let first = Task { @MainActor in
+            await spreadView.go(
+                to: .right,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        try await waitUntil {
+            spreadView.scrollView.contentOffset.x > 0
+                && spreadView.readiness.state == .initializing(
+                    generation: spreadView.readiness.generation,
+                    activeWriterLeases: 1
+                )
+        }
+        let latest = Task { @MainActor in
+            await spreadView.go(
+                to: .left,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        await Task.yield()
+
+        if case let .initializing(_, activeWriterLeases) = spreadView.readiness.state {
+            XCTAssertEqual(activeWriterLeases, 1)
+        }
+        try await releaseAnimationFrames(in: spreadView)
+        let firstOutcome = await first.value
+        let latestOutcome = await latest.value
+        XCTAssertEqual(firstOutcome, .cancelled)
+        XCTAssertEqual(latestOutcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+        XCTAssertEqual(spreadView.scrollView.contentOffset.x, 0, accuracy: 1)
+    }
+
+    func testRapidReflowableLocationsSupersedeAndSerializePositionWriters() async throws {
+        let spreadView = makeReflowableSpreadView(scroll: true)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+        try await blockAnimationFrames(in: spreadView)
+
+        let first = Task { @MainActor in
+            await spreadView.go(to: .start, animated: false)
+        }
+        try await waitUntil {
+            if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
+                return true
+            }
+            return false
+        }
+        let latest = Task { @MainActor in
+            await spreadView.go(to: .end, animated: false)
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(
+            spreadView.readiness.state,
+            .initializing(
+                generation: spreadView.readiness.generation,
+                activeWriterLeases: 1
+            )
+        )
+        try await releaseAnimationFrames(in: spreadView)
+
+        let firstOutcome = await first.value
+        let latestOutcome = await latest.value
+        XCTAssertEqual(firstOutcome, .cancelled)
+        XCTAssertEqual(latestOutcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+        XCTAssertEqual(
+            spreadView.scrollView.contentOffset.y,
+            spreadView.scrollView.contentSize.height - spreadView.scrollView.bounds.height,
+            accuracy: 1
+        )
+    }
+
+    func testReflowablePageTurnWaitsForExistingLayoutWriter() async throws {
+        let spreadView = makeReflowableSpreadView()
+        let delegate = TestSpreadDelegate()
+        spreadView.delegate = delegate
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+        try await blockAnimationFrames(in: spreadView)
+
+        delegate.contentInset = UIEdgeInsets(top: 24, left: 0, bottom: 32, right: 0)
+        spreadView.safeAreaInsetsDidChange()
+        try await waitUntil {
+            spreadView.readiness.state == .initializing(
+                generation: spreadView.readiness.generation,
+                activeWriterLeases: 1
+            )
+        }
+
+        var turnOutcome: EPUBSpreadView.PageTurnOutcome?
+        let turn = Task { @MainActor in
+            let outcome = await spreadView.go(
+                to: .right,
+                options: NavigatorGoOptions(animated: false)
+            )
+            turnOutcome = outcome
+            return outcome
+        }
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        XCTAssertEqual(
+            spreadView.readiness.state,
+            .initializing(
+                generation: spreadView.readiness.generation,
+                activeWriterLeases: 1
+            )
+        )
+        XCTAssertNil(turnOutcome)
+
+        try await releaseAnimationFrames(in: spreadView)
+        let outcome = await turn.value
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
     func testReflowableRuntimeInsetFailureNeverRepublishesReady() async throws {
         let spreadView = makeReflowableSpreadView(scroll: true)
         let delegate = TestSpreadDelegate()
@@ -17,7 +279,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
         try await initializeReflowableSpread(spreadView)
-        try await makeLayoutUnstable(in: spreadView)
+        try await makeLayoutStabilityCheckFail(in: spreadView)
 
         delegate.contentInset = UIEdgeInsets(top: 24, left: 0, bottom: 32, right: 0)
         spreadView.safeAreaInsetsDidChange()
@@ -293,9 +555,9 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
     }
 
-    private func makeLayoutUnstable(in spreadView: EPUBSpreadView) async throws {
+    private func makeLayoutStabilityCheckFail(in spreadView: EPUBSpreadView) async throws {
         _ = try await spreadView.webView.callAsyncJavaScript(
-            "let tall = false; window.requestAnimationFrame = callback => setTimeout(() => { tall = !tall; document.body.style.height = tall ? '10000px' : '12000px'; callback(performance.now()); }, 0); return true;",
+            "window.requestAnimationFrame = () => { throw new Error('test layout stability failure'); }; return true;",
             arguments: [:],
             in: nil,
             contentWorld: .page
@@ -374,6 +636,34 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 }
 
 private struct TestTimeout: Error {}
+
+@MainActor
+private final class ReflowablePaginationDelegate: PaginationViewDelegate {
+    let spreadView: EPUBReflowableSpreadView
+    private(set) var updateCount = 0
+
+    init(spreadView: EPUBReflowableSpreadView) {
+        self.spreadView = spreadView
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        pageViewAtIndex index: Int
+    ) -> (UIView & PageView)? {
+        index == 0 ? spreadView : nil
+    }
+
+    func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
+        updateCount += 1
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        positionCountAtIndex index: Int
+    ) -> Int {
+        1
+    }
+}
 
 @MainActor
 private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
