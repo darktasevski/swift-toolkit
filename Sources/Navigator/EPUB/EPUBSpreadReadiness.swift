@@ -59,6 +59,39 @@ struct EPUBSpreadFrameCapability: Equatable, Hashable, Sendable {
 final class EPUBSpreadReadiness {
     typealias Generation = UInt64
 
+    /// One non-resetting budget shared by stylesheet, font and geometry
+    /// stabilization during spread initialization.
+    static let initializationStabilityBudgetMilliseconds = 5000
+
+    static func makeInitializationStabilityDeadline(
+        clock: ContinuousClock = ContinuousClock()
+    ) -> ContinuousClock.Instant {
+        clock.now.advanced(by: .milliseconds(
+            initializationStabilityBudgetMilliseconds
+        ))
+    }
+
+    static func remainingInitializationStabilityMilliseconds(
+        until deadline: ContinuousClock.Instant,
+        clock: ContinuousClock = ContinuousClock()
+    ) -> Int {
+        let remaining = clock.now.duration(to: deadline)
+        guard remaining > .zero else { return 0 }
+
+        let components = remaining.components
+        let millisecondsPerSecond: Int64 = 1000
+        let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+        let wholeMilliseconds = components.seconds * millisecondsPerSecond
+        let partialMilliseconds = (
+            components.attoseconds + attosecondsPerMillisecond - 1
+        ) / attosecondsPerMillisecond
+        return Int(wholeMilliseconds + partialMilliseconds)
+    }
+
+    /// Bounds controller waits after a page object is installed but before its
+    /// exact render generation publishes command readiness.
+    static let commandReadinessBudget: Duration = .seconds(2)
+
     enum State: Equatable, Sendable {
         case unavailable(generation: Generation)
         case loading(generation: Generation)
@@ -298,6 +331,18 @@ final class EPUBSpreadReadiness {
         activeWriterLeaseIDs.removeAll()
         initializingFrameCapability = nil
         state = .unavailable(generation: generation)
+    }
+
+    /// Invalidates only when the supplied generation still owns the lifecycle.
+    /// Late navigation and initialization callbacks must not poison a newer
+    /// document generation.
+    @discardableResult
+    func invalidate(ifCurrent generation: Generation) -> Bool {
+        guard state.generation == generation else {
+            return false
+        }
+        invalidate()
+        return true
     }
 
     func waitForDocumentAvailability(for generation: Generation) async -> WaitOutcome {

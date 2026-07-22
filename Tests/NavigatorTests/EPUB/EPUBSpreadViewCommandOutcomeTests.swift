@@ -6,10 +6,118 @@
 
 @testable import ReadiumNavigator
 import ReadiumShared
+import WebKit
 import XCTest
 
 @MainActor
 final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
+    func testFreshReflowablePaginationImmediatelyAwaitsItsPageCommand() async {
+        let spreadView = makeReflowableSpreadView(
+            scroll: true,
+            scripts: [activeAnimationFramesUserScript()]
+        )
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        let (pagination, delegate) = makePagination(spreadView: spreadView)
+        _ = delegate
+        let hostWindow = hostView(pagination)
+        defer { hostWindow.isHidden = true }
+
+        let outcome = await pagination.goToIndex(
+            0,
+            location: .end,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testFreshFixedPaginationImmediatelyAwaitsItsPageCommand() async {
+        let spreadView = makeFixedSpreadView(
+            scripts: [activeAnimationFramesUserScript()]
+        )
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        let (pagination, delegate) = makePagination(spreadView: spreadView)
+        _ = delegate
+        let hostWindow = hostView(pagination)
+        defer { hostWindow.isHidden = true }
+
+        let outcome = await pagination.goToIndex(
+            0,
+            location: .start,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testReplacementReflowableLoadStartsItsGenerationSynchronously() async throws {
+        let spreadView = makeReflowableSpreadView()
+        try await waitForDocumentLoad(in: spreadView)
+        let firstGeneration = spreadView.readiness.generation
+
+        spreadView.loadSpread()
+
+        XCTAssertEqual(spreadView.readiness.generation, firstGeneration + 1)
+        XCTAssertEqual(
+            spreadView.readiness.state,
+            .loading(generation: firstGeneration + 1)
+        )
+    }
+
+    func testCancellingLoadingLocationDoesNotApplyAfterInitialization() async throws {
+        let spreadView = makeReflowableSpreadView(scroll: true)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+
+        let navigation = Task { @MainActor in
+            await spreadView.go(to: .end, animated: false)
+        }
+        await Task.yield()
+        navigation.cancel()
+
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .cancelled)
+        let offsetAfterCancellation = spreadView.scrollView.contentOffset
+
+        try await initializeReflowableSpread(spreadView)
+
+        XCTAssertEqual(spreadView.scrollView.contentOffset, offsetAfterCancellation)
+    }
+
+    func testCancellingOlderLoadingLocationDoesNotClearNewerLocation() async throws {
+        let spreadView = makeReflowableSpreadView(scroll: true)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+
+        let olderNavigation = Task { @MainActor in
+            await spreadView.go(to: .start, animated: false)
+        }
+        await Task.yield()
+        let newerNavigation = Task { @MainActor in
+            await spreadView.go(to: .end, animated: false)
+        }
+        await Task.yield()
+        olderNavigation.cancel()
+
+        let olderOutcome = await olderNavigation.value
+        XCTAssertEqual(olderOutcome, .cancelled)
+        try await initializeReflowableSpread(spreadView)
+
+        let newerOutcome = await newerNavigation.value
+        XCTAssertEqual(newerOutcome, .succeeded)
+        XCTAssertEqual(
+            spreadView.scrollView.contentOffset.y,
+            spreadView.scrollView.contentSize.height - spreadView.scrollView.bounds.height,
+            accuracy: 1
+        )
+    }
+
     func testSuccessfulReflowablePageTurnReturnsSucceededAndRemainsReady() async throws {
         let spreadView = makeReflowableSpreadView()
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
@@ -390,6 +498,130 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(initializationOutcome, .succeeded)
     }
 
+    func testReflowableInitializationWaitsForLateExternalStylesheet() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        try await enableAnimationFrames(in: spreadView)
+        try await installDelayedStylesheet(in: spreadView, documentExpression: "document")
+        let hostWindow = hostView(spreadView)
+        defer { hostWindow.isHidden = true }
+
+        let outcome = try await initializeLoadedReflowableSpread(spreadView)
+        let stylesheetReady = try await spreadView.webView.callAsyncJavaScript(
+            "return document.querySelector('link[href$=\"late.css\"]')?.sheet !== null;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        ) as? Bool
+
+        XCTAssertEqual(stylesheetReady, true)
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testFixedInitializationWaitsForLateExternalStylesheet() async throws {
+        let spreadView = makeFixedSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        try await waitForFixedResourceLoad(in: spreadView)
+        try await enableAnimationFrames(in: spreadView)
+        try await installDelayedStylesheet(
+            in: spreadView,
+            documentExpression: "document.querySelector('iframe').contentDocument"
+        )
+        let hostWindow = hostView(spreadView)
+        defer { hostWindow.isHidden = true }
+
+        let outcome = try await initializeLoadedFixedSpread(spreadView)
+        let stylesheetReady = try await spreadView.webView.callAsyncJavaScript(
+            "return document.querySelector('iframe').contentDocument.querySelector('link[href$=\"late.css\"]')?.sheet !== null;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        ) as? Bool
+
+        XCTAssertEqual(stylesheetReady, true)
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testUnavailableStylesheetUsesOneBudgetAndDoesNotPoisonReplacement() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        try await enableAnimationFrames(in: spreadView)
+        _ = try await spreadView.webView.callAsyncJavaScript(
+            "const link = document.createElement('link'); link.rel = 'stylesheet'; document.head.append(link); return true;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+
+        let clock = ContinuousClock()
+        let startedAt = clock.now
+        let outcome = try await initializeLoadedReflowableSpread(spreadView)
+        let elapsed = startedAt.duration(to: clock.now)
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertGreaterThanOrEqual(
+            elapsed,
+            .milliseconds(EPUBSpreadReadiness.initializationStabilityBudgetMilliseconds - 250)
+        )
+        XCTAssertLessThan(
+            elapsed,
+            .milliseconds(EPUBSpreadReadiness.initializationStabilityBudgetMilliseconds + 750)
+        )
+
+        spreadView.webView.configuration.userContentController.addUserScript(WKUserScript(
+            source: "window.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0);",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
+        spreadView.loadSpread()
+        try await waitForDocumentLoad(in: spreadView)
+        let replacementOutcome = try await initializeLoadedReflowableSpread(spreadView)
+
+        XCTAssertEqual(replacementOutcome, .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady)
+    }
+
+    func testFixedMainFrameReloadBootstrapsExactlyOneNewGeneration() async throws {
+        let spreadView = makeFixedSpreadView(scripts: [WKUserScript(
+            source: "window.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0);",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )])
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        _ = try await initializeLoadedFixedSpread(spreadView)
+        let firstGeneration = spreadView.readiness.generation
+        let wrapperHTMLResult = try await spreadView.webView.callAsyncJavaScript(
+            "return document.documentElement.outerHTML;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        ) as? String
+        let wrapperHTML = try XCTUnwrap(wrapperHTMLResult)
+        let hostWindow = hostView(spreadView)
+        defer { hostWindow.isHidden = true }
+
+        spreadView.webView.loadHTMLString(
+            wrapperHTML,
+            baseURL: spreadView.viewModel.publicationBaseURL.url
+        )
+
+        try await waitUntil(timeout: .seconds(3)) {
+            spreadView.readiness.isCommandReady
+                && spreadView.readiness.generation > firstGeneration
+        }
+        XCTAssertEqual(spreadView.readiness.generation, firstGeneration + 1)
+        try await waitForFixedResourceLoad(in: spreadView)
+    }
+
     func testReflowableInitializationGatesReadinessAndAppliesLatestPendingLocation() async throws {
         let spreadView = makeReflowableSpreadView(scroll: true)
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
@@ -482,24 +714,61 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
     }
 
-    private func makeReflowableSpreadView(scroll: Bool = false) -> EPUBReflowableSpreadView {
+    private func makeReflowableSpreadView(
+        scroll: Bool = false,
+        scripts: [WKUserScript] = []
+    ) -> EPUBReflowableSpreadView {
         let fixture = makeFixture(layout: .reflowable, scroll: scroll)
         return EPUBReflowableSpreadView(
             viewModel: fixture.viewModel,
             spread: fixture.spread,
-            scripts: [],
+            scripts: scripts,
             animatedLoad: false
         )
     }
 
-    private func makeFixedSpreadView() -> EPUBFixedSpreadView {
+    private func makeFixedSpreadView(
+        scripts: [WKUserScript] = []
+    ) -> EPUBFixedSpreadView {
         let fixture = makeFixture(layout: .fixed)
         return EPUBFixedSpreadView(
             viewModel: fixture.viewModel,
             spread: fixture.spread,
-            scripts: [],
+            scripts: scripts,
             animatedLoad: false
         )
+    }
+
+    private func makePagination(
+        spreadView: EPUBSpreadView
+    ) -> (PaginationView, SpreadPaginationDelegate) {
+        let delegate = SpreadPaginationDelegate(spreadView: spreadView)
+        let pagination = PaginationView(
+            frame: CGRect(x: 0, y: 0, width: 600, height: 800),
+            preloadPreviousPositionCount: 0,
+            preloadNextPositionCount: 0,
+            isScrollEnabled: true
+        )
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(
+            0,
+            location: .start,
+            pageCount: 1,
+            readingProgression: .ltr
+        )
+        return (pagination, delegate)
+    }
+
+    private func hostView(_ view: UIView) -> UIWindow {
+        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
+        let viewController = UIViewController()
+        window.rootViewController = viewController
+        view.frame = viewController.view.bounds
+        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
+        viewController.view.addSubview(view)
+        window.makeKeyAndVisible()
+        viewController.view.layoutIfNeeded()
+        return window
     }
 
     private func makeFixture(
@@ -510,15 +779,23 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spread: EPUBSpread
     ) {
         let href = RelativeURL(path: "chapter.html")!
+        let stylesheetHREF = RelativeURL(path: "late.css")!
         let link = Link(href: href.string, mediaType: .html)
         let publication = Publication(
             manifest: Manifest(
                 metadata: Metadata(title: "Spread command outcome", layout: layout),
-                readingOrder: [link]
+                readingOrder: [link],
+                resources: [Link(href: stylesheetHREF.string, mediaType: .css)]
             ),
-            container: SingleResourceContainer(
-                resource: DataResource(string: "<!doctype html><html><head><style>body{height:10000px}</style></head><body>Chapter</body></html>"),
-                at: href.anyURL
+            container: CompositeContainer(
+                SingleResourceContainer(
+                    resource: DataResource(string: "<!doctype html><html><head><style>body{height:10000px}</style></head><body>Chapter</body></html>"),
+                    at: href.anyURL
+                ),
+                SingleResourceContainer(
+                    resource: DataResource(string: "body { letter-spacing: 0; }"),
+                    at: stylesheetHREF.anyURL
+                )
             )
         )
         let viewModel = EPUBNavigatorViewModel(
@@ -553,6 +830,43 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             in: nil,
             contentWorld: .page
         )
+    }
+
+    private func activeAnimationFramesUserScript() -> WKUserScript {
+        WKUserScript(
+            source: "window.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0);",
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        )
+    }
+
+    private func installDelayedStylesheet(
+        in spreadView: EPUBSpreadView,
+        documentExpression: String
+    ) async throws {
+        let result = try await spreadView.webView.callAsyncJavaScript(
+            """
+            const targetDocument = \(documentExpression);
+            const link = targetDocument.createElement('link');
+            link.rel = 'stylesheet';
+            targetDocument.head.append(link);
+            let remainingFrames = 30;
+            const attachStylesheet = () => {
+                remainingFrames -= 1;
+                if (remainingFrames === 0) {
+                    link.href = 'late.css';
+                } else {
+                    requestAnimationFrame(attachStylesheet);
+                }
+            };
+            requestAnimationFrame(attachStylesheet);
+            return link.sheet === null;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        ) as? Bool
+        XCTAssertEqual(result, true)
     }
 
     private func makeLayoutStabilityCheckFail(in spreadView: EPUBSpreadView) async throws {
@@ -606,6 +920,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     ) async throws {
         try await waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
+        let outcome = try await initializeLoadedReflowableSpread(spreadView)
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { spreadView.readiness.isCommandReady }
+    }
+
+    private func initializeLoadedReflowableSpread(
+        _ spreadView: EPUBReflowableSpreadView
+    ) async throws -> EPUBSpreadReadiness.InitializationOutcome {
         let generation = spreadView.readiness.generation
         let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
             for: generation,
@@ -614,8 +936,22 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.applySettings()
         let outcome = await spreadView.initializeSpread()
         spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
-        XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        return outcome
+    }
+
+    private func initializeLoadedFixedSpread(
+        _ spreadView: EPUBFixedSpreadView
+    ) async throws -> EPUBSpreadReadiness.InitializationOutcome {
+        try await waitForDocumentLoad(in: spreadView)
+        try await waitForFixedResourceLoad(in: spreadView)
+        let generation = spreadView.readiness.generation
+        let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability()
+        ))
+        let outcome = await spreadView.initializeSpread()
+        spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
+        return outcome
     }
 
     private func waitUntil(
@@ -656,6 +992,31 @@ private final class ReflowablePaginationDelegate: PaginationViewDelegate {
     func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
         updateCount += 1
     }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        positionCountAtIndex index: Int
+    ) -> Int {
+        1
+    }
+}
+
+@MainActor
+private final class SpreadPaginationDelegate: PaginationViewDelegate {
+    let spreadView: EPUBSpreadView
+
+    init(spreadView: EPUBSpreadView) {
+        self.spreadView = spreadView
+    }
+
+    func paginationView(
+        _ paginationView: PaginationView,
+        pageViewAtIndex index: Int
+    ) -> (UIView & PageView)? {
+        index == 0 ? spreadView : nil
+    }
+
+    func paginationViewDidUpdateViews(_ paginationView: PaginationView) {}
 
     func paginationView(
         _ paginationView: PaginationView,

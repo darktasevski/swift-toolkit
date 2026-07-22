@@ -57,4 +57,43 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             .cancelled
         )
     }
+
+    func testInvalidatedReadySpreadWaitIsReportedAsCancelled() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .invalidated,
+                targetIsCurrent: true,
+                generationIsCurrent: false,
+                taskIsCancelled: false
+            ),
+            .cancelled
+        )
+    }
+
+    func testReplacedReadySpreadTargetIsReportedAsCancelled() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .ready(
+                    generation: 7,
+                    frameCapability: EPUBSpreadFrameCapability()
+                ),
+                targetIsCurrent: false,
+                generationIsCurrent: true,
+                taskIsCancelled: false
+            ),
+            .cancelled
+        )
+    }
+
+    func testCurrentReadySpreadTimeoutIsReportedAsMiss() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .timedOut,
+                targetIsCurrent: true,
+                generationIsCurrent: true,
+                taskIsCancelled: false
+            ),
+            .miss
+        )
+    }
 }

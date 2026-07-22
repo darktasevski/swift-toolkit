@@ -17,8 +17,8 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         let fit: String
     }
 
-    /// Whether the host wrapper page is loaded or not. The wrapper page contains the iframe that will display the resource.
-    private var isWrapperLoaded = false
+    /// Generation whose host wrapper has completed its one bootstrap.
+    private var wrapperBootstrapGeneration: EPUBSpreadReadiness.Generation?
     /// URL to load in the iframe once the wrapper page is loaded.
     private var urlToLoad: URL?
     private var layoutMutation: EPUBLatestMutation<LayoutConfiguration>?
@@ -67,8 +67,23 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             )
 
             // The publication's base URL is used to make sure we can access the resources through the iframe with JavaScript.
-            webView.loadHTMLString(wrapperPage, baseURL: viewModel.publicationBaseURL.url)
+            issueMainFrameLoad {
+                webView.loadHTMLString(
+                    wrapperPage,
+                    baseURL: viewModel.publicationBaseURL.url
+                )
+            }
         }
+    }
+
+    override func mainFrameLoadDidBegin(
+        _ generation: EPUBSpreadReadiness.Generation
+    ) {
+        wrapperBootstrapGeneration = nil
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        layoutTask?.cancel()
+        layoutTask = nil
     }
 
     override func clear() {
@@ -91,7 +106,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     /// Layouts the resource to fit its content in the bounds.
     private func layoutSpread() {
-        guard isWrapperLoaded else {
+        guard wrapperBootstrapGeneration == readiness.generation else {
             return
         }
 
@@ -154,12 +169,14 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         """
     }
 
-    private func applyLatestLayout() async -> Bool {
+    private func applyLatestLayout(
+        stabilityDeadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
         guard let layoutMutation else { return false }
         return await layoutMutation.applyLatest { [weak self] configuration in
             guard let self else { return false }
             guard await self.evaluateViewport(configuration) else { return false }
-            return await self.waitForFixedLayoutStability()
+            return await self.waitForFixedLayoutStability(until: stabilityDeadline)
         }
     }
 
@@ -177,59 +194,90 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         }
     }
 
-    private func waitForFixedLayoutStability() async -> Bool {
+    private func waitForFixedLayoutStability(
+        until deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
         let generation = readiness.generation
         guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
             return false
         }
 
+        let deadline = deadline ?? EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let remainingMilliseconds = EPUBSpreadReadiness
+            .remainingInitializationStabilityMilliseconds(until: deadline)
+        guard remainingMilliseconds > 0 else { return false }
+
         do {
             let result = try await webView.callAsyncJavaScript(
                 """
-                const frames = Array.from(document.querySelectorAll('iframe'));
-                if (frames.length === 0) {
-                    return false;
-                }
-                for (const frame of frames) {
-                    const child = frame.contentDocument;
-                    if (!child) {
+                const absoluteDeadline = performance.now() + deadlineMilliseconds;
+                const beforeDeadline = () => performance.now() < absoluteDeadline;
+                const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+                const cappedWait = new Promise(resolve => {
+                    setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
+                });
+                const currentFramesAndDocuments = () => {
+                    const frames = Array.from(document.querySelectorAll('iframe'));
+                    const documents = frames.map(frame => frame.contentDocument);
+                    if (frames.length === 0 || documents.some(child => child === null)) {
+                        return null;
+                    }
+                    return {frames, documents};
+                };
+                const stabilityWork = async () => {
+                    var loaded;
+                    while (beforeDeadline()) {
+                        loaded = currentFramesAndDocuments();
+                        if (loaded && loaded.documents.every(child => {
+                            const links = Array.from(child.querySelectorAll('link[rel~="stylesheet"]'));
+                            return links.every(link => link.sheet !== null);
+                        })) {
+                            break;
+                        }
+                        await nextFrame();
+                    }
+                    if (!loaded || !beforeDeadline()) {
                         return false;
                     }
-                    const links = Array.from(child.querySelectorAll('link[rel~="stylesheet"]'));
-                    if (links.some(link => link.sheet === null)) {
+                    await Promise.all(loaded.documents.map(child => child.fonts?.ready));
+                    if (!beforeDeadline()) {
                         return false;
                     }
-                    if (child.fonts) {
-                        await child.fonts.ready;
-                    }
-                }
 
-                var previous = null;
-                var stableFrames = 0;
-                for (let frameIndex = 0; frameIndex < 12 && stableFrames < 2; frameIndex += 1) {
-                    await new Promise(resolve => requestAnimationFrame(resolve));
-                    const current = frames.flatMap(frame => {
-                        const child = frame.contentDocument;
-                        const rect = frame.getBoundingClientRect();
-                        return [
-                            rect.width,
-                            rect.height,
-                            child.documentElement.scrollWidth,
-                            child.documentElement.scrollHeight,
-                            child.body?.scrollWidth ?? 0,
-                            child.body?.scrollHeight ?? 0,
-                        ];
-                    });
-                    if (previous !== null && current.every((value, index) => value === previous[index])) {
-                        stableFrames += 1;
-                    } else {
-                        stableFrames = 0;
+                    var previous = null;
+                    var stableFrames = 0;
+                    for (let frameIndex = 0; frameIndex < 12 && stableFrames < 2 && beforeDeadline(); frameIndex += 1) {
+                        await nextFrame();
+                        loaded = currentFramesAndDocuments();
+                        if (!loaded) {
+                            return false;
+                        }
+                        const current = loaded.frames.flatMap((frame, index) => {
+                            const child = loaded.documents[index];
+                            const rect = frame.getBoundingClientRect();
+                            return [
+                                rect.width,
+                                rect.height,
+                                child.documentElement.scrollWidth,
+                                child.documentElement.scrollHeight,
+                                child.body?.scrollWidth ?? 0,
+                                child.body?.scrollHeight ?? 0,
+                            ];
+                        });
+                        if (previous !== null && current.every((value, index) => value === previous[index])) {
+                            stableFrames += 1;
+                        } else {
+                            stableFrames = 0;
+                        }
+                        previous = current;
                     }
-                    previous = current;
-                }
-                return stableFrames >= 2;
+                    return stableFrames >= 2;
+                };
+                return await Promise.race([stabilityWork(), cappedWait]);
                 """,
-                arguments: [:],
+                arguments: [
+                    "deadlineMilliseconds": remainingMilliseconds,
+                ],
                 in: nil,
                 contentWorld: .page
             )
@@ -251,7 +299,8 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         guard let layoutLease = readiness.acquireWriterLease(for: generation) else {
             return .failed
         }
-        let succeeded = await applyLatestLayout()
+        let stabilityDeadline = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let succeeded = await applyLatestLayout(stabilityDeadline: stabilityDeadline)
         readiness.finishInitialization(
             layoutLease,
             outcome: succeeded ? .succeeded : .failed
@@ -260,7 +309,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
     }
 
     override func loadSpread() {
-        guard isWrapperLoaded else {
+        guard wrapperBootstrapGeneration == readiness.generation else {
             return
         }
         // We call this directly on the web view on purpose, because this needs
@@ -298,22 +347,37 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
     override func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         super.webView(webView, didFinish: navigation)
 
-        if !isWrapperLoaded {
-            isWrapperLoaded = true
-            layoutSpread()
-            bootstrapTask?.cancel()
-            bootstrapTask = Task { @MainActor [weak self] in
-                guard let self, let layoutMutation else { return }
-                let succeeded = await layoutMutation.applyLatest { [weak self] configuration in
-                    guard let self else { return false }
-                    return await self.evaluateViewport(configuration)
-                }
-                guard succeeded, !Task.isCancelled else {
-                    self.readiness.invalidate()
-                    return
-                }
-                self.loadSpread()
+        guard
+            let generation = currentMainFrameGeneration(for: navigation),
+            wrapperBootstrapGeneration != generation
+        else {
+            return
+        }
+
+        wrapperBootstrapGeneration = generation
+        layoutSpread()
+        bootstrapTask?.cancel()
+        bootstrapTask = Task { @MainActor [weak self] in
+            guard let self, let layoutMutation else { return }
+            let succeeded = await layoutMutation.applyLatest { [weak self] configuration in
+                guard let self else { return false }
+                return await self.evaluateViewport(configuration)
             }
+            guard
+                succeeded,
+                !Task.isCancelled,
+                self.readiness.generation == generation,
+                self.wrapperBootstrapGeneration == generation
+            else {
+                if !Task.isCancelled,
+                   self.wrapperBootstrapGeneration == generation,
+                   self.readiness.invalidate(ifCurrent: generation)
+                {
+                    self.locatorCommandBridge.invalidateDocument()
+                }
+                return
+            }
+            self.loadSpread()
         }
     }
 

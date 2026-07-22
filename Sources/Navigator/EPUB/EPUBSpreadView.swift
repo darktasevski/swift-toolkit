@@ -80,6 +80,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     let readiness = EPUBSpreadReadiness()
     private var spreadLoadTask: Task<Void, Never>?
 
+    private struct MainFrameNavigationRecord {
+        let navigation: WKNavigation
+        let generation: EPUBSpreadReadiness.Generation
+    }
+
+    private struct IssuingMainFrameNavigation {
+        let generation: EPUBSpreadReadiness.Generation
+        var provisionalNavigation: WKNavigation?
+    }
+
+    private var currentMainFrameNavigation: MainFrameNavigationRecord?
+    private var issuingMainFrameNavigation: IssuingMainFrameNavigation?
+
     var isCommandReady: Bool {
         readiness.isCommandReady
     }
@@ -205,6 +218,73 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     func loadSpread() {
         fatalError("loadSpread() must be implemented in subclasses")
+    }
+
+    /// Starts the generation before issuing an owned main-frame load. WebKit's
+    /// provisional-navigation callback then validates and associates the
+    /// returned navigation identity without advancing the generation again.
+    @discardableResult
+    func issueMainFrameLoad(
+        _ operation: () -> WKNavigation?
+    ) -> WKNavigation? {
+        let generation = beginMainFrameLoading()
+        issuingMainFrameNavigation = IssuingMainFrameNavigation(
+            generation: generation,
+            provisionalNavigation: nil
+        )
+
+        let navigation = operation()
+        let provisionalNavigation = issuingMainFrameNavigation?.provisionalNavigation
+        issuingMainFrameNavigation = nil
+
+        guard
+            let navigation,
+            provisionalNavigation == nil || provisionalNavigation === navigation
+        else {
+            if readiness.invalidate(ifCurrent: generation) {
+                locatorCommandBridge.invalidateDocument()
+            }
+            return navigation
+        }
+
+        registerMainFrameNavigation(navigation, generation: generation)
+        return navigation
+    }
+
+    /// Called synchronously whenever a main-frame generation starts.
+    func mainFrameLoadDidBegin(_ generation: EPUBSpreadReadiness.Generation) {}
+
+    func currentMainFrameGeneration(
+        for navigation: WKNavigation?
+    ) -> EPUBSpreadReadiness.Generation? {
+        guard
+            let navigation,
+            let record = currentMainFrameNavigation,
+            record.navigation === navigation,
+            record.generation == readiness.generation
+        else {
+            return nil
+        }
+        return record.generation
+    }
+
+    private func beginMainFrameLoading() -> EPUBSpreadReadiness.Generation {
+        spreadLoadTask?.cancel()
+        spreadLoadTask = nil
+        let generation = readiness.beginLoading()
+        locatorCommandBridge.beginDocument()
+        mainFrameLoadDidBegin(generation)
+        return generation
+    }
+
+    private func registerMainFrameNavigation(
+        _ navigation: WKNavigation,
+        generation: EPUBSpreadReadiness.Generation
+    ) {
+        currentMainFrameNavigation = MainFrameNavigationRecord(
+            navigation: navigation,
+            generation: generation
+        )
     }
 
     /// Evaluates the given JavaScript into the resource's HTML page.
@@ -746,14 +826,43 @@ extension EPUBSpreadView: WKScriptMessageHandler {
 
 extension EPUBSpreadView: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
-        spreadLoadTask?.cancel()
-        spreadLoadTask = nil
-        readiness.beginLoading()
-        locatorCommandBridge.beginDocument()
+        guard let navigation else { return }
+
+        if let record = currentMainFrameNavigation,
+           record.navigation === navigation
+        {
+            guard
+                record.generation == readiness.generation
+            else {
+                return
+            }
+            return
+        }
+
+        if var issuingMainFrameNavigation {
+            guard issuingMainFrameNavigation.generation == readiness.generation else {
+                return
+            }
+            issuingMainFrameNavigation.provisionalNavigation = navigation
+            self.issuingMainFrameNavigation = issuingMainFrameNavigation
+            registerMainFrameNavigation(
+                navigation,
+                generation: issuingMainFrameNavigation.generation
+            )
+            return
+        }
+
+        let generation = beginMainFrameLoading()
+        registerMainFrameNavigation(navigation, generation: generation)
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        readiness.invalidate()
+        guard let generation = currentMainFrameGeneration(for: navigation) else {
+            return
+        }
+        if readiness.invalidate(ifCurrent: generation) {
+            locatorCommandBridge.invalidateDocument()
+        }
         let ns = error as NSError
         log(.error, "Web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
     }
@@ -763,12 +872,20 @@ extension EPUBSpreadView: WKNavigationDelegate {
         didFailProvisionalNavigation navigation: WKNavigation!,
         withError error: Error
     ) {
-        readiness.invalidate()
+        guard let generation = currentMainFrameGeneration(for: navigation) else {
+            return
+        }
+        if readiness.invalidate(ifCurrent: generation) {
+            locatorCommandBridge.invalidateDocument()
+        }
         let ns = error as NSError
         log(.error, "Provisional web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard currentMainFrameGeneration(for: navigation) != nil else {
+            return
+        }
         setNeedsStopActivityIndicator()
     }
 

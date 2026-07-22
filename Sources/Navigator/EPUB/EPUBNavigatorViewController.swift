@@ -62,6 +62,26 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    static func readySpreadNavigationDisposition(
+        for outcome: EPUBSpreadReadiness.WaitOutcome,
+        targetIsCurrent: Bool,
+        generationIsCurrent: Bool,
+        taskIsCancelled: Bool
+    ) -> PageCommandNavigationDisposition {
+        guard !taskIsCancelled, targetIsCurrent, generationIsCurrent else {
+            return .cancelled
+        }
+
+        switch outcome {
+        case .ready:
+            return .landed
+        case .documentAvailable, .timedOut:
+            return .miss
+        case .invalidated, .cancelled:
+            return .cancelled
+        }
+    }
+
     enum PageTurnNavigationDisposition: Equatable {
         case moved
         case crossResource
@@ -886,10 +906,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             case .cancelled:
                 return .cancelled
             }
-            guard let loaded = await waitForReadySpread(at: spreadIndex) else {
-                return Task.isCancelled ? .cancelled : .miss
+            switch await waitForReadySpread(at: spreadIndex) {
+            case let .ready(loaded):
+                spreadView = loaded
+            case .miss:
+                return .miss
+            case .cancelled:
+                return .cancelled
             }
-            spreadView = loaded
         }
 
         guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
@@ -961,25 +985,51 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func waitForReadySpread(at index: Int) async -> EPUBSpreadView? {
+    private enum ReadySpreadWaitResult {
+        case ready(EPUBSpreadView)
+        case miss
+        case cancelled
+    }
+
+    private func waitForReadySpread(at index: Int) async -> ReadySpreadWaitResult {
         guard
             let paginationView,
-            paginationView.currentIndex == index,
-            let spreadView = await paginationView.waitForCurrentPage(at: index) as? EPUBSpreadView
+            paginationView.currentIndex == index
         else {
-            return nil
+            return .cancelled
+        }
+
+        guard let spreadView = await paginationView.waitForCurrentPage(at: index) as? EPUBSpreadView else {
+            let targetIsCurrent = self.paginationView === paginationView
+                && paginationView.currentIndex == index
+            return Task.isCancelled || !targetIsCurrent ? .cancelled : .miss
         }
 
         let generation = spreadView.readiness.generation
-        guard
-            case .ready = await spreadView.readiness.waitForCommandReadiness(for: generation),
-            !Task.isCancelled,
-            paginationView.currentIndex == index,
-            paginationView.loadedViews[index] === spreadView
-        else {
-            return nil
+        let outcome = await spreadView.readiness.waitForCommandReadiness(
+            for: generation,
+            until: ContinuousClock().now.advanced(
+                by: EPUBSpreadReadiness.commandReadinessBudget
+            )
+        )
+        let targetIsCurrent = self.paginationView === paginationView
+            && paginationView.currentIndex == index
+            && paginationView.loadedViews[index] === spreadView
+        let generationIsCurrent = spreadView.readiness.generation == generation
+
+        switch Self.readySpreadNavigationDisposition(
+            for: outcome,
+            targetIsCurrent: targetIsCurrent,
+            generationIsCurrent: generationIsCurrent,
+            taskIsCancelled: Task.isCancelled
+        ) {
+        case .landed:
+            return .ready(spreadView)
+        case .miss:
+            return .miss
+        case .cancelled:
+            return .cancelled
         }
-        return spreadView
     }
 
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {

@@ -118,12 +118,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         scripts: [WKUserScript],
         animatedLoad: Bool
     ) {
+        var scripts = scripts
+        scripts.append(WKUserScript(
+            source: Self.reflowableScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         super.init(
             viewModel: viewModel,
             spread: spread,
-            scripts: [
-                WKUserScript(source: Self.reflowableScript, injectionTime: .atDocumentStart, forMainFrameOnly: false),
-            ],
+            scripts: scripts,
             animatedLoad: animatedLoad
         )
     }
@@ -176,7 +180,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return
         }
         let url = viewModel.url(to: spread.first.link)
-        webView.load(URLRequest(url: url.url))
+        issueMainFrameLoad {
+            webView.load(URLRequest(url: url.url))
+        }
     }
 
     override func applySettings() {
@@ -266,6 +272,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
+        let stabilityDeadline = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
             guard case .success = await evaluateDocumentScript("readium.link = \(linkJSON);") else {
@@ -273,7 +280,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
-        guard await waitForLayoutStability() else { return .failed }
+        guard await waitForLayoutStability(until: stabilityDeadline) else { return .failed }
 
         // Anchor-tracking init: pull the per-resource anchor list from the
         // view model and call into the JS module. Even on oversized/invalid
@@ -315,55 +322,84 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // skipped by an older pending value.
         guard await pendingLocationMutation.applyLatest({ [weak self] location in
             guard let self else { return false }
+            guard let location else { return true }
             guard await self.apply(location) else { return false }
-            return await self.waitForLayoutStability()
+            return await self.waitForLayoutStability(until: stabilityDeadline)
         }) else {
             return .failed
         }
         return .succeeded
     }
 
-    /// Waits for fonts and a bounded run of stable animation frames. The
-    /// `spreadLoaded` message is emitted after the window load event, so every
-    /// external stylesheet link must already expose a non-null `sheet` before
-    /// stability can be accepted.
-    private func waitForLayoutStability() async -> Bool {
+    /// Waits for every external stylesheet, fonts and a bounded run of stable
+    /// animation frames. A caller-provided deadline lets all initialization
+    /// stages share one non-resetting budget.
+    private func waitForLayoutStability(
+        until deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
         let generation = readiness.generation
         guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
             return false
         }
 
+        let deadline = deadline ?? EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let remainingMilliseconds = EPUBSpreadReadiness
+            .remainingInitializationStabilityMilliseconds(until: deadline)
+        guard remainingMilliseconds > 0 else { return false }
+
         do {
             let result = try await webView.callAsyncJavaScript(
                 """
-                const stylesheetLinks = Array.from(document.querySelectorAll('link[rel~="stylesheet"]'));
-                if (stylesheetLinks.some(link => link.sheet === null)) {
-                    return false;
-                }
-                if (document.fonts) {
-                    await document.fonts.ready;
-                }
-
-                var previous = null;
-                var stableFrames = 0;
-                for (let frame = 0; frame < 12 && stableFrames < 2; frame += 1) {
-                    await new Promise(resolve => requestAnimationFrame(resolve));
-                    const current = [
-                        document.documentElement.scrollWidth,
-                        document.documentElement.scrollHeight,
-                        document.body?.scrollWidth ?? 0,
-                        document.body?.scrollHeight ?? 0,
-                    ];
-                    if (previous !== null && current.every((value, index) => value === previous[index])) {
-                        stableFrames += 1;
-                    } else {
-                        stableFrames = 0;
+                const absoluteDeadline = performance.now() + deadlineMilliseconds;
+                const beforeDeadline = () => performance.now() < absoluteDeadline;
+                const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+                const cappedWait = new Promise(resolve => {
+                    setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
+                });
+                const stabilityWork = async () => {
+                    while (beforeDeadline()) {
+                        const stylesheetLinks = Array.from(
+                            document.querySelectorAll('link[rel~="stylesheet"]')
+                        );
+                        if (stylesheetLinks.every(link => link.sheet !== null)) {
+                            break;
+                        }
+                        await nextFrame();
                     }
-                    previous = current;
-                }
-                return stableFrames >= 2;
+                    if (!beforeDeadline()) {
+                        return false;
+                    }
+                    if (document.fonts) {
+                        await document.fonts.ready;
+                    }
+                    if (!beforeDeadline()) {
+                        return false;
+                    }
+
+                    var previous = null;
+                    var stableFrames = 0;
+                    for (let frame = 0; frame < 12 && stableFrames < 2 && beforeDeadline(); frame += 1) {
+                        await nextFrame();
+                        const current = [
+                            document.documentElement.scrollWidth,
+                            document.documentElement.scrollHeight,
+                            document.body?.scrollWidth ?? 0,
+                            document.body?.scrollHeight ?? 0,
+                        ];
+                        if (previous !== null && current.every((value, index) => value === previous[index])) {
+                            stableFrames += 1;
+                        } else {
+                            stableFrames = 0;
+                        }
+                        previous = current;
+                    }
+                    return stableFrames >= 2;
+                };
+                return await Promise.race([stabilityWork(), cappedWait]);
                 """,
-                arguments: [:],
+                arguments: [
+                    "deadlineMilliseconds": remainingMilliseconds,
+                ],
                 in: nil,
                 contentWorld: .page
             )
@@ -416,8 +452,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private struct PendingLocation {
+        let ownerID: UUID
         let location: PageLocation
         let animated: Bool
+
+        init(
+            ownerID: UUID = UUID(),
+            location: PageLocation,
+            animated: Bool
+        ) {
+            self.ownerID = ownerID
+            self.location = location
+            self.animated = animated
+        }
     }
 
     private enum PendingPositionCommand {
@@ -426,7 +473,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     /// Location to scroll to in the resource once the page is loaded.
-    private let pendingLocationMutation = EPUBLatestMutation(
+    private let pendingLocationMutation = EPUBLatestMutation<PendingLocation?>(
         initialValue: PendingLocation(location: .start, animated: false)
     )
     private let pendingPositionMutation = EPUBLatestMutation<PendingPositionCommand>(
@@ -441,16 +488,35 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         to location: PageLocation,
         animated: Bool
     ) async -> PageCommandOutcome {
-        pendingLocationMutation.update(PendingLocation(
+        let pendingLocation = PendingLocation(
             location: location,
             animated: animated
-        ))
+        )
+        pendingLocationMutation.update(pendingLocation)
 
+        return await withTaskCancellationHandler {
+            let outcome = await go(to: pendingLocation)
+            if outcome == .cancelled || Task.isCancelled {
+                clearPendingLocation(ownedBy: pendingLocation.ownerID)
+                return .cancelled
+            }
+            return outcome
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.clearPendingLocation(ownedBy: pendingLocation.ownerID)
+            }
+        }
+    }
+
+    private func go(to pendingLocation: PendingLocation) async -> PageCommandOutcome {
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
         guard readiness.isCommandReady || activePositionCommand != nil else {
             let generation = readiness.generation
             switch await readiness.waitForCommandReadiness(for: generation) {
             case .ready:
-                return .succeeded
+                return Task.isCancelled ? .cancelled : .succeeded
             case .cancelled:
                 return .cancelled
             case .documentAvailable, .invalidated, .timedOut:
@@ -458,10 +524,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
-        let outcome = await runPositionCommand(.location(PendingLocation(
-            location: location,
-            animated: animated
-        )))
+        let outcome = await runPositionCommand(.location(pendingLocation))
         switch outcome {
         case .succeeded:
             return .succeeded
@@ -470,6 +533,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         case .boundary, .failed:
             return .failed
         }
+    }
+
+    private func clearPendingLocation(ownedBy ownerID: UUID) {
+        guard pendingLocationMutation.latestValue?.ownerID == ownerID else {
+            return
+        }
+        pendingLocationMutation.update(nil)
     }
 
     private func runPositionCommand(
