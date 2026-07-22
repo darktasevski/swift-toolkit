@@ -45,6 +45,27 @@ final class EPUBScrollAnimationCoordinatorTests: XCTestCase {
         await second.value
     }
 
+    func testCancellingStaleFirstWaiterAfterNewerWaiterPreservesNewerRequest() async {
+        let coordinator = EPUBScrollAnimationCoordinator()
+        let first = Task { @MainActor in
+            await coordinator.waitUntilSettled()
+        }
+        await waitUntil { coordinator.hasPendingRequest }
+
+        let second = Task { @MainActor in
+            await coordinator.waitUntilSettled()
+        }
+        await waitUntil { coordinator.hasPendingRequest }
+
+        first.cancel()
+        await Task.yield()
+
+        XCTAssertTrue(coordinator.hasPendingRequest)
+        coordinator.finish()
+        await first.value
+        await second.value
+    }
+
     func testTakingPendingRequestClearsItBeforeResumption() async throws {
         let coordinator = EPUBScrollAnimationCoordinator()
         var finished = false

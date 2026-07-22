@@ -10,7 +10,7 @@ import XCTest
 
 @MainActor
 final class PaginationViewCurrentPageTests: XCTestCase {
-    func testCurrentPageIdentityResolvesBeforeItsGoAndNeighborPreloading() async throws {
+    func testCurrentPageIdentityResolvesBeforeItsGoAndNeighborPreloading() async {
         let current = TestPageView(blocksGo: true)
         let previous = TestPageView()
         let next = TestPageView()
@@ -151,7 +151,7 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         delegate.pages[1] = target
         delegate.pages[2] = neighbor
 
-        var result: Bool?
+        var result: PageCommandOutcome?
         let navigation = Task { @MainActor in
             let success = await pagination.goToIndex(
                 1,
@@ -172,10 +172,10 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         await waitUntil { neighbor.goCallCount == 1 }
         await waitUntil { result != nil }
 
-        XCTAssertEqual(result, true)
+        XCTAssertEqual(result, .succeeded)
         neighbor.finishGo()
-        let success = await navigation.value
-        XCTAssertTrue(success)
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .succeeded)
     }
 
     func testSameIndexGoCancelsAndAcknowledgesInitialCommandBeforeReplacingIt() async {
@@ -186,7 +186,7 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         pagination.reloadAtIndex(0, location: .start, pageCount: 1, readingProgression: .ltr)
         await waitUntil { page.goCallCount == 1 }
 
-        var result: Bool?
+        var result: PageCommandOutcome?
         let replacement = Task { @MainActor in
             let success = await pagination.goToIndex(
                 0,
@@ -199,6 +199,7 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         await waitUntil { page.cancellationObserved }
 
         XCTAssertTrue(page.cancellationObserved)
+        XCTAssertEqual(page.commandSupersessionAcknowledgementCount, 1)
         XCTAssertEqual(page.goCallCount, 1)
         XCTAssertEqual(page.maximumConcurrentGoCount, 1)
         XCTAssertNil(result)
@@ -209,9 +210,9 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertNil(result)
 
         page.finishGo()
-        let success = await replacement.value
-        XCTAssertTrue(success)
-        XCTAssertEqual(result, true)
+        let outcome = await replacement.value
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertEqual(result, .succeeded)
     }
 
     func testMissingPageFactoryIsTerminalForExactCurrentPageWaiter() async {
@@ -237,6 +238,42 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertNil(outcome)
         waiter.cancel()
         _ = await waiter.value
+    }
+
+    func testFailedPageCommandIsNotReportedAsSucceeded() async {
+        let initial = TestPageView()
+        let failed = TestPageView(commandOutcome: .failed)
+        let delegate = TestPaginationDelegate(pages: [0: initial, 1: failed])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let outcome = await pagination.goToIndex(
+            1,
+            location: .start,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .failed)
+    }
+
+    func testCancelledPageCommandIsNotReportedAsFailed() async {
+        let initial = TestPageView()
+        let cancelled = TestPageView(commandOutcome: .cancelled)
+        let delegate = TestPaginationDelegate(pages: [0: initial, 1: cancelled])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let outcome = await pagination.goToIndex(
+            1,
+            location: .start,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .cancelled)
     }
 
     private func makePaginationView(preloadPositionCount: Int = 1) -> PaginationView {
@@ -298,19 +335,25 @@ private final class TestPaginationDelegate: PaginationViewDelegate {
 @MainActor
 private final class TestPageView: UIView, PageView {
     private let blocksGo: Bool
-    private var goContinuations: [CheckedContinuation<Void, Never>] = []
+    private let commandOutcome: PageCommandOutcome
+    private var goContinuations: [CheckedContinuation<PageCommandOutcome, Never>] = []
 
     private(set) var goCallCount = 0
     private(set) var activeGoCount = 0
     private(set) var maximumConcurrentGoCount = 0
     private(set) var cancellationObserved = false
+    private(set) var commandSupersessionAcknowledgementCount = 0
 
     var goStarted: Bool {
         goCallCount > 0
     }
 
-    init(blocksGo: Bool = false) {
+    init(
+        blocksGo: Bool = false,
+        commandOutcome: PageCommandOutcome = .succeeded
+    ) {
         self.blocksGo = blocksGo
+        self.commandOutcome = commandOutcome
         super.init(frame: .zero)
     }
 
@@ -319,14 +362,14 @@ private final class TestPageView: UIView, PageView {
         fatalError("init(coder:) has not been implemented")
     }
 
-    func go(to location: PageLocation, animated: Bool) async {
+    func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {
         goCallCount += 1
         activeGoCount += 1
         maximumConcurrentGoCount = max(maximumConcurrentGoCount, activeGoCount)
         defer { activeGoCount -= 1 }
-        guard blocksGo else { return }
+        guard blocksGo else { return commandOutcome }
 
-        await withTaskCancellationHandler {
+        return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 goContinuations.append(continuation)
             }
@@ -337,8 +380,12 @@ private final class TestPageView: UIView, PageView {
         }
     }
 
+    func acknowledgeCommandSupersession() {
+        commandSupersessionAcknowledgementCount += 1
+    }
+
     func finishGo() {
         guard !goContinuations.isEmpty else { return }
-        goContinuations.removeFirst().resume()
+        goContinuations.removeFirst().resume(returning: commandOutcome)
     }
 }

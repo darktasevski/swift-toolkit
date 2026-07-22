@@ -236,6 +236,32 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         XCTAssertEqual(outcome, .invalidated)
     }
 
+    func testFailedRuntimeMutationInvalidatesRetainedFrameCapability() throws {
+        let readiness = try makeReadyReadiness()
+        let mutation = try XCTUnwrap(readiness.beginMutation())
+
+        readiness.finishMutation(mutation, outcome: .failed)
+
+        XCTAssertFalse(readiness.isCommandReady)
+        XCTAssertEqual(
+            readiness.state,
+            .unavailable(generation: mutation.generation + 1)
+        )
+    }
+
+    func testSupersededRuntimeMutationReleasesRetainedFrameCapability() throws {
+        let readiness = try makeReadyReadiness()
+        let mutation = try XCTUnwrap(readiness.beginMutation())
+
+        readiness.finishMutation(mutation, outcome: .superseded)
+
+        guard case let .ready(generation, frameCapability) = readiness.state else {
+            return XCTFail("Superseded mutation did not restore command readiness")
+        }
+        XCTAssertEqual(generation, mutation.generation)
+        XCTAssertNotNil(frameCapability)
+    }
+
     func testLatestMutationReplaysAnUpdateThatArrivesDuringInitialWrite() async {
         let mutation = EPUBLatestMutation(initialValue: 1)
         var writes: [Int] = []
@@ -315,5 +341,16 @@ final class EPUBSpreadReadinessTests: XCTestCase {
             await Task.yield()
         }
         XCTFail("Condition did not become true")
+    }
+
+    private func makeReadyReadiness() throws -> EPUBSpreadReadiness {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        return readiness
     }
 }

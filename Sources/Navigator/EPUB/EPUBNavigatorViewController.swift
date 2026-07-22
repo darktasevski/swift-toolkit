@@ -554,7 +554,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
         let isRTL = (viewModel.readingProgression == .rtl)
         let delta = isRTL ? -1 : 1
-        let moved: Bool = await {
+        let outcome: PageCommandOutcome = await {
             switch direction {
             case .left:
                 let location: PageLocation = isRTL ? .start : .end
@@ -566,7 +566,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }()
 
         on(.moved)
-        return moved
+        return outcome == .succeeded
     }
 
     // MARK: - Pagination and spreads
@@ -752,6 +752,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        await goToLocator(locator, options: options) == .succeeded
+    }
+
+    /// Executes the locator's pagination stage without collapsing failure and
+    /// cancellation into the public Navigator `Bool` contract.
+    func goToLocator(
+        _ locator: Locator,
+        options: NavigatorGoOptions
+    ) async -> PageCommandOutcome {
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -760,15 +769,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let spreadIndex = spreads.firstIndexWithReadingOrderIndex(index),
             on(.jump(locator))
         else {
-            return false
+            return .failed
         }
 
-        let success = await paginationView.goToIndex(spreadIndex, location: .locator(locator), options: options)
+        let outcome = await paginationView.goToIndex(
+            spreadIndex,
+            location: .locator(locator),
+            options: options
+        )
         on(.jumped)
-        if success {
+        if outcome == .succeeded {
             delegate?.navigator(self, didJumpTo: locator)
         }
-        return success
+        return outcome
     }
 
     /// Navigates with the bounded, fixed-source locator command bridge and
@@ -814,8 +827,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             spreadView = loaded
         } else {
             let resourceOnly = Locator(href: locator.href, mediaType: locator.mediaType)
-            guard await go(to: resourceOnly, options: NavigatorGoOptions(animated: animated)) else {
-                return Task.isCancelled ? .cancelled : .miss
+            switch await goToLocator(
+                resourceOnly,
+                options: NavigatorGoOptions(animated: animated)
+            ) {
+            case .succeeded:
+                break
+            case .failed:
+                return .miss
+            case .cancelled:
+                return .cancelled
             }
             guard let loaded = await waitForReadySpread(at: spreadIndex) else {
                 return Task.isCancelled ? .cancelled : .miss

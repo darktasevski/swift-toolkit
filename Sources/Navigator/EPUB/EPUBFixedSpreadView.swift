@@ -132,16 +132,15 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         layoutTask = Task { @MainActor [weak self] in
             await predecessor?.value
             guard let self else { return }
-            let succeeded: Bool
+            let outcome: EPUBSpreadReadiness.MutationOutcome
             if Task.isCancelled {
-                succeeded = false
+                outcome = .superseded
+            } else if await self.applyLatestLayout() {
+                outcome = .succeeded
             } else {
-                succeeded = await self.applyLatestLayout()
+                outcome = Task.isCancelled ? .superseded : .failed
             }
-            self.readiness.finishInitialization(
-                writerLease,
-                outcome: succeeded ? .succeeded : .failed
-            )
+            self.readiness.finishMutation(writerLease, outcome: outcome)
         }
     }
 
@@ -320,10 +319,20 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
-    override func go(to location: PageLocation, animated: Bool) async {
+    override func go(
+        to location: PageLocation,
+        animated: Bool
+    ) async -> PageCommandOutcome {
         // Fixed layout resources are always fully visible so we don't use the
         // location.
         let generation = readiness.generation
-        _ = await readiness.waitForCommandReadiness(for: generation)
+        switch await readiness.waitForCommandReadiness(for: generation) {
+        case .ready:
+            return .succeeded
+        case .cancelled:
+            return .cancelled
+        case .documentAvailable, .invalidated, .timedOut:
+            return .failed
+        }
     }
 }

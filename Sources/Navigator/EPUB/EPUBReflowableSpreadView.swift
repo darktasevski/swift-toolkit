@@ -99,6 +99,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
     private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
+    private var activeCommandMutationGeneration: EPUBSpreadReadiness.Generation?
+    private var isActiveCommandSupersessionAcknowledged = false
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -121,6 +123,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func clear() {
         settingsLayoutTask?.cancel()
         settingsLayoutTask = nil
+        activeCommandMutationGeneration = nil
+        isActiveCommandSupersessionAcknowledged = false
         super.clear()
         scrollAnimationCoordinator.finish()
     }
@@ -208,9 +212,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         settingsLayoutTask = Task { @MainActor [weak self] in
             await predecessor?.value
             guard let self else { return }
-            defer { self.readiness.release(writerLease) }
-            guard !Task.isCancelled else { return }
-            _ = await self.waitForLayoutStability()
+            let outcome: EPUBSpreadReadiness.MutationOutcome
+            if Task.isCancelled {
+                outcome = .superseded
+            } else if await self.waitForLayoutStability() {
+                outcome = .succeeded
+            } else {
+                outcome = Task.isCancelled ? .superseded : .failed
+            }
+            self.readiness.finishMutation(writerLease, outcome: outcome)
         }
     }
 
@@ -421,7 +431,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         initialValue: PendingLocation(location: .start, animated: false)
     )
 
-    override func go(to location: PageLocation, animated: Bool) async {
+    func acknowledgeCommandSupersession() {
+        guard activeCommandMutationGeneration != nil else { return }
+        isActiveCommandSupersessionAcknowledged = true
+    }
+
+    override func go(
+        to location: PageLocation,
+        animated: Bool
+    ) async -> PageCommandOutcome {
         pendingLocationMutation.update(PendingLocation(
             location: location,
             animated: animated
@@ -429,22 +447,45 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         guard readiness.isCommandReady else {
             let generation = readiness.generation
-            _ = await readiness.waitForCommandReadiness(for: generation)
-            return
+            switch await readiness.waitForCommandReadiness(for: generation) {
+            case .ready:
+                return .succeeded
+            case .cancelled:
+                return .cancelled
+            case .documentAvailable, .invalidated, .timedOut:
+                return .failed
+            }
         }
 
         guard let writerLease = readiness.acquirePositionWriter() else {
-            return
+            return Task.isCancelled ? .cancelled : .failed
+        }
+        activeCommandMutationGeneration = writerLease.generation
+        isActiveCommandSupersessionAcknowledged = false
+        defer {
+            if activeCommandMutationGeneration == writerLease.generation {
+                activeCommandMutationGeneration = nil
+                isActiveCommandSupersessionAcknowledged = false
+            }
         }
         let succeeded = await pendingLocationMutation.applyLatest { [weak self] location in
             guard let self else { return false }
             guard await self.apply(location) else { return false }
             return await self.waitForLayoutStability()
         }
-        readiness.finishInitialization(
-            writerLease,
-            outcome: succeeded ? .succeeded : .failed
-        )
+        let mutationOutcome: EPUBSpreadReadiness.MutationOutcome
+        if succeeded {
+            mutationOutcome = .succeeded
+        } else if Task.isCancelled, isActiveCommandSupersessionAcknowledged {
+            mutationOutcome = .superseded
+        } else {
+            mutationOutcome = .failed
+        }
+        readiness.finishMutation(writerLease, outcome: mutationOutcome)
+        if succeeded {
+            return .succeeded
+        }
+        return Task.isCancelled ? .cancelled : .failed
     }
 
     private func apply(_ location: PendingLocation) async -> Bool {

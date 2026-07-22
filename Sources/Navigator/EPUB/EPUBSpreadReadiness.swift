@@ -94,6 +94,12 @@ final class EPUBSpreadReadiness {
         case failed
     }
 
+    enum MutationOutcome: Equatable, Sendable {
+        case succeeded
+        case superseded
+        case failed
+    }
+
     private enum WaitTarget {
         case documentAvailability
         case commandReadiness
@@ -263,6 +269,28 @@ final class EPUBSpreadReadiness {
         }
     }
 
+    /// Finishes a runtime write against the retained frame capability.
+    /// Supersession is a successful hand-off to a known successor, while an
+    /// actual write failure makes the document unavailable.
+    func finishMutation(
+        _ lease: WriterLease,
+        outcome: MutationOutcome
+    ) {
+        guard
+            case .initializing(lease.generation, _) = state,
+            activeWriterLeaseIDs.contains(lease.id)
+        else {
+            return
+        }
+
+        switch outcome {
+        case .succeeded, .superseded:
+            release(lease)
+        case .failed:
+            invalidate()
+        }
+    }
+
     /// Invalidates the current document and terminates every registered wait.
     func invalidate() {
         let generation = nextGeneration()
@@ -384,7 +412,7 @@ final class EPUBSpreadReadiness {
     }
 
     private func drainWaiters(with outcome: WaitOutcome) {
-        let waiters = self.waiters.values
+        let waiters = waiters.values
         self.waiters.removeAll()
         for waiter in waiters {
             waiter.continuation.resume(returning: outcome)
