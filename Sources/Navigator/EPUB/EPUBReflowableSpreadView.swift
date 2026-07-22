@@ -339,15 +339,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
-        if locator.text.highlight != nil {
-            return await scroll(toLocator: locator, animated: animated)
-            // TODO: find the first fragment matching a tag ID (need a regex)
-        } else if let id = locator.locations.fragments.first, !id.isEmpty {
-            return await scroll(toTagID: id, animated: animated)
-        } else {
-            let progression = locator.locations.progression ?? 0
-            return await scroll(toProgression: progression, animated: animated)
+        let hasDocumentAnchor = locator.locations.domRange != nil
+            || locator.locations.cssSelector != nil
+            || locator.locations.fragments.contains { !$0.isEmpty }
+            || locator.text.highlight != nil
+
+        if hasDocumentAnchor {
+            return await navigate(to: locator, animated: animated)
         }
+
+        let progression = locator.locations.progression ?? 0
+        return await scroll(toProgression: progression, animated: animated)
     }
 
     /// Scrolls at given progression (from 0.0 to 1.0)
@@ -373,33 +375,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
-    /// Scrolls at the tag with ID `tagID`.
+    /// Resolves and scrolls to a document anchor in the isolated locator
+    /// command world. Publisher-derived locator data is passed as a typed
+    /// argument and is never interpolated into executable source.
     @discardableResult
-    private func scroll(toTagID tagID: String, animated: Bool) async -> Bool {
-        let result = await evaluateScript("readium.scrollToId(\'\(tagID)\', \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
-            log(.error, error)
-            return false
-        }
-    }
-
-    /// Scrolls at the snippet matching the given text context.
-    @discardableResult
-    private func scroll(toLocator locator: Locator, animated: Bool) async -> Bool {
+    private func navigate(to locator: Locator, animated: Bool) async -> Bool {
         guard let json = try? locator.jsonString() else {
             return false
         }
-        let result = await evaluateScript("readium.scrollToLocator(\(json), \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
-            log(.error, error)
-            return false
-        }
+        let result = await locatorCommandBridge.navigate(
+            locatorJSON: json,
+            targetHREF: viewModel.url(to: spread.first.link),
+            animated: animated
+        )
+        return result.outcome == .applied
     }
 
     // MARK: - Progression

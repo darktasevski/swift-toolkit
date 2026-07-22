@@ -32,6 +32,13 @@ public extension EPUBNavigatorDelegate {
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
+/// The observable result of a render-faithful locator command.
+public enum LocatorNavigationOutcome: Equatable, Sendable {
+    case landed
+    case miss
+    case cancelled
+}
+
 open class EPUBNavigatorViewController: InputObservableViewController,
     VisualNavigator, ViewportObservingNavigator, VisibleAnchorObservingNavigator,
     SelectableNavigator, DecorableNavigator, Configurable, Loggable
@@ -764,6 +771,135 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return success
     }
 
+    /// Navigates with the bounded, fixed-source locator command bridge and
+    /// reports the command's actual landing result.
+    public func navigateToLocatorJSON(
+        _ locatorJSON: String,
+        animated: Bool
+    ) async -> LocatorNavigationOutcome {
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+        guard
+            let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
+            let decoded = try? Locator(json: payload.locator)
+        else {
+            return .miss
+        }
+        let locator = publication.normalizeLocator(decoded)
+        guard
+            let paginationView,
+            let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href),
+            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(readingOrderIndex)
+        else {
+            return .miss
+        }
+
+        let spreadView: EPUBSpreadView
+        if
+            paginationView.currentIndex == spreadIndex,
+            let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
+            loaded.isSpreadLoaded
+        {
+            spreadView = loaded
+        } else {
+            let resourceOnly = Locator(href: locator.href, mediaType: locator.mediaType)
+            guard await go(to: resourceOnly, options: NavigatorGoOptions(animated: animated)) else {
+                return Task.isCancelled ? .cancelled : .miss
+            }
+            guard let loaded = await waitForLoadedSpread(at: spreadIndex) else {
+                return Task.isCancelled ? .cancelled : .miss
+            }
+            spreadView = loaded
+        }
+
+        let result = await spreadView.locatorCommandBridge.navigate(
+            locatorJSON: locatorJSON,
+            targetHREF: locator.href,
+            animated: animated
+        )
+        switch result.outcome {
+        case .applied:
+            return .landed
+        case .miss:
+            return .miss
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
+    /// Checks the transient-highlight uniqueness rule inside the isolated
+    /// command world. Only a closed command outcome crosses back to native.
+    public func isLocatorTextUnique(
+        _ locatorJSON: String,
+        cssSelector: String?
+    ) async -> Bool {
+        guard
+            !Task.isCancelled,
+            let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
+            let decoded = try? Locator(json: payload.locator)
+        else {
+            return false
+        }
+        let locator = publication.normalizeLocator(decoded)
+        guard
+            let readingOrderIndex = readingOrder.firstIndexWithHREF(locator.href),
+            let spreadIndex = spreads.firstIndexWithReadingOrderIndex(readingOrderIndex),
+            let paginationView,
+            paginationView.currentIndex == spreadIndex,
+            let spreadView = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
+            spreadView.isSpreadLoaded
+        else {
+            return false
+        }
+        let result = await spreadView.locatorCommandBridge.validateUniqueTextMatch(
+            locatorJSON: locatorJSON,
+            targetHREF: locator.href,
+            cssSelector: cssSelector
+        )
+        return result.outcome == .applied
+    }
+
+    /// Extracts a bounded visible excerpt through fixed source in the isolated
+    /// content world. Publisher content is returned only to the local caller.
+    public func extractVisibleText(maximumLength: Int) async -> String? {
+        guard
+            let paginationView,
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            spreadView.isSpreadLoaded
+        else {
+            return nil
+        }
+        let targetHREF = currentLocation?.href ?? spreadView.spread.first.link.url()
+        return await spreadView.locatorCommandBridge.visibleText(
+            targetHREF: targetHREF,
+            maximumLength: maximumLength
+        )
+    }
+
+    private func waitForLoadedSpread(at index: Int) async -> EPUBSpreadView? {
+        for _ in 0 ..< 200 {
+            guard !Task.isCancelled else {
+                return nil
+            }
+            guard let paginationView, paginationView.currentIndex == index else {
+                return nil
+            }
+            if
+                let spreadView = paginationView.loadedViews[index] as? EPUBSpreadView,
+                spreadView.isSpreadLoaded
+            {
+                return spreadView
+            }
+            do {
+                try await Task.sleep(for: .milliseconds(10))
+            } catch {
+                return nil
+            }
+        }
+        return nil
+    }
+
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {
         guard let locator = await publication.locate(link) else {
             return false
@@ -856,40 +992,80 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             let transaction = DecorationApplyTransaction(group: group, source: source, target: target)
 
-            await withTaskGroup(of: Void.self) { tasks in
-                guard !Task.isCancelled else { return }
-                if transaction.target.isEmpty {
-                    for (_, pageView) in paginationView.loadedViews {
-                        tasks.addTask {
-                            guard !Task.isCancelled else { return }
-                            await (pageView as? EPUBSpreadView)?.evaluateScript(
-                                // The updates command are using `requestAnimationFrame()`, so we need it for
-                                // `clear()` as well otherwise we might recreate a highlight after it has been
-                                // cleared.
-                                "requestAnimationFrame(function () { readium.getDecorations('\(group)').clear(); });"
-                            )
-                        }
-                    }
-                } else {
-                    for (href, changes) in transaction.changesByHREF {
-                        guard let script = changes.javascript(forGroup: group, styles: self.config.decorationTemplates) else {
-                            continue
-                        }
-                        tasks.addTask { @MainActor [weak self] in
-                            guard
-                                !Task.isCancelled,
-                                let spreadView = self?.loadedSpreadViewForHREF(href),
-                                spreadView.isSpreadLoaded
-                            else {
-                                return
-                            }
-                            await spreadView.evaluateScript(script, inHREF: href)
+            var affectedHREFs = Array(transaction.changesByHREF.keys)
+            if transaction.target.isEmpty {
+                for (_, pageView) in paginationView.loadedViews {
+                    guard let spreadView = pageView as? EPUBSpreadView else { continue }
+                    for index in spreadView.spread.readingOrderIndices {
+                        guard let href = self.readingOrder.getOrNil(index)?.url() else { continue }
+                        if !affectedHREFs.contains(where: { $0.isEquivalentTo(href) }) {
+                            affectedHREFs.append(href)
                         }
                     }
                 }
             }
 
-            guard !Task.isCancelled else { return }
+            let activable = !(self.decorationCallbacks[group] ?? []).isEmpty
+            var applied: [(href: AnyURL, spreadView: EPUBSpreadView)] = []
+
+            func values(
+                from decorations: [DiffableDecoration],
+                for href: AnyURL
+            ) -> [EPUBDecorationCommandItem]? {
+                decorations
+                    .filter { $0.decoration.locator.href.isEquivalentTo(href) }
+                    .commandItems(styles: self.config.decorationTemplates)
+            }
+
+            func rollbackAppliedResources() async {
+                for operation in applied {
+                    guard let items = values(from: source, for: operation.href) else {
+                        self.log(.error, "Decoration rollback encoding failed")
+                        continue
+                    }
+                    _ = await operation.spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: operation.href,
+                        activable: activable
+                    )
+                }
+            }
+
+            for href in affectedHREFs {
+                guard !Task.isCancelled else {
+                    await rollbackAppliedResources()
+                    return
+                }
+                guard
+                    let spreadView = self.loadedSpreadViewForHREF(href),
+                    spreadView.isSpreadLoaded
+                else {
+                    continue
+                }
+                guard let items = values(from: transaction.target, for: href) else {
+                    await rollbackAppliedResources()
+                    return
+                }
+
+                let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                    items,
+                    in: group,
+                    targetHREF: href,
+                    activable: activable
+                )
+                guard result.outcome == .applied else {
+                    self.log(.warning, "Decoration command rejected reason=\(result.reason.rawValue)")
+                    await rollbackAppliedResources()
+                    return
+                }
+                applied.append((href, spreadView))
+            }
+
+            guard !Task.isCancelled else {
+                await rollbackAppliedResources()
+                return
+            }
             transaction.commit(to: &self.decorations)
         }
         decorationTasks[group] = task
@@ -903,15 +1079,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         Task {
             await initialized()
 
-            guard let paginationView = paginationView else {
-                return
-            }
-
-            await withTaskGroup(of: Void.self) { tasks in
-                for (_, view) in paginationView.loadedViews {
-                    tasks.addTask {
-                        await (view as? EPUBSpreadView)?.evaluateScript("readium.getDecorations('\(group)').setActivable();")
+            guard let paginationView = paginationView else { return }
+            let cached = decorations[group] ?? []
+            for (_, view) in paginationView.loadedViews {
+                guard let spreadView = view as? EPUBSpreadView else { continue }
+                for index in spreadView.spread.readingOrderIndices {
+                    guard
+                        let href = readingOrder.getOrNil(index)?.url(),
+                        let items = cached
+                            .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                            .commandItems(styles: config.decorationTemplates)
+                    else {
+                        continue
                     }
+                    _ = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: true
+                    )
                 }
             }
         }
@@ -1122,43 +1308,29 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
     }
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
-        let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
-            styles[item.key.rawValue] = .object(item.value.jsonObject)
-        }
-
-        guard let stylesJSON = try? templates.jsonString() else {
-            log(.error, "Can't serialize decoration styles to JSON")
-            return
-        }
-        var script = "readium.registerDecorationTemplates(\(stylesJSON.replacingOccurrences(of: "\\n", with: " ")));\n"
-
-        script += decorationCallbacks
-            .compactMap { group, callbacks in
-                guard !callbacks.isEmpty else {
-                    return nil
-                }
-                return "readium.getDecorations('\(group)').setActivable();"
-            }
-            .joined(separator: "\n")
-
         let links = spreadView.spread.readingOrderIndices
             .compactMap { readingOrder.getOrNil($0) }
 
         for link in links {
             let href = link.url()
             for (group, decorations) in decorations {
-                let decorations = decorations
-                    .filter { $0.decoration.locator.href.isEquivalentTo(href) }
-                    .map { DecorationChange.add($0.decoration) }
-
-                guard let decorationsScript = decorations.javascript(forGroup: group, styles: config.decorationTemplates) else {
+                guard let items = decorations
+                    .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                    .commandItems(styles: config.decorationTemplates)
+                else {
                     continue
                 }
-                script += decorationsScript
+                let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                    items,
+                    in: group,
+                    targetHREF: href,
+                    activable: !(decorationCallbacks[group] ?? []).isEmpty
+                )
+                if result.outcome != .applied {
+                    log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+                }
             }
         }
-
-        await spreadView.evaluateScript("(function() {\n\(script)\n})();")
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
