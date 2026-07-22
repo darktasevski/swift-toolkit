@@ -64,6 +64,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private(set) var focusedResource: ReadingOrder.Index?
 
     let webView: WebView
+    let locatorCommandBridge: EPUBLocatorCommandBridge
 
     private var lastClick: ClickEvent?
 
@@ -90,6 +91,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         config.setURLSchemeHandler(viewModel.server, forURLScheme: viewModel.server.scheme)
         config.mediaTypesRequiringUserActionForPlayback = .all
 
+        let locatorCommandBridge = EPUBLocatorCommandBridge(
+            layout: viewModel.publication.metadata.layout == .fixed ? .fixed : .reflowable,
+            publicationBaseURL: viewModel.publicationBaseURL
+        )
+        locatorCommandBridge.install(in: config)
+        self.locatorCommandBridge = locatorCommandBridge
+
         // Disable the Apple Intelligence Writing tools in the web views.
         // See https://github.com/readium/swift-toolkit/issues/509#issuecomment-2577780749
         if #available(iOS 18.0, *) {
@@ -97,6 +105,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
 
         webView = WebView(editingActions: viewModel.editingActions, configuration: config)
+        locatorCommandBridge.attach(to: webView)
 
         super.init(frame: .zero)
 
@@ -134,6 +143,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
+        locatorCommandBridge.disableMessageHandler()
     }
 
     func setupWebView() {
@@ -177,6 +187,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         if superview != nil {
             enableJSMessages()
+            locatorCommandBridge.enableMessageHandler()
             scrollView.delegate = self
         }
     }
@@ -684,6 +695,10 @@ extension EPUBSpreadView: WKScriptMessageHandler {
 }
 
 extension EPUBSpreadView: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        locatorCommandBridge.beginDocument()
+    }
+
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
         log(.error, error)
     }
@@ -712,6 +727,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        locatorCommandBridge.invalidateDocument()
         delegate?.spreadViewDidTerminate()
     }
 }
