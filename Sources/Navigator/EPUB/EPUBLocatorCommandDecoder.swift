@@ -37,7 +37,10 @@ enum EPUBLocatorCommandDecoder {
         static let stringUTF16 = 16 * 1024
         static let selectorUTF16 = 8 * 1024
         static let hrefOrTitleUTF16 = 4 * 1024
-        static let quoteContextUTF16 = 64
+        // selection.js persists at most 200 UTF-16 units on either side of a selection.
+        // Keep the decoder bounded while accepting the complete producer contract, including
+        // locators already persisted by clients before isolated commands were introduced.
+        static let quoteContextUTF16 = 200
         static let highlightUTF16 = 16384
     }
 

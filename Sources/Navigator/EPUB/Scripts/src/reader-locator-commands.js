@@ -11,7 +11,8 @@ const LIMITS = Object.freeze({
   stringUTF16: 16 * 1024,
   selectorUTF16: 8 * 1024,
   hrefOrTitleUTF16: 4 * 1024,
-  quoteContextUTF16: 64,
+  // Must accept the bounded context emitted by selection.js and stored in Locator.Text.
+  quoteContextUTF16: 200,
   highlightUTF16: 16384,
 });
 
