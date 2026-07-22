@@ -12,8 +12,15 @@ import WebKit
 
 /// A view rendering a spread of resources with a reflowable layout.
 final class EPUBReflowableSpreadView: EPUBSpreadView {
+    private struct ContentInsetConfiguration: Equatable {
+        let inset: UIEdgeInsets
+        let scroll: Bool
+    }
+
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
+    private var contentInsetConfiguration: ContentInsetConfiguration?
+    private var settingsLayoutTask: Task<Void, Never>?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -34,14 +41,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func clear() {
+        settingsLayoutTask?.cancel()
+        settingsLayoutTask = nil
         super.clear()
-
-        // Clean up go to continuations.
-        for continuation in goToContinuations {
-            continuation.resume()
-        }
-        goToContinuations.removeAll()
-
         scrollDidEnd()
     }
 
@@ -98,6 +100,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     private func updateContentInset() {
         let contentInset = delegate?.spreadViewContentInset(self) ?? .zero
+        let configuration = ContentInsetConfiguration(
+            inset: contentInset,
+            scroll: viewModel.scroll
+        )
+        guard configuration != contentInsetConfiguration else {
+            return
+        }
+        contentInsetConfiguration = configuration
+
+        let writerLease = readiness.acquirePositionWriter()
 
         if viewModel.scroll {
             topConstraint.constant = 0
@@ -108,6 +120,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             topConstraint.constant = contentInset.top
             bottomConstraint.constant = -contentInset.bottom
             scrollView.contentInset = .zero
+        }
+
+        layoutIfNeeded()
+
+        guard let writerLease else { return }
+        let predecessor = settingsLayoutTask
+        predecessor?.cancel()
+        settingsLayoutTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+            defer { self.readiness.release(writerLease) }
+            guard !Task.isCancelled else { return }
+            _ = await self.waitForLayoutStability()
         }
     }
 
@@ -147,25 +172,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     override func spreadDidLoad() async {
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
-            await evaluateScript("readium.link = \(linkJSON);")
+            await evaluateDocumentScript("readium.link = \(linkJSON);")
         }
 
-        // TODO: Better solution for delaying scrolling to pending location
-        // This delay is used to wait for the web view pagination to settle and give the CSS and webview time to layout
-        // correctly before attempting to scroll to the target progression, otherwise we might end up at the wrong spot.
-        // 0.2 seconds seems like a good value for it to work on an iPhone 5s.
-        try? await Task.sleep(seconds: 0.2)
-        if Task.isCancelled { return }
+        guard await waitForLayoutStability() else { return }
 
         let location = pendingLocation
         await go(to: location.location, animated: location.animated)
         if Task.isCancelled { return }
 
-        // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
-        // a generous delay before showing the spread again.
-        let delayed = !location.location.isStart
-        try? await Task.sleep(seconds: delayed ? 0.3 : 0)
-        if Task.isCancelled { return }
+        guard await waitForLayoutStability() else { return }
 
         // Anchor-tracking init: pull the per-resource anchor list from the
         // view model and call into the JS module. Even on oversized/invalid
@@ -203,10 +219,75 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
+    /// Waits for fonts and a bounded run of stable animation frames. The
+    /// `spreadLoaded` message is emitted after the window load event, so every
+    /// external stylesheet link must already expose a non-null `sheet` before
+    /// stability can be accepted.
+    private func waitForLayoutStability() async -> Bool {
+        let generation = readiness.generation
+        guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
+            return false
+        }
+
+        do {
+            let result = try await webView.callAsyncJavaScript(
+                """
+                const stylesheetLinks = Array.from(document.querySelectorAll('link[rel~="stylesheet"]'));
+                if (stylesheetLinks.some(link => link.sheet === null)) {
+                    return false;
+                }
+                if (document.fonts) {
+                    await document.fonts.ready;
+                }
+
+                var previous = null;
+                var stableFrames = 0;
+                for (let frame = 0; frame < 12 && stableFrames < 2; frame += 1) {
+                    await new Promise(resolve => requestAnimationFrame(resolve));
+                    const current = [
+                        document.documentElement.scrollWidth,
+                        document.documentElement.scrollHeight,
+                        document.body?.scrollWidth ?? 0,
+                        document.body?.scrollHeight ?? 0,
+                    ];
+                    if (previous !== null && current.every((value, index) => value === previous[index])) {
+                        stableFrames += 1;
+                    } else {
+                        stableFrames = 0;
+                    }
+                    previous = current;
+                }
+                return stableFrames >= 2;
+                """,
+                arguments: [:],
+                in: nil,
+                contentWorld: .page
+            )
+            guard
+                !Task.isCancelled,
+                generation == readiness.generation
+            else {
+                return false
+            }
+            return result as? Bool == true
+        } catch is CancellationError {
+            return false
+        } catch {
+            let ns = error as NSError
+            log(.warning, "Layout stability failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            return false
+        }
+    }
+
     override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
         guard !viewModel.scroll else {
             return await super.go(to: direction, options: options)
         }
+
+        guard let writerLease = readiness.acquirePositionWriter() else {
+            return false
+        }
+        defer { readiness.release(writerLease) }
 
         let factor: CGFloat = {
             switch direction {
@@ -234,7 +315,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // (`offsetX`) is coordinate-system agnostic and works for both LTR and
         // RTL.
         let behavior = options.animated ? "smooth" : "instant"
-        await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
+        await evaluateDocumentScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
 
         if options.animated {
             // Waits for the scroll animation to finish.
@@ -265,13 +346,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
 
     override func go(to location: PageLocation, animated: Bool) async {
-        guard isSpreadLoaded else {
-            // Delays moving to the location until the document is loaded.
+        guard readiness.isDocumentAvailable else {
             pendingLocation = PendingLocation(location: location, animated: animated)
-
-            await waitGoToCompletion()
+            let generation = readiness.generation
+            _ = await readiness.waitForCommandReadiness(for: generation)
             return
         }
+
+        guard let writerLease = readiness.acquirePositionWriter() else {
+            return
+        }
+        defer { readiness.release(writerLease) }
 
         switch location {
         case let .locator(locator):
@@ -282,23 +367,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             await scroll(toProgression: 1, animated: animated)
         }
 
-        didCompleteGoTo()
     }
-
-    private func waitGoToCompletion() async {
-        await withCheckedContinuation { continuation in
-            goToContinuations.append(continuation)
-        }
-    }
-
-    private func didCompleteGoTo() {
-        for cont in goToContinuations {
-            cont.resume()
-        }
-        goToContinuations.removeAll()
-    }
-
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
 
     private var pendingScrollAnimation: ScrollAnimationRequest?
 
@@ -370,7 +439,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            await evaluateScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
+            await evaluateDocumentScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
             return true
         }
     }
@@ -401,7 +470,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Called by the javascript code to notify that scrolling ended.
     private func progressionDidChange(_ body: Any) {
         guard
-            isSpreadLoaded,
+            isCommandReady,
             let body = body as? [String: Any],
             var firstProgression = body["first"] as? Double,
             var lastProgression = body["last"] as? Double

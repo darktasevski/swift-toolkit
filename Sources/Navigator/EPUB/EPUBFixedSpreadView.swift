@@ -11,10 +11,17 @@ import WebKit
 
 /// A view rendering a spread of resources with a fixed layout.
 final class EPUBFixedSpreadView: EPUBSpreadView {
+    private struct LayoutConfiguration: Equatable {
+        let viewportSize: CGSize
+        let insets: UIEdgeInsets
+        let fit: String
+    }
+
     /// Whether the host wrapper page is loaded or not. The wrapper page contains the iframe that will display the resource.
     private var isWrapperLoaded = false
     /// URL to load in the iframe once the wrapper page is loaded.
     private var urlToLoad: URL?
+    private var lastLayoutConfiguration: LayoutConfiguration?
 
     private static let fixedScript = loadScript(named: "readium-fixed")
 
@@ -89,6 +96,17 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
         let viewportSize = bounds.inset(by: insets).size
         let fitString = viewModel.settings.fit.rawValue
+        let configuration = LayoutConfiguration(
+            viewportSize: viewportSize,
+            insets: insets,
+            fit: fitString
+        )
+        guard configuration != lastLayoutConfiguration else {
+            return
+        }
+        lastLayoutConfiguration = configuration
+
+        let writerLease = readiness.acquirePositionWriter()
 
         webView.evaluateJavaScript("""
             spread.setViewport(
@@ -96,7 +114,10 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
                 {'top': \(Int(insets.top)), 'left': \(Int(insets.left)), 'bottom': \(Int(insets.bottom)), 'right': \(Int(insets.right))},
                 '\(fitString)'
             );
-        """)
+        """) { [weak self] _, _ in
+            guard let self, let writerLease else { return }
+            self.readiness.release(writerLease)
+        }
     }
 
     override func loadSpread() {
@@ -110,13 +131,6 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             readingProgression: viewModel.readingProgression
         )
         webView.evaluateJavaScript("spread.load(\(spreadJSON));")
-    }
-
-    override func spreadDidLoad() async {
-        for continuation in goToContinuations {
-            continuation.resume()
-        }
-        goToContinuations.removeAll()
     }
 
     override func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, any Error> {
@@ -154,18 +168,10 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
-
     override func go(to location: PageLocation, animated: Bool) async {
         // Fixed layout resources are always fully visible so we don't use the
         // location.
-
-        if isSpreadLoaded {
-            return
-        } else {
-            await withCheckedContinuation { continuation in
-                goToContinuations.append(continuation)
-            }
-        }
+        let generation = readiness.generation
+        _ = await readiness.waitForCommandReadiness(for: generation)
     }
 }

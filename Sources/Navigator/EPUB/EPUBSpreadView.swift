@@ -74,8 +74,15 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     weak var activityIndicatorView: UIActivityIndicatorView?
     private var activityIndicatorStopWorkItem: DispatchWorkItem?
 
-    private(set) var isSpreadLoaded = false
+    /// Sole authority for this spread's render generation and position
+    /// writers. Document availability and external command readiness are
+    /// intentionally separate states.
+    let readiness = EPUBSpreadReadiness()
     private var spreadLoadTask: Task<Void, Never>?
+
+    var isCommandReady: Bool {
+        readiness.isCommandReady
+    }
 
     required init(
         viewModel: EPUBNavigatorViewModel,
@@ -143,6 +150,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        readiness.invalidate()
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
@@ -202,7 +210,25 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Evaluates the given JavaScript into the resource's HTML page.
     @discardableResult
     func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, Error> {
-        await spreadLoaded()
+        let generation = readiness.generation
+        guard case .ready = await readiness.waitForCommandReadiness(for: generation) else {
+            return .failure(CancellationError())
+        }
+
+        return await evaluateDocumentScript(script, inHREF: href)
+    }
+
+    /// Evaluates during initialization after the frame document exists, but
+    /// before external command readiness is published.
+    @discardableResult
+    func evaluateDocumentScript(
+        _ script: String,
+        inHREF href: AnyURL? = nil
+    ) async -> Result<Any, Error> {
+        let generation = readiness.generation
+        guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
+            return .failure(CancellationError())
+        }
 
         return await withCheckedContinuation { continuation in
             webView.evaluateJavaScript(script) { [weak self] res, error in
@@ -426,41 +452,40 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
         spreadLoadTask?.cancel()
-        spreadLoadTask = Task { @MainActor in
-            isSpreadLoaded = true
+        let generation = readiness.generation
+        guard let rootLease = readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability()
+        ) else {
+            return
+        }
+
+        spreadLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             applySettings()
             await spreadDidLoad()
+            readiness.release(rootLease)
+
+            guard
+                !Task.isCancelled,
+                case .ready(generation, _) = readiness.state
+            else {
+                return
+            }
+
             await delegate?.spreadViewDidLoad(self)
-            onSpreadLoadedCallbacks.complete()
+            guard
+                !Task.isCancelled,
+                case .ready(generation, _) = readiness.state
+            else {
+                return
+            }
             showSpread()
         }
     }
 
     /// To be overriden to customize the behavior after the spread is loaded.
     func spreadDidLoad() async {}
-
-    private let onSpreadLoadedCallbacks = CompletionList()
-
-    /// Awaits for the spread to be fully loaded.
-    func spreadLoaded() async {
-        if isSpreadLoaded {
-            return
-        }
-
-        await withCheckedContinuation { continuation in
-            whenSpreadLoaded {
-                continuation.resume()
-            }
-        }
-    }
-
-    /// Executes the given `callback` when the spread is fully loaded.
-    func whenSpreadLoaded(_ callback: @escaping () -> Void) {
-        let callback = onSpreadLoadedCallbacks.add(callback)
-        if isSpreadLoaded {
-            callback()
-        }
-    }
 
     func showSpread() {
         activityIndicatorView?.stopAnimating()
@@ -673,7 +698,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
         isVoiceOverRunning = UIAccessibility.isVoiceOverRunning
         // Scroll mode will be activated if VoiceOver is on
+        guard let lease = readiness.acquirePositionWriter() else {
+            applySettings()
+            return
+        }
         applySettings()
+        layoutIfNeeded()
+        readiness.release(lease)
     }
 
     // MARK: - Scripts
@@ -698,12 +729,26 @@ extension EPUBSpreadView: WKScriptMessageHandler {
 
 extension EPUBSpreadView: WKNavigationDelegate {
     func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        spreadLoadTask?.cancel()
+        spreadLoadTask = nil
+        readiness.beginLoading()
         locatorCommandBridge.beginDocument()
     }
 
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+        readiness.invalidate()
         let ns = error as NSError
         log(.error, "Web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        readiness.invalidate()
+        let ns = error as NSError
+        log(.error, "Provisional web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -730,6 +775,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        readiness.invalidate()
         locatorCommandBridge.invalidateDocument()
         delegate?.spreadViewDidTerminate()
     }

@@ -809,7 +809,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         if
             paginationView.currentIndex == spreadIndex,
             let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
-            loaded.isSpreadLoaded
+            loaded.isCommandReady
         {
             spreadView = loaded
         } else {
@@ -817,11 +817,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             guard await go(to: resourceOnly, options: NavigatorGoOptions(animated: animated)) else {
                 return Task.isCancelled ? .cancelled : .miss
             }
-            guard let loaded = await waitForLoadedSpread(at: spreadIndex) else {
+            guard let loaded = await waitForReadySpread(at: spreadIndex) else {
                 return Task.isCancelled ? .cancelled : .miss
             }
             spreadView = loaded
         }
+
+        guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
+            return .cancelled
+        }
+        defer { spreadView.readiness.release(writerLease) }
 
         let result = await spreadView.locatorCommandBridge.navigate(
             locatorJSON: locatorJSON,
@@ -858,7 +863,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let paginationView,
             paginationView.currentIndex == spreadIndex,
             let spreadView = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
-            spreadView.isSpreadLoaded
+            spreadView.isCommandReady
         else {
             return false
         }
@@ -876,7 +881,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard
             let paginationView,
             let spreadView = paginationView.currentView as? EPUBSpreadView,
-            spreadView.isSpreadLoaded
+            spreadView.isCommandReady
         else {
             return nil
         }
@@ -887,27 +892,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func waitForLoadedSpread(at index: Int) async -> EPUBSpreadView? {
-        for _ in 0 ..< 200 {
-            guard !Task.isCancelled else {
-                return nil
-            }
-            guard let paginationView, paginationView.currentIndex == index else {
-                return nil
-            }
-            if
-                let spreadView = paginationView.loadedViews[index] as? EPUBSpreadView,
-                spreadView.isSpreadLoaded
-            {
-                return spreadView
-            }
-            do {
-                try await Task.sleep(for: .milliseconds(10))
-            } catch {
-                return nil
-            }
+    private func waitForReadySpread(at index: Int) async -> EPUBSpreadView? {
+        guard
+            let paginationView,
+            paginationView.currentIndex == index,
+            let spreadView = await paginationView.waitForCurrentPage(at: index) as? EPUBSpreadView
+        else {
+            return nil
         }
-        return nil
+
+        let generation = spreadView.readiness.generation
+        guard
+            case .ready = await spreadView.readiness.waitForCommandReadiness(for: generation),
+            !Task.isCancelled,
+            paginationView.currentIndex == index,
+            paginationView.loadedViews[index] === spreadView
+        else {
+            return nil
+        }
+        return spreadView
     }
 
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {
@@ -1027,7 +1030,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 apply: { href in
                     guard
                         let spreadView = self.loadedSpreadViewForHREF(href),
-                        spreadView.isSpreadLoaded
+                        spreadView.isCommandReady
                     else {
                         return true
                     }
@@ -1035,6 +1038,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         self.log(.error, "Decoration command encoding failed")
                         return false
                     }
+                    guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
+                        return false
+                    }
+                    defer { spreadView.readiness.release(writerLease) }
 
                     let result = await spreadView.locatorCommandBridge.replaceDecorations(
                         items,
@@ -1051,7 +1058,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 rollback: { href in
                     guard
                         let spreadView = self.loadedSpreadViewForHREF(href),
-                        spreadView.isSpreadLoaded
+                        spreadView.isCommandReady
                     else {
                         return true
                     }
@@ -1059,6 +1066,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         self.log(.error, "Decoration rollback encoding failed")
                         return false
                     }
+                    guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
+                        return false
+                    }
+                    defer { spreadView.readiness.release(writerLease) }
 
                     let result = await spreadView.locatorCommandBridge.replaceDecorations(
                         items,
@@ -1163,7 +1174,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func reinjectAnchorTracking(into spread: EPUBSpreadView) async {
-        guard !Task.isCancelled, spread.isSpreadLoaded else { return }
+        guard
+            !Task.isCancelled,
+            spread.isCommandReady,
+            let writerLease = spread.readiness.acquirePositionWriter()
+        else {
+            return
+        }
+        defer { spread.readiness.release(writerLease) }
         let anchorIds = viewModel.anchorIds(forResourceAt: spread.spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
         guard anchorIds.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else {
             log(.warning, "anchor tracking reinjection skipped: list size=\(anchorIds.count)")
