@@ -17,10 +17,14 @@ extension Array where Element == DiffableDecoration {
 
         for value in self {
             let decoration = value.decoration
-            guard
-                let template = styles[decoration.style.id],
-                let locatorJSON = try? decoration.locator.jsonString()
-            else {
+            guard let template = styles[decoration.style.id] else {
+                EPUBNavigatorViewController.log(.error, "Decoration template unavailable")
+                return nil
+            }
+            let locatorJSON: String
+            do {
+                locatorJSON = try decoration.locator.jsonString()
+            } catch {
                 EPUBNavigatorViewController.log(.error, "Decoration command encoding failed")
                 return nil
             }

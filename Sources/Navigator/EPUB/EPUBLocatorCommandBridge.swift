@@ -4,6 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
+import CoreFoundation
 import Foundation
 import ReadiumShared
 @preconcurrency import WebKit
@@ -204,12 +205,6 @@ struct EPUBDecorationCommandItem: Sendable {
     let locatorJSON: String
     let style: EPUBDecorationCommandStyle
 
-    init(id: String, locatorJSON: String, style: EPUBDecorationCommandStyle) {
-        self.id = id
-        self.locatorJSON = locatorJSON
-        self.style = style
-    }
-
     fileprivate var javascriptValue: [String: Any] {
         [
             "id": id,
@@ -220,10 +215,25 @@ struct EPUBDecorationCommandItem: Sendable {
 }
 
 @MainActor
-final class EPUBLocatorCommandBridge: NSObject {
+final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private struct StoredFrame {
         let info: WKFrameInfo
         let documentEpoch: Int
+    }
+
+    private struct DecorationActivationState {
+        let token: EPUBLocatorCommandToken
+        let identifiers: Set<String>
+    }
+
+    private struct CommandSequenceKey: Hashable {
+        let operationKind: EPUBLocatorCommandOperationKind
+        let groupID: String?
+    }
+
+    private struct DecorationActivationStateKey: Hashable {
+        let frameID: String
+        let groupID: String
     }
 
     static let contentWorld = WKContentWorld.world(name: "ReaderLocatorCommands")
@@ -236,19 +246,27 @@ final class EPUBLocatorCommandBridge: NSObject {
     const text = range.commonAncestorContainer.textContent || '';
     return text.slice(0, maximumLength);
     """
-    private static let commandSource: String = Bundle.module
-        .url(
+    private static let commandSource: String? = {
+        guard let url = Bundle.module.url(
             forResource: "readium-reader-locator-commands",
             withExtension: "js",
             subdirectory: "Assets/Static/scripts"
-        )
-        .flatMap { try? String(contentsOf: $0, encoding: .utf8) }!
+        ) else {
+            return nil
+        }
+        do {
+            return try String(contentsOf: url, encoding: .utf8)
+        } catch {
+            return nil
+        }
+    }()
 
     private let publicationBaseURL: AbsoluteURL
     private let webViewInstanceID = UUID().uuidString
     private var registry: EPUBLocatorFrameRegistry
     private var framesByID: [String: StoredFrame] = [:]
-    private var latestSequences: [String: Int] = [:]
+    private var latestSequences: [CommandSequenceKey: Int] = [:]
+    private var decorationActivationStates: [DecorationActivationStateKey: DecorationActivationState] = [:]
     private(set) var documentEpoch = 0
     private weak var webView: WKWebView?
     private weak var userContentController: WKUserContentController?
@@ -263,8 +281,14 @@ final class EPUBLocatorCommandBridge: NSObject {
 
     func install(in configuration: WKWebViewConfiguration) {
         let controller = configuration.userContentController
+        guard let commandSource = Self.commandSource else {
+            log(.error, "Locator command bundle unavailable")
+            userContentController = controller
+            enableMessageHandler()
+            return
+        }
         controller.addUserScript(WKUserScript(
-            source: Self.commandSource,
+            source: commandSource,
             injectionTime: .atDocumentStart,
             forMainFrameOnly: false,
             in: Self.contentWorld
@@ -314,6 +338,7 @@ final class EPUBLocatorCommandBridge: NSObject {
         framesByID.removeAll(keepingCapacity: true)
         registry.removeAll()
         latestSequences.removeAll(keepingCapacity: true)
+        decorationActivationStates.removeAll(keepingCapacity: true)
     }
 
     func invalidateDocument() {
@@ -417,8 +442,8 @@ final class EPUBLocatorCommandBridge: NSObject {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField)
         }
 
-        let validLayouts: Set<String> = ["bounds", "boxes"]
-        let validWidths: Set<String> = ["wrap", "bounds", "viewport", "page"]
+        let validLayouts: Set = ["bounds", "boxes"]
+        let validWidths: Set = ["wrap", "bounds", "viewport", "page"]
         var totalStringUnits = groupID.utf16.count
         for decoration in decorations {
             let payload: EPUBLocatorCommandPayload
@@ -495,7 +520,19 @@ final class EPUBLocatorCommandBridge: NSObject {
         guard !Task.isCancelled, isCurrent(token) else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
-        return Self.decodeResult(rawResult, expectedToken: token)
+        let result = Self.decodeResult(rawResult, expectedToken: token)
+        if result.outcome == .applied {
+            let key = DecorationActivationStateKey(frameID: selectedID, groupID: groupID)
+            if activable {
+                decorationActivationStates[key] = DecorationActivationState(
+                    token: token,
+                    identifiers: Set(decorations.map(\.id))
+                )
+            } else {
+                decorationActivationStates[key] = nil
+            }
+        }
+        return result
     }
 
     func validateUniqueTextMatch(
@@ -615,7 +652,7 @@ final class EPUBLocatorCommandBridge: NSObject {
         for operationKind: EPUBLocatorCommandOperationKind,
         groupID: String? = nil
     ) -> EPUBLocatorCommandToken {
-        let key = "\(operationKind.rawValue):\(groupID ?? "")"
+        let key = CommandSequenceKey(operationKind: operationKind, groupID: groupID)
         let sequence = (latestSequences[key] ?? 0) + 1
         latestSequences[key] = sequence
         return EPUBLocatorCommandToken(
@@ -634,7 +671,10 @@ final class EPUBLocatorCommandBridge: NSObject {
         else {
             return false
         }
-        let key = "\(token.operationKind.rawValue):\(token.groupID ?? "")"
+        let key = CommandSequenceKey(
+            operationKind: token.operationKind,
+            groupID: token.groupID
+        )
         return latestSequences[key] == token.sequence
     }
 
@@ -657,6 +697,99 @@ final class EPUBLocatorCommandBridge: NSObject {
         }
         components.fragment = nil
         return components.url?.absoluteString
+    }
+
+    private func validatedDecorationActivation(
+        _ message: WKScriptMessage
+    ) -> [String: Any]? {
+        guard
+            let body = message.body as? [String: Any],
+            Set(body.keys) == ["id", "group", "token", "rect", "click"],
+            let identifier = body["id"] as? String,
+            identifier.utf16.count <= 4 * 1024,
+            let groupID = body["group"] as? String,
+            groupID.utf16.count <= 4 * 1024,
+            let tokenValue = body["token"] as? [String: Any],
+            let token = Self.decodeToken(tokenValue),
+            token.webViewInstanceID == webViewInstanceID,
+            token.documentEpoch == documentEpoch,
+            token.operationKind == .decoration,
+            token.groupID == groupID,
+            let requestURL = message.frameInfo.request.url,
+            publicationBaseURL.relativize(requestURL) != nil,
+            let frameKey = frameKey(for: requestURL),
+            case let .selected(selectedID) = registry.select(
+                href: frameKey,
+                documentEpoch: documentEpoch
+            ),
+            Self.validActivationRect(body["rect"]),
+            Self.validActivationClick(body["click"])
+        else {
+            return nil
+        }
+
+        guard
+            let storedFrame = framesByID[selectedID],
+            storedFrame.documentEpoch == documentEpoch,
+            let state = decorationActivationStates[
+                DecorationActivationStateKey(frameID: selectedID, groupID: groupID)
+            ],
+            state.token == token,
+            state.identifiers.contains(identifier)
+        else {
+            return nil
+        }
+        return body
+    }
+
+    private static func validActivationRect(_ value: Any?) -> Bool {
+        guard
+            let rect = value as? [String: Any],
+            Set(rect.keys) == ["left", "top", "width", "height"],
+            let left = boundedFiniteDouble(rect["left"]),
+            let top = boundedFiniteDouble(rect["top"]),
+            let width = boundedFiniteDouble(rect["width"]),
+            let height = boundedFiniteDouble(rect["height"]),
+            width >= 0,
+            height >= 0
+        else {
+            return false
+        }
+        return abs(left) <= 10_000_000 && abs(top) <= 10_000_000
+    }
+
+    private static func validActivationClick(_ value: Any?) -> Bool {
+        guard
+            let click = value as? [String: Any],
+            Set(click.keys) == ["defaultPrevented", "x", "y", "targetElement"],
+            isBoolean(click["defaultPrevented"]),
+            let x = boundedFiniteDouble(click["x"]),
+            let y = boundedFiniteDouble(click["y"]),
+            abs(x) <= 10_000_000,
+            abs(y) <= 10_000_000,
+            let targetElement = click["targetElement"] as? String,
+            targetElement.utf16.count <= 4 * 1024
+        else {
+            return false
+        }
+        return true
+    }
+
+    private static func isBoolean(_ value: Any?) -> Bool {
+        guard let number = value as? NSNumber else { return false }
+        return CFGetTypeID(number) == CFBooleanGetTypeID()
+    }
+
+    private static func boundedFiniteDouble(_ value: Any?) -> Double? {
+        guard
+            let number = value as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
+            return nil
+        }
+        let double = number.doubleValue
+        guard double.isFinite, abs(double) <= 10_000_000 else { return nil }
+        return double
     }
 
     private static func decodeResult(
@@ -711,7 +844,10 @@ final class EPUBLocatorCommandBridge: NSObject {
     }
 
     private static func exactInteger(_ value: Any?) -> Int? {
-        guard let number = value as? NSNumber else {
+        guard
+            let number = value as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID()
+        else {
             return nil
         }
         let double = number.doubleValue
@@ -728,7 +864,9 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
         didReceive message: WKScriptMessage
     ) {
         if message.name == Self.decorationActivatedMessageName {
-            onDecorationActivated?(message.body)
+            if let activation = validatedDecorationActivation(message) {
+                onDecorationActivated?(activation)
+            }
             return
         }
         guard

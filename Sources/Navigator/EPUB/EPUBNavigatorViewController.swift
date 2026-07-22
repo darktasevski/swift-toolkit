@@ -777,6 +777,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         _ locatorJSON: String,
         animated: Bool
     ) async -> LocatorNavigationOutcome {
+        await locatorNavigationTaskQueue.run { [weak self] in
+            guard let self else { return .cancelled }
+            return await self.performLocatorNavigation(locatorJSON, animated: animated)
+        }
+    }
+
+    private func performLocatorNavigation(
+        _ locatorJSON: String,
+        animated: Bool
+    ) async -> LocatorNavigationOutcome {
         guard !Task.isCancelled else {
             return .cancelled
         }
@@ -956,24 +966,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Decoration group callbacks, indexed by the group name.
     private var decorationCallbacks: [DecorationGroup: [DecorableNavigator.OnActivatedCallback]] = [:]
 
-    /// Pending decoration tasks, indexed by group name. Stored to allow
-    /// cancellation when a new `apply(decorations:in:)` call supersedes a
-    /// previous one.
-    private var decorationTasks: [DecorationGroup: Task<Void, Never>] = [:]
+    /// Serializes decoration replacement and cleanup within each group.
+    private let decorationApplyTaskQueue = DecorationApplyTaskQueue()
+
+    /// Serializes rapid locator requests with latest-request-wins semantics.
+    private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         config.decorationTemplates.keys.contains(style)
     }
 
     public func apply(decorations: [Decoration], in group: DecorationGroup) {
-        decorationTasks[group]?.cancel()
-        var task: Task<Void, Never>?
-        task = Task { [weak self] in
-            defer {
-                if let self, self.decorationTasks[group] == task {
-                    self.decorationTasks[group] = nil
-                }
-            }
+        decorationApplyTaskQueue.submit(in: group) { [weak self] isSuperseding in
             guard let self else { return }
             await self.initialized()
 
@@ -993,7 +997,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let transaction = DecorationApplyTransaction(group: group, source: source, target: target)
 
             var affectedHREFs = Array(transaction.changesByHREF.keys)
-            if transaction.target.isEmpty {
+            if transaction.target.isEmpty || isSuperseding {
                 for (_, pageView) in paginationView.loadedViews {
                     guard let spreadView = pageView as? EPUBSpreadView else { continue }
                     for index in spreadView.spread.readingOrderIndices {
@@ -1006,69 +1010,74 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
 
             let activable = !(self.decorationCallbacks[group] ?? []).isEmpty
-            var applied: [(href: AnyURL, spreadView: EPUBSpreadView)] = []
+            let decorationTemplates = self.config.decorationTemplates
 
+            @MainActor
             func values(
                 from decorations: [DiffableDecoration],
                 for href: AnyURL
             ) -> [EPUBDecorationCommandItem]? {
                 decorations
                     .filter { $0.decoration.locator.href.isEquivalentTo(href) }
-                    .commandItems(styles: self.config.decorationTemplates)
+                    .commandItems(styles: decorationTemplates)
             }
 
-            func rollbackAppliedResources() async {
-                for operation in applied {
-                    guard let items = values(from: source, for: operation.href) else {
-                        self.log(.error, "Decoration rollback encoding failed")
-                        continue
+            let resourceTransaction = DecorationApplyResourceTransaction(resources: affectedHREFs)
+            let didApply = await resourceTransaction.run(
+                apply: { href in
+                    guard
+                        let spreadView = self.loadedSpreadViewForHREF(href),
+                        spreadView.isSpreadLoaded
+                    else {
+                        return true
                     }
-                    _ = await operation.spreadView.locatorCommandBridge.replaceDecorations(
+                    guard let items = values(from: transaction.target, for: href) else {
+                        self.log(.error, "Decoration command encoding failed")
+                        return false
+                    }
+
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
                         items,
                         in: group,
-                        targetHREF: operation.href,
+                        targetHREF: href,
                         activable: activable
                     )
-                }
-            }
+                    guard result.outcome == .applied else {
+                        self.log(.warning, "Decoration command rejected reason=\(result.reason.rawValue)")
+                        return false
+                    }
+                    return true
+                },
+                rollback: { href in
+                    guard
+                        let spreadView = self.loadedSpreadViewForHREF(href),
+                        spreadView.isSpreadLoaded
+                    else {
+                        return true
+                    }
+                    guard let items = values(from: source, for: href) else {
+                        self.log(.error, "Decoration rollback encoding failed")
+                        return false
+                    }
 
-            for href in affectedHREFs {
-                guard !Task.isCancelled else {
-                    await rollbackAppliedResources()
-                    return
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: activable
+                    )
+                    guard result.outcome == .applied else {
+                        self.log(.warning, "Decoration rollback rejected reason=\(result.reason.rawValue)")
+                        return false
+                    }
+                    return true
                 }
-                guard
-                    let spreadView = self.loadedSpreadViewForHREF(href),
-                    spreadView.isSpreadLoaded
-                else {
-                    continue
-                }
-                guard let items = values(from: transaction.target, for: href) else {
-                    await rollbackAppliedResources()
-                    return
-                }
-
-                let result = await spreadView.locatorCommandBridge.replaceDecorations(
-                    items,
-                    in: group,
-                    targetHREF: href,
-                    activable: activable
-                )
-                guard result.outcome == .applied else {
-                    self.log(.warning, "Decoration command rejected reason=\(result.reason.rawValue)")
-                    await rollbackAppliedResources()
-                    return
-                }
-                applied.append((href, spreadView))
-            }
-
-            guard !Task.isCancelled else {
-                await rollbackAppliedResources()
+            )
+            guard didApply else {
                 return
             }
             transaction.commit(to: &self.decorations)
         }
-        decorationTasks[group] = task
     }
 
     public func observeDecorationInteractions(inGroup group: DecorationGroup, onActivated: @escaping OnActivatedCallback) {
@@ -1077,27 +1086,30 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         decorationCallbacks[group] = callbacks
 
         Task {
-            await initialized()
+            await decorationApplyTaskQueue.replay(in: group) { [weak self] in
+                guard let self else { return }
+                await self.initialized()
 
-            guard let paginationView = paginationView else { return }
-            let cached = decorations[group] ?? []
-            for (_, view) in paginationView.loadedViews {
-                guard let spreadView = view as? EPUBSpreadView else { continue }
-                for index in spreadView.spread.readingOrderIndices {
-                    guard
-                        let href = readingOrder.getOrNil(index)?.url(),
-                        let items = cached
+                guard let paginationView = self.paginationView else { return }
+                let committed = self.decorations[group] ?? []
+                for (_, view) in paginationView.loadedViews {
+                    guard let spreadView = view as? EPUBSpreadView else { continue }
+                    for index in spreadView.spread.readingOrderIndices {
+                        guard
+                            let href = self.readingOrder.getOrNil(index)?.url(),
+                            let items = committed
                             .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
-                            .commandItems(styles: config.decorationTemplates)
-                    else {
-                        continue
+                            .commandItems(styles: self.config.decorationTemplates)
+                        else {
+                            continue
+                        }
+                        _ = await spreadView.locatorCommandBridge.replaceDecorations(
+                            items,
+                            in: group,
+                            targetHREF: href,
+                            activable: true
+                        )
                     }
-                    _ = await spreadView.locatorCommandBridge.replaceDecorations(
-                        items,
-                        in: group,
-                        targetHREF: href,
-                        activable: true
-                    )
                 }
             }
         }
@@ -1311,23 +1323,27 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         let links = spreadView.spread.readingOrderIndices
             .compactMap { readingOrder.getOrNil($0) }
 
-        for link in links {
-            let href = link.url()
-            for (group, decorations) in decorations {
-                guard let items = decorations
-                    .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
-                    .commandItems(styles: config.decorationTemplates)
-                else {
-                    continue
-                }
-                let result = await spreadView.locatorCommandBridge.replaceDecorations(
-                    items,
-                    in: group,
-                    targetHREF: href,
-                    activable: !(decorationCallbacks[group] ?? []).isEmpty
-                )
-                if result.outcome != .applied {
-                    log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+        for group in Array(decorations.keys) {
+            await decorationApplyTaskQueue.replay(in: group) { [weak self, weak spreadView] in
+                guard let self, let spreadView else { return }
+                let committed = self.decorations[group] ?? []
+                for link in links {
+                    let href = link.url()
+                    guard let items = committed
+                        .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                        .commandItems(styles: self.config.decorationTemplates)
+                    else {
+                        continue
+                    }
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: !(self.decorationCallbacks[group] ?? []).isEmpty
+                    )
+                    if result.outcome != .applied {
+                        self.log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+                    }
                 }
             }
         }
