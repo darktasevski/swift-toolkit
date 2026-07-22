@@ -777,6 +777,16 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         _ locatorJSON: String,
         animated: Bool
     ) async -> LocatorNavigationOutcome {
+        await locatorNavigationTaskQueue.run { [weak self] in
+            guard let self else { return .cancelled }
+            return await self.performLocatorNavigation(locatorJSON, animated: animated)
+        }
+    }
+
+    private func performLocatorNavigation(
+        _ locatorJSON: String,
+        animated: Bool
+    ) async -> LocatorNavigationOutcome {
         guard !Task.isCancelled else {
             return .cancelled
         }
@@ -959,6 +969,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Serializes decoration replacement and cleanup within each group.
     private let decorationApplyTaskQueue = DecorationApplyTaskQueue()
 
+    /// Serializes rapid locator requests with latest-request-wins semantics.
+    private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         config.decorationTemplates.keys.contains(style)
     }
@@ -1073,27 +1086,30 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         decorationCallbacks[group] = callbacks
 
         Task {
-            await initialized()
+            await decorationApplyTaskQueue.replay(in: group) { [weak self] in
+                guard let self else { return }
+                await self.initialized()
 
-            guard let paginationView = paginationView else { return }
-            let cached = decorations[group] ?? []
-            for (_, view) in paginationView.loadedViews {
-                guard let spreadView = view as? EPUBSpreadView else { continue }
-                for index in spreadView.spread.readingOrderIndices {
-                    guard
-                        let href = readingOrder.getOrNil(index)?.url(),
-                        let items = cached
-                        .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
-                        .commandItems(styles: config.decorationTemplates)
-                    else {
-                        continue
+                guard let paginationView = self.paginationView else { return }
+                let committed = self.decorations[group] ?? []
+                for (_, view) in paginationView.loadedViews {
+                    guard let spreadView = view as? EPUBSpreadView else { continue }
+                    for index in spreadView.spread.readingOrderIndices {
+                        guard
+                            let href = self.readingOrder.getOrNil(index)?.url(),
+                            let items = committed
+                            .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                            .commandItems(styles: self.config.decorationTemplates)
+                        else {
+                            continue
+                        }
+                        _ = await spreadView.locatorCommandBridge.replaceDecorations(
+                            items,
+                            in: group,
+                            targetHREF: href,
+                            activable: true
+                        )
                     }
-                    _ = await spreadView.locatorCommandBridge.replaceDecorations(
-                        items,
-                        in: group,
-                        targetHREF: href,
-                        activable: true
-                    )
                 }
             }
         }
@@ -1307,23 +1323,27 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         let links = spreadView.spread.readingOrderIndices
             .compactMap { readingOrder.getOrNil($0) }
 
-        for link in links {
-            let href = link.url()
-            for (group, decorations) in decorations {
-                guard let items = decorations
-                    .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
-                    .commandItems(styles: config.decorationTemplates)
-                else {
-                    continue
-                }
-                let result = await spreadView.locatorCommandBridge.replaceDecorations(
-                    items,
-                    in: group,
-                    targetHREF: href,
-                    activable: !(decorationCallbacks[group] ?? []).isEmpty
-                )
-                if result.outcome != .applied {
-                    log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+        for group in Array(decorations.keys) {
+            await decorationApplyTaskQueue.replay(in: group) { [weak self, weak spreadView] in
+                guard let self, let spreadView else { return }
+                let committed = self.decorations[group] ?? []
+                for link in links {
+                    let href = link.url()
+                    guard let items = committed
+                        .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                        .commandItems(styles: self.config.decorationTemplates)
+                    else {
+                        continue
+                    }
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: !(self.decorationCallbacks[group] ?? []).isEmpty
+                    )
+                    if result.outcome != .applied {
+                        self.log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+                    }
                 }
             }
         }

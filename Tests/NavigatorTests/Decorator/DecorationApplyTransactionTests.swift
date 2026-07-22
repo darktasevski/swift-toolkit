@@ -11,6 +11,110 @@ import XCTest
 
 final class DecorationApplyTransactionTests: XCTestCase {
     @MainActor
+    func testLatestNavigationWaitsForCancelledPredecessorBeforeStarting() async {
+        let firstStarted = AsyncGate()
+        let releaseFirst = AsyncGate()
+        let queue = EPUBLocatorNavigationTaskQueue()
+        var events: [String] = []
+
+        let first = Task { @MainActor in
+            await queue.run {
+                events.append("A-start")
+                await firstStarted.open()
+                await releaseFirst.wait()
+                XCTAssertTrue(Task.isCancelled)
+                events.append("A-end")
+                return .landed
+            }
+        }
+        await firstStarted.wait()
+        let second = Task { @MainActor in
+            await queue.run {
+                XCTAssertFalse(Task.isCancelled)
+                events.append("B")
+                return .landed
+            }
+        }
+        await Task.yield()
+        XCTAssertEqual(events, ["A-start"])
+
+        await releaseFirst.open()
+        let firstOutcome = await first.value
+        let secondOutcome = await second.value
+
+        XCTAssertEqual(firstOutcome, .cancelled)
+        XCTAssertEqual(secondOutcome, .landed)
+        XCTAssertEqual(events, ["A-start", "A-end", "B"])
+    }
+
+    @MainActor
+    func testReplayWaitsForApplyAndReadsCommittedSnapshot() async {
+        let group: DecorationGroup = "epub-highlights"
+        let applyReachedMutation = AsyncGate()
+        let releaseApply = AsyncGate()
+        let queue = DecorationApplyTaskQueue()
+        var committedValue = "A"
+        var replayedValue: String?
+        var applyWasCancelled = false
+
+        queue.submit(in: group) { _ in
+            await applyReachedMutation.open()
+            await releaseApply.wait()
+            applyWasCancelled = Task.isCancelled
+            guard !Task.isCancelled else { return }
+            committedValue = "B"
+        }
+
+        await applyReachedMutation.wait()
+        let replay = Task { @MainActor in
+            await queue.replay(in: group) {
+                replayedValue = committedValue
+            }
+        }
+        await Task.yield()
+        XCTAssertFalse(applyWasCancelled)
+
+        await releaseApply.open()
+        await replay.value
+
+        XCTAssertFalse(applyWasCancelled)
+        XCTAssertEqual(committedValue, "B")
+        XCTAssertEqual(replayedValue, "B")
+    }
+
+    @MainActor
+    func testMultipleReplaysSerializeWithoutSupersedingEachOther() async {
+        let group: DecorationGroup = "epub-highlights"
+        let firstReplayStarted = AsyncGate()
+        let releaseFirstReplay = AsyncGate()
+        let queue = DecorationApplyTaskQueue()
+        var events: [String] = []
+
+        let first = Task { @MainActor in
+            await queue.replay(in: group) {
+                events.append("first-start")
+                await firstReplayStarted.open()
+                await releaseFirstReplay.wait()
+                XCTAssertFalse(Task.isCancelled)
+                events.append("first-end")
+            }
+        }
+        await firstReplayStarted.wait()
+        let second = Task { @MainActor in
+            await queue.replay(in: group) {
+                XCTAssertFalse(Task.isCancelled)
+                events.append("second")
+            }
+        }
+
+        await releaseFirstReplay.open()
+        await first.value
+        await second.value
+
+        XCTAssertEqual(events, ["first-start", "first-end", "second"])
+    }
+
+    @MainActor
     func testSupersededApplyRestoresAttemptedResourcesBeforeSuccessorStarts() async {
         let group: DecorationGroup = "epub-highlights"
         let resources = ["chapter-1", "chapter-2"]

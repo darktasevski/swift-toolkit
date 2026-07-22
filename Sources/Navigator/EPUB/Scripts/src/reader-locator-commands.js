@@ -574,33 +574,51 @@ function resolveLocator(locator) {
   );
 }
 
-function textContentExcludingUnrenderedSubtrees(root) {
+async function boundedTextContentExcludingUnrenderedSubtrees(root, token) {
   if (root.matches("script,style,noscript")) {
-    return "";
+    return { status: "ready", text: "" };
   }
-  if (!root.querySelector("script,style,noscript")) {
-    return root.textContent || "";
-  }
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      for (
-        let element = node.parentElement;
-        element && element !== root;
-        element = element.parentElement
-      ) {
-        const tag = element.tagName;
-        if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
-          return NodeFilter.FILTER_REJECT;
+  const walker = document.createTreeWalker(
+    root,
+    NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+    {
+      acceptNode(node) {
+        if (node.nodeType === Node.ELEMENT_NODE) {
+          const tag = node.tagName;
+          if (tag === "SCRIPT" || tag === "STYLE" || tag === "NOSCRIPT") {
+            return NodeFilter.FILTER_REJECT;
+          }
+          return NodeFilter.FILTER_ACCEPT;
         }
-      }
-      return NodeFilter.FILTER_ACCEPT;
-    },
-  });
+        return NodeFilter.FILTER_ACCEPT;
+      },
+    }
+  );
   const parts = [];
+  let textUnits = 0;
+  let visitedNodes = 0;
   for (let node = walker.nextNode(); node; node = walker.nextNode()) {
-    parts.push(node.nodeValue);
+    visitedNodes += 1;
+    if (visitedNodes > 100_000) {
+      return { status: "tooLarge" };
+    }
+    if (visitedNodes % 2_048 === 0) {
+      await new Promise((resolve) => scheduleTimeout(resolve, 0));
+      if (!isCurrent(token)) {
+        return { status: "stale" };
+      }
+    }
+    if (node.nodeType !== Node.TEXT_NODE) {
+      continue;
+    }
+    const value = node.nodeValue || "";
+    textUnits += value.length;
+    if (textUnits > 1_000_000) {
+      return { status: "tooLarge" };
+    }
+    parts.push(value);
   }
-  return parts.join("");
+  return { status: "ready", text: parts.join("") };
 }
 
 function normalizeDOMText(value) {
@@ -610,7 +628,7 @@ function normalizeDOMText(value) {
     .replace(/[\s\u0085]+/g, " ");
 }
 
-function validateUniqueTextMatch(command, token) {
+async function validateUniqueTextMatch(command, token) {
   requireOnlyKeys(command, VALIDATE_UNIQUE_TEXT_KEYS);
   if (
     command.kind !== "validateUniqueTextMatch" ||
@@ -638,11 +656,17 @@ function validateUniqueTextMatch(command, token) {
   if (!root) {
     return commandResult(token, "miss", "notFound");
   }
-  const rawText = textContentExcludingUnrenderedSubtrees(root);
-  if (rawText.length > 1_000_000) {
+  const extraction = await boundedTextContentExcludingUnrenderedSubtrees(
+    root,
+    token
+  );
+  if (extraction.status === "stale") {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  if (extraction.status !== "ready") {
     return commandResult(token, "miss", "matchRootTooLarge");
   }
-  const text = normalizeDOMText(rawText);
+  const text = normalizeDOMText(extraction.text);
   const quote = normalizeDOMText(highlight);
   if (!quote) {
     return commandResult(token, "miss", "invalidField");
@@ -718,7 +742,18 @@ function validateReplaceDecorations(command, token) {
     if (stringUnits > 2 * 1024 * 1024) {
       reject("payloadTooLarge");
     }
-    return { id, locator, style };
+    return {
+      id,
+      locator,
+      style,
+      fingerprint: JSON.stringify([
+        locatorSource,
+        style.layout,
+        style.width,
+        style.element,
+        style.stylesheet,
+      ]),
+    };
   });
   return { groupID, decorations, activable: command.activable };
 }
@@ -808,12 +843,11 @@ function positionDecorationElement(element, rect, bounds, style) {
   element.style.top = `${source.top + yOffset}px`;
 }
 
-function buildDecorationGroup(value, token) {
+function buildDecorationGroup(value, token, previous) {
   if (!document.body) {
     reject("notFound");
   }
   const container = document.createElement("div");
-  container.dataset.readerDecorationGroup = value.groupID;
   container.style.pointerEvents = "none";
 
   const stylesheets = new Set(
@@ -828,11 +862,18 @@ function buildDecorationGroup(value, token) {
   }
 
   const items = [];
+  const previousItems = new Map(
+    (previous?.items ?? []).map((item) => [item.id, item])
+  );
   for (const decoration of value.decorations) {
     if (!isCurrent(token)) {
       return { status: "stale" };
     }
-    const range = resolveLocator(decoration.locator);
+    const previousItem = previousItems.get(decoration.id);
+    const range =
+      previousItem?.fingerprint === decoration.fingerprint
+        ? previousItem.range
+        : resolveLocator(decoration.locator);
     if (!range) {
       return { status: "notFound" };
     }
@@ -856,7 +897,6 @@ function buildDecorationGroup(value, token) {
     }
 
     const itemContainer = document.createElement("div");
-    itemContainer.dataset.readerDecorationID = decoration.id;
     itemContainer.style.pointerEvents = "none";
     const clickableElements = [];
     for (const rect of rects) {
@@ -866,7 +906,12 @@ function buildDecorationGroup(value, token) {
       clickableElements.push(element);
     }
     container.append(itemContainer);
-    items.push({ id: decoration.id, range, clickableElements });
+    items.push({
+      id: decoration.id,
+      fingerprint: decoration.fingerprint,
+      range,
+      clickableElements,
+    });
   }
   return { status: "ready", container, items };
 }
@@ -1032,7 +1077,8 @@ async function replaceDecorationGroup(command, token) {
     return commandResult(token, "cancelled", "staleToken");
   }
 
-  const built = buildDecorationGroup(value, token);
+  const previous = decorationGroups.get(value.groupID);
+  const built = buildDecorationGroup(value, token, previous);
   if (built.status === "stale") {
     return commandResult(token, "cancelled", "staleToken");
   }
@@ -1051,7 +1097,6 @@ async function replaceDecorationGroup(command, token) {
     return commandResult(token, "cancelled", "staleToken");
   }
 
-  const previous = decorationGroups.get(value.groupID);
   previous?.container?.remove();
   document.body.append(built.container);
   const state = {
@@ -1095,7 +1140,7 @@ async function execute(commandValue, tokenValue) {
       case "replaceDecorationGroup":
         return await replaceDecorationGroup(commandValue, token);
       case "validateUniqueTextMatch":
-        return validateUniqueTextMatch(commandValue, token);
+        return await validateUniqueTextMatch(commandValue, token);
       default:
         reject("invalidCommand");
     }
@@ -1132,7 +1177,7 @@ function decorationAtPoint(x, y) {
 document.addEventListener(
   "click",
   (event) => {
-    if (!globalThis.getSelection()?.isCollapsed) {
+    if (!event.isTrusted || !globalThis.getSelection()?.isCollapsed) {
       return;
     }
     const target = decorationAtPoint(event.clientX, event.clientY);
@@ -1144,6 +1189,7 @@ document.addEventListener(
         {
           id: target.item.id,
           group: target.groupID,
+          token: decorationGroups.get(target.groupID)?.token,
           rect: {
             left: target.rect.left,
             top: target.rect.top,

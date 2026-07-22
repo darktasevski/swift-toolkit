@@ -22,8 +22,31 @@ final class DecorationApplyTaskQueue {
     private var entries: [DecorationGroup: Entry] = [:]
 
     func submit(in group: DecorationGroup, operation: @escaping Operation) {
+        enqueue(in: group, cancelsPredecessor: true, operation: operation)
+    }
+
+    /// Replays the latest committed group snapshot after any active mutation.
+    ///
+    /// Lifecycle and callback replays must not supersede a user-requested
+    /// mutation. The operation is created immediately but reads navigator state
+    /// only after its predecessor completes.
+    func replay(in group: DecorationGroup, operation: @escaping @MainActor () async -> Void) async {
+        let task = enqueue(in: group, cancelsPredecessor: false) { _ in
+            await operation()
+        }
+        await task.value
+    }
+
+    @discardableResult
+    private func enqueue(
+        in group: DecorationGroup,
+        cancelsPredecessor: Bool,
+        operation: @escaping Operation
+    ) -> Task<Void, Never> {
         let predecessor = entries[group]?.task
-        predecessor?.cancel()
+        if cancelsPredecessor {
+            predecessor?.cancel()
+        }
 
         let id = UUID()
         let task = Task { @MainActor [weak self] in
@@ -40,6 +63,7 @@ final class DecorationApplyTaskQueue {
             self?.removeEntry(with: id, in: group)
         }
         entries[group] = Entry(id: id, task: task)
+        return task
     }
 
     func waitForIdle(in group: DecorationGroup) async {
