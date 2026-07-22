@@ -451,7 +451,6 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called by the javascript code when the spread contents is fully loaded.
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
-        spreadLoadTask?.cancel()
         let generation = readiness.generation
         guard let rootLease = readiness.beginInitialization(
             for: generation,
@@ -459,16 +458,22 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         ) else {
             return
         }
+        spreadLoadTask?.cancel()
 
         spreadLoadTask = Task { @MainActor [weak self] in
             guard let self else { return }
             applySettings()
-            await spreadDidLoad()
-            readiness.release(rootLease)
+            let outcome = await initializeSpread()
+            readiness.finishInitialization(
+                rootLease,
+                outcome: Task.isCancelled ? .failed : outcome
+            )
 
             guard
                 !Task.isCancelled,
-                case .ready(generation, _) = readiness.state
+                case .ready(generation, _) = await readiness.waitForCommandReadiness(
+                    for: generation
+                )
             else {
                 return
             }
@@ -485,7 +490,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     /// To be overriden to customize the behavior after the spread is loaded.
-    func spreadDidLoad() async {}
+    func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
+        .succeeded
+    }
 
     func showSpread() {
         activityIndicatorView?.stopAnimating()

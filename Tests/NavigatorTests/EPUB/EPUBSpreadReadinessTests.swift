@@ -216,4 +216,104 @@ final class EPUBSpreadReadinessTests: XCTestCase {
             .ready(generation: mutation.generation, frameCapability: capability)
         )
     }
+
+    func testFailedInitializationNeverPublishesCommandReadiness() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let rootLease = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+        let waiter = Task { @MainActor in
+            await readiness.waitForCommandReadiness(for: generation)
+        }
+        await Task.yield()
+
+        readiness.finishInitialization(rootLease, outcome: .failed)
+
+        XCTAssertFalse(readiness.isCommandReady)
+        let outcome = await waiter.value
+        XCTAssertEqual(outcome, .invalidated)
+    }
+
+    func testLatestMutationReplaysAnUpdateThatArrivesDuringInitialWrite() async {
+        let mutation = EPUBLatestMutation(initialValue: 1)
+        var writes: [Int] = []
+        var releaseFirstWrite: CheckedContinuation<Void, Never>?
+
+        let application = Task { @MainActor in
+            await mutation.applyLatest { value in
+                writes.append(value)
+                if value == 1 {
+                    await withCheckedContinuation { continuation in
+                        releaseFirstWrite = continuation
+                    }
+                }
+                return true
+            }
+        }
+        await waitUntil { releaseFirstWrite != nil }
+
+        mutation.update(2)
+        releaseFirstWrite?.resume()
+
+        let succeeded = await application.value
+        XCTAssertTrue(succeeded)
+        XCTAssertEqual(writes, [1, 2])
+        XCTAssertEqual(mutation.latestValue, 2)
+    }
+
+    func testInitializationLayoutLeaseGatesReadinessAndAppliesLatestViewport() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let layouts = EPUBLatestMutation(initialValue: 320)
+        layouts.update(640)
+        let rootLease = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+        let layoutLease = try XCTUnwrap(readiness.acquireWriterLease(for: generation))
+        var appliedWidths: [Int] = []
+        var releaseStability: CheckedContinuation<Void, Never>?
+
+        let layout = Task { @MainActor in
+            await layouts.applyLatest { width in
+                appliedWidths.append(width)
+                if width == 640 {
+                    await withCheckedContinuation { continuation in
+                        releaseStability = continuation
+                    }
+                }
+                return true
+            }
+        }
+        await waitUntil { releaseStability != nil }
+        readiness.finishInitialization(rootLease, outcome: .succeeded)
+
+        XCTAssertEqual(
+            readiness.state,
+            .initializing(generation: generation, activeWriterLeases: 1)
+        )
+        layouts.update(768)
+        releaseStability?.resume()
+        let layoutSucceeded = await layout.value
+        XCTAssertTrue(layoutSucceeded)
+        readiness.release(layoutLease)
+
+        XCTAssertEqual(appliedWidths, [640, 768])
+        XCTAssertTrue(readiness.isCommandReady)
+    }
+
+    private func waitUntil(
+        _ predicate: @MainActor () -> Bool,
+        iterations: Int = 100
+    ) async {
+        for _ in 0 ..< iterations {
+            if predicate() {
+                return
+            }
+            await Task.yield()
+        }
+        XCTFail("Condition did not become true")
+    }
 }

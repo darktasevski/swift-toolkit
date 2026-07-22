@@ -137,6 +137,108 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertNil(outcome)
     }
 
+    func testCrossResourceGoWaitsForTargetCommandButNotNeighborPreloading() async {
+        let initial = TestPageView()
+        let target = TestPageView(blocksGo: true)
+        let neighbor = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [0: initial])
+        let pagination = makePaginationView()
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 3, readingProgression: .ltr)
+
+        await waitUntil { initial.goCallCount == 1 }
+        await waitUntil { delegate.requestedIndices.contains(1) }
+        delegate.pages[1] = target
+        delegate.pages[2] = neighbor
+
+        var result: Bool?
+        let navigation = Task { @MainActor in
+            let success = await pagination.goToIndex(
+                1,
+                location: .start,
+                options: NavigatorGoOptions(animated: false)
+            )
+            result = success
+            return success
+        }
+
+        await waitUntil { target.goCallCount == 1 }
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertNil(result)
+
+        target.finishGo()
+        await waitUntil { neighbor.goCallCount == 1 }
+        await waitUntil { result != nil }
+
+        XCTAssertEqual(result, true)
+        neighbor.finishGo()
+        let success = await navigation.value
+        XCTAssertTrue(success)
+    }
+
+    func testSameIndexGoCancelsAndAcknowledgesInitialCommandBeforeReplacingIt() async {
+        let page = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [0: page])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 1, readingProgression: .ltr)
+        await waitUntil { page.goCallCount == 1 }
+
+        var result: Bool?
+        let replacement = Task { @MainActor in
+            let success = await pagination.goToIndex(
+                0,
+                location: .end,
+                options: NavigatorGoOptions(animated: false)
+            )
+            result = success
+            return success
+        }
+        await waitUntil { page.cancellationObserved }
+
+        XCTAssertTrue(page.cancellationObserved)
+        XCTAssertEqual(page.goCallCount, 1)
+        XCTAssertEqual(page.maximumConcurrentGoCount, 1)
+        XCTAssertNil(result)
+
+        page.finishGo()
+        await waitUntil { page.goCallCount == 2 }
+        XCTAssertEqual(page.maximumConcurrentGoCount, 1)
+        XCTAssertNil(result)
+
+        page.finishGo()
+        let success = await replacement.value
+        XCTAssertTrue(success)
+        XCTAssertEqual(result, true)
+    }
+
+    func testMissingPageFactoryIsTerminalForExactCurrentPageWaiter() async {
+        let delegate = TestPaginationDelegate(pages: [:])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 1, readingProgression: .ltr)
+
+        var waiterFinished = false
+        var outcome: (UIView & PageView)?
+        let waiter = Task { @MainActor in
+            let page = await pagination.waitForCurrentPage(at: 0)
+            waiterFinished = true
+            outcome = page
+            return page
+        }
+        await waitUntil { delegate.requestedIndices == [0] }
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+
+        XCTAssertTrue(waiterFinished)
+        XCTAssertNil(outcome)
+        waiter.cancel()
+        _ = await waiter.value
+    }
+
     private func makePaginationView(preloadPositionCount: Int = 1) -> PaginationView {
         PaginationView(
             frame: CGRect(x: 0, y: 0, width: 320, height: 480),
@@ -166,7 +268,7 @@ private final class TestPaginationDelegate: PaginationViewDelegate {
     private(set) var requestedIndices: [Int] = []
     private(set) var updateCount = 0
 
-    private let pages: [Int: TestPageView]
+    var pages: [Int: TestPageView]
 
     init(pages: [Int: TestPageView]) {
         self.pages = pages
@@ -196,10 +298,16 @@ private final class TestPaginationDelegate: PaginationViewDelegate {
 @MainActor
 private final class TestPageView: UIView, PageView {
     private let blocksGo: Bool
-    private var goContinuation: CheckedContinuation<Void, Never>?
+    private var goContinuations: [CheckedContinuation<Void, Never>] = []
 
-    private(set) var goStarted = false
+    private(set) var goCallCount = 0
+    private(set) var activeGoCount = 0
+    private(set) var maximumConcurrentGoCount = 0
     private(set) var cancellationObserved = false
+
+    var goStarted: Bool {
+        goCallCount > 0
+    }
 
     init(blocksGo: Bool = false) {
         self.blocksGo = blocksGo
@@ -212,12 +320,15 @@ private final class TestPageView: UIView, PageView {
     }
 
     func go(to location: PageLocation, animated: Bool) async {
-        goStarted = true
+        goCallCount += 1
+        activeGoCount += 1
+        maximumConcurrentGoCount = max(maximumConcurrentGoCount, activeGoCount)
+        defer { activeGoCount -= 1 }
         guard blocksGo else { return }
 
         await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
-                goContinuation = continuation
+                goContinuations.append(continuation)
             }
         } onCancel: {
             Task { @MainActor [weak self] in
@@ -227,8 +338,7 @@ private final class TestPageView: UIView, PageView {
     }
 
     func finishGo() {
-        let continuation = goContinuation
-        goContinuation = nil
-        continuation?.resume()
+        guard !goContinuations.isEmpty else { return }
+        goContinuations.removeFirst().resume()
     }
 }

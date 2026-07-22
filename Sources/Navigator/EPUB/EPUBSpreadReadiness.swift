@@ -6,6 +6,40 @@
 
 import Foundation
 
+/// Replays the newest value when it changes while an asynchronous mutation is
+/// in flight. The caller remains responsible for serializing separate
+/// `applyLatest` invocations.
+@MainActor
+final class EPUBLatestMutation<Value> {
+    private(set) var latestValue: Value
+    private var revision: UInt64 = 0
+
+    init(initialValue: Value) {
+        latestValue = initialValue
+    }
+
+    func update(_ value: Value) {
+        latestValue = value
+        revision &+= 1
+    }
+
+    func applyLatest(
+        _ operation: @MainActor (Value) async -> Bool
+    ) async -> Bool {
+        while !Task.isCancelled {
+            let appliedRevision = revision
+            let value = latestValue
+            guard await operation(value), !Task.isCancelled else {
+                return false
+            }
+            if appliedRevision == revision {
+                return true
+            }
+        }
+        return false
+    }
+}
+
 /// Opaque identity for the frame document accepted by a spread generation.
 struct EPUBSpreadFrameCapability: Equatable, Hashable, Sendable {
     let id: UUID
@@ -53,6 +87,11 @@ final class EPUBSpreadReadiness {
         case invalidated
         case cancelled
         case timedOut
+    }
+
+    enum InitializationOutcome: Equatable, Sendable {
+        case succeeded
+        case failed
     }
 
     private enum WaitTarget {
@@ -200,6 +239,27 @@ final class EPUBSpreadReadiness {
                 generation: lease.generation,
                 activeWriterLeases: activeWriterLeaseIDs.count
             )
+        }
+    }
+
+    /// Finishes the root initialization write. Failure invalidates the exact
+    /// active generation instead of releasing it into a ready state.
+    func finishInitialization(
+        _ lease: WriterLease,
+        outcome: InitializationOutcome
+    ) {
+        guard
+            case .initializing(lease.generation, _) = state,
+            activeWriterLeaseIDs.contains(lease.id)
+        else {
+            return
+        }
+
+        switch outcome {
+        case .succeeded:
+            release(lease)
+        case .failed:
+            invalidate()
         }
     }
 

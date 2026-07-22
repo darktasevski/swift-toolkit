@@ -10,6 +10,83 @@ import ReadiumShared
 import UIKit
 import WebKit
 
+/// Owns the single continuation waiting for a smooth scroll to settle.
+/// Requests are removed from the coordinator before they are resumed.
+@MainActor
+final class EPUBScrollAnimationCoordinator {
+    final class Request {
+        fileprivate let id: UUID
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        fileprivate init(
+            id: UUID,
+            continuation: CheckedContinuation<Void, Never>
+        ) {
+            self.id = id
+            self.continuation = continuation
+        }
+
+        func resume() {
+            let continuation = continuation
+            self.continuation = nil
+            continuation?.resume()
+        }
+    }
+
+    private var pendingRequest: Request?
+
+    var hasPendingRequest: Bool {
+        pendingRequest != nil
+    }
+
+    func waitUntilSettled() async {
+        let requestID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                    return
+                }
+
+                let request = Request(id: requestID, continuation: continuation)
+                let previous = takePendingRequest()
+                previous?.resume()
+                pendingRequest = request
+
+                Task { @MainActor [weak self, weak request] in
+                    try? await Task.sleep(seconds: 0.8)
+                    guard let self, let request else { return }
+                    finish(request)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    let request = self.pendingRequest,
+                    request.id == requestID
+                else {
+                    return
+                }
+                self.takePendingRequest(matching: request)?.resume()
+            }
+        }
+    }
+
+    func takePendingRequest(matching request: Request? = nil) -> Request? {
+        guard request == nil || pendingRequest === request else {
+            return nil
+        }
+        let pendingRequest = pendingRequest
+        self.pendingRequest = nil
+        return pendingRequest
+    }
+
+    func finish(_ request: Request? = nil) {
+        takePendingRequest(matching: request)?.resume()
+    }
+}
+
 /// A view rendering a spread of resources with a reflowable layout.
 final class EPUBReflowableSpreadView: EPUBSpreadView {
     private struct ContentInsetConfiguration: Equatable {
@@ -21,6 +98,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var bottomConstraint: NSLayoutConstraint!
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
+    private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -44,7 +122,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         settingsLayoutTask?.cancel()
         settingsLayoutTask = nil
         super.clear()
-        scrollDidEnd()
+        scrollAnimationCoordinator.finish()
     }
 
     override func setupWebView() {
@@ -169,19 +247,15 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return progression
     }
 
-    override func spreadDidLoad() async {
+    override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
-            await evaluateDocumentScript("readium.link = \(linkJSON);")
+            guard case .success = await evaluateDocumentScript("readium.link = \(linkJSON);") else {
+                return .failed
+            }
         }
 
-        guard await waitForLayoutStability() else { return }
-
-        let location = pendingLocation
-        await go(to: location.location, animated: location.animated)
-        if Task.isCancelled { return }
-
-        guard await waitForLayoutStability() else { return }
+        guard await waitForLayoutStability() else { return .failed }
 
         // Anchor-tracking init: pull the per-resource anchor list from the
         // view model and call into the JS module. Even on oversized/invalid
@@ -210,13 +284,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             )
         } catch is CancellationError {
             // Spread teardown — not a failure.
-            return
+            return .failed
         } catch {
             // type+domain+code only — never bare \(error). WKErrorDomain.userInfo
             // can echo script source + arguments.
             let ns = error as NSError
             log(.warning, "anchor tracking init failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
         }
+
+        // Positioning is the final suspending initialization stage so a
+        // locator received during stylesheet/font or anchor setup cannot be
+        // skipped by an older pending value.
+        guard await pendingLocationMutation.applyLatest({ [weak self] location in
+            guard let self else { return false }
+            guard await self.apply(location) else { return false }
+            return await self.waitForLayoutStability()
+        }) else {
+            return .failed
+        }
+        return .succeeded
     }
 
     /// Waits for fonts and a bounded run of stable animation frames. The
@@ -319,35 +405,29 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
         if options.animated {
             // Waits for the scroll animation to finish.
-            await withCheckedContinuation { continuation in
-                let request = ScrollAnimationRequest(continuation)
-                pendingScrollAnimation?.resume()
-                pendingScrollAnimation = request
-
-                // Safety net in case `scrollDidEnd` never fires. The identity
-                // check on `request` ensures a stale timeout from a previous
-                // request does not resume a newer one.
-                Task { @MainActor in
-                    try? await Task.sleep(seconds: 0.8)
-                    scrollDidEnd(for: request)
-                }
-            }
+            await scrollAnimationCoordinator.waitUntilSettled()
         }
 
         return true
     }
 
     private struct PendingLocation {
-        var location: PageLocation
-        var animated: Bool
+        let location: PageLocation
+        let animated: Bool
     }
 
     /// Location to scroll to in the resource once the page is loaded.
-    private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
+    private let pendingLocationMutation = EPUBLatestMutation(
+        initialValue: PendingLocation(location: .start, animated: false)
+    )
 
     override func go(to location: PageLocation, animated: Bool) async {
-        guard readiness.isDocumentAvailable else {
-            pendingLocation = PendingLocation(location: location, animated: animated)
+        pendingLocationMutation.update(PendingLocation(
+            location: location,
+            animated: animated
+        ))
+
+        guard readiness.isCommandReady else {
             let generation = readiness.generation
             _ = await readiness.waitForCommandReadiness(for: generation)
             return
@@ -356,44 +436,30 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard let writerLease = readiness.acquirePositionWriter() else {
             return
         }
-        defer { readiness.release(writerLease) }
+        let succeeded = await pendingLocationMutation.applyLatest { [weak self] location in
+            guard let self else { return false }
+            guard await self.apply(location) else { return false }
+            return await self.waitForLayoutStability()
+        }
+        readiness.finishInitialization(
+            writerLease,
+            outcome: succeeded ? .succeeded : .failed
+        )
+    }
 
-        switch location {
+    private func apply(_ location: PendingLocation) async -> Bool {
+        switch location.location {
         case let .locator(locator):
-            await go(to: locator, animated: animated)
+            return await go(to: locator, animated: location.animated)
         case .start:
-            await scroll(toProgression: 0, animated: animated)
+            return await scroll(toProgression: 0, animated: location.animated)
         case .end:
-            await scroll(toProgression: 1, animated: animated)
-        }
-
-    }
-
-    private var pendingScrollAnimation: ScrollAnimationRequest?
-
-    /// Represents an in-flight animated page turn, waiting for the scroll
-    /// animation to settle before completing.
-    private class ScrollAnimationRequest {
-        private var continuation: CheckedContinuation<Void, Never>?
-
-        init(_ continuation: CheckedContinuation<Void, Never>) {
-            self.continuation = continuation
-        }
-
-        /// Resumes the continuation. Safe to call multiple times; only the
-        /// first call has any effect.
-        func resume() {
-            continuation?.resume()
-            continuation = nil
+            return await scroll(toProgression: 1, animated: location.animated)
         }
     }
 
-    private func scrollDidEnd(for request: ScrollAnimationRequest? = nil) {
-        guard request == nil || pendingScrollAnimation === request else {
-            return
-        }
-        pendingScrollAnimation?.resume()
-        pendingScrollAnimation = nil
+    private func scrollDidEnd() {
+        scrollAnimationCoordinator.finish()
     }
 
     @discardableResult
@@ -439,7 +505,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            await evaluateDocumentScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
+            let result = await evaluateDocumentScript(
+                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))"
+            )
+            guard case .success = result else { return false }
             return true
         }
     }

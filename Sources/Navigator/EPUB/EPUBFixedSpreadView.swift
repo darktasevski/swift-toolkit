@@ -21,7 +21,9 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
     private var isWrapperLoaded = false
     /// URL to load in the iframe once the wrapper page is loaded.
     private var urlToLoad: URL?
-    private var lastLayoutConfiguration: LayoutConfiguration?
+    private var layoutMutation: EPUBLatestMutation<LayoutConfiguration>?
+    private var layoutTask: Task<Void, Never>?
+    private var bootstrapTask: Task<Void, Never>?
 
     private static let fixedScript = loadScript(named: "readium-fixed")
 
@@ -69,6 +71,14 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         }
     }
 
+    override func clear() {
+        bootstrapTask?.cancel()
+        bootstrapTask = nil
+        layoutTask?.cancel()
+        layoutTask = nil
+        super.clear()
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         layoutSpread()
@@ -101,23 +111,153 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             insets: insets,
             fit: fitString
         )
-        guard configuration != lastLayoutConfiguration else {
+        guard configuration != layoutMutation?.latestValue else {
             return
         }
-        lastLayoutConfiguration = configuration
-
-        let writerLease = readiness.acquirePositionWriter()
-
-        webView.evaluateJavaScript("""
-            spread.setViewport(
-                {'width': \(Int(viewportSize.width)), 'height': \(Int(viewportSize.height))},
-                {'top': \(Int(insets.top)), 'left': \(Int(insets.left)), 'bottom': \(Int(insets.bottom)), 'right': \(Int(insets.right))},
-                '\(fitString)'
-            );
-        """) { [weak self] _, _ in
-            guard let self, let writerLease else { return }
-            self.readiness.release(writerLease)
+        if let layoutMutation {
+            layoutMutation.update(configuration)
+        } else {
+            layoutMutation = EPUBLatestMutation(initialValue: configuration)
         }
+
+        guard readiness.isCommandReady else {
+            return
+        }
+
+        guard let writerLease = readiness.acquirePositionWriter() else {
+            return
+        }
+        let predecessor = layoutTask
+        predecessor?.cancel()
+        layoutTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+            let succeeded: Bool
+            if Task.isCancelled {
+                succeeded = false
+            } else {
+                succeeded = await self.applyLatestLayout()
+            }
+            self.readiness.finishInitialization(
+                writerLease,
+                outcome: succeeded ? .succeeded : .failed
+            )
+        }
+    }
+
+    private func viewportScript(for configuration: LayoutConfiguration) -> String {
+        """
+        spread.setViewport(
+            {'width': \(Int(configuration.viewportSize.width)), 'height': \(Int(configuration.viewportSize.height))},
+            {'top': \(Int(configuration.insets.top)), 'left': \(Int(configuration.insets.left)), 'bottom': \(Int(configuration.insets.bottom)), 'right': \(Int(configuration.insets.right))},
+            '\(configuration.fit)'
+        );
+        """
+    }
+
+    private func applyLatestLayout() async -> Bool {
+        guard let layoutMutation else { return false }
+        return await layoutMutation.applyLatest { [weak self] configuration in
+            guard let self else { return false }
+            guard await self.evaluateViewport(configuration) else { return false }
+            return await self.waitForFixedLayoutStability()
+        }
+    }
+
+    private func evaluateViewport(_ configuration: LayoutConfiguration) async -> Bool {
+        await withCheckedContinuation { continuation in
+            webView.evaluateJavaScript(viewportScript(for: configuration)) { [weak self] _, error in
+                if let error {
+                    let ns = error as NSError
+                    self?.log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+                    continuation.resume(returning: false)
+                } else {
+                    continuation.resume(returning: true)
+                }
+            }
+        }
+    }
+
+    private func waitForFixedLayoutStability() async -> Bool {
+        let generation = readiness.generation
+        guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
+            return false
+        }
+
+        do {
+            let result = try await webView.callAsyncJavaScript(
+                """
+                const frames = Array.from(document.querySelectorAll('iframe'));
+                if (frames.length === 0) {
+                    return false;
+                }
+                for (const frame of frames) {
+                    const child = frame.contentDocument;
+                    if (!child) {
+                        return false;
+                    }
+                    const links = Array.from(child.querySelectorAll('link[rel~="stylesheet"]'));
+                    if (links.some(link => link.sheet === null)) {
+                        return false;
+                    }
+                    if (child.fonts) {
+                        await child.fonts.ready;
+                    }
+                }
+
+                var previous = null;
+                var stableFrames = 0;
+                for (let frameIndex = 0; frameIndex < 12 && stableFrames < 2; frameIndex += 1) {
+                    await new Promise(resolve => requestAnimationFrame(resolve));
+                    const current = frames.flatMap(frame => {
+                        const child = frame.contentDocument;
+                        const rect = frame.getBoundingClientRect();
+                        return [
+                            rect.width,
+                            rect.height,
+                            child.documentElement.scrollWidth,
+                            child.documentElement.scrollHeight,
+                            child.body?.scrollWidth ?? 0,
+                            child.body?.scrollHeight ?? 0,
+                        ];
+                    });
+                    if (previous !== null && current.every((value, index) => value === previous[index])) {
+                        stableFrames += 1;
+                    } else {
+                        stableFrames = 0;
+                    }
+                    previous = current;
+                }
+                return stableFrames >= 2;
+                """,
+                arguments: [:],
+                in: nil,
+                contentWorld: .page
+            )
+            return
+                !Task.isCancelled &&
+                generation == readiness.generation &&
+                result as? Bool == true
+        } catch is CancellationError {
+            return false
+        } catch {
+            let ns = error as NSError
+            log(.warning, "Fixed layout stability failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            return false
+        }
+    }
+
+    override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
+        let generation = readiness.generation
+        guard let layoutLease = readiness.acquireWriterLease(for: generation) else {
+            return .failed
+        }
+        let succeeded = await applyLatestLayout()
+        readiness.finishInitialization(
+            layoutLease,
+            outcome: succeeded ? .succeeded : .failed
+        )
+        return succeeded ? .succeeded : .failed
     }
 
     override func loadSpread() {
@@ -162,7 +302,19 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         if !isWrapperLoaded {
             isWrapperLoaded = true
             layoutSpread()
-            loadSpread()
+            bootstrapTask?.cancel()
+            bootstrapTask = Task { @MainActor [weak self] in
+                guard let self, let layoutMutation else { return }
+                let succeeded = await layoutMutation.applyLatest { [weak self] configuration in
+                    guard let self else { return false }
+                    return await self.evaluateViewport(configuration)
+                }
+                guard succeeded, !Task.isCancelled else {
+                    self.readiness.invalidate()
+                    return
+                }
+                self.loadSpread()
+            }
         }
     }
 
