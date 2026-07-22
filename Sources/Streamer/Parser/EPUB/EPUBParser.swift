@@ -57,6 +57,10 @@ public final class EPUBParser: PublicationParser {
                 container: asset.container,
                 encryptions: encryptions
             ).parseManifest()
+            let manifest = await resolvingServedMediaTypes(
+                in: parserResult.manifest,
+                container: container
+            )
 
             // For Adobe font deobfuscation, prefer the UUID-based identifier if available,
             // otherwise fall back to the main publication identifier.
@@ -67,7 +71,7 @@ public final class EPUBParser: PublicationParser {
             let deobfuscator = EPUBDeobfuscator(publicationId: deobfuscationId, encryptions: encryptions)
 
             return .success(Publication.Builder(
-                manifest: parserResult.manifest,
+                manifest: manifest,
                 container: container.map { url, resource in
                     deobfuscator.deobfuscate(resource: resource, at: url)
                 },
@@ -85,5 +89,45 @@ public final class EPUBParser: PublicationParser {
         } catch {
             return .failure(.reading(.wrap(error) ?? .decoding(error)))
         }
+    }
+
+    private func resolvingServedMediaTypes(
+        in parsedManifest: Manifest,
+        container: Container
+    ) async -> Manifest {
+        var manifest = parsedManifest
+        let formatSniffer = DefaultFormatSniffer()
+
+        func resolved(_ link: Link) async -> Link {
+            let href = link.url()
+            guard let resource = container[href] else {
+                return link
+            }
+            let resolution = await EPUBServedResourcePolicy.resolve(
+                manifestMediaType: link.mediaType,
+                resource: resource,
+                at: href,
+                formatSniffer: formatSniffer
+            )
+            var link = link
+            link.mediaType = resolution.mediaType
+            return link
+        }
+
+        var readingOrder: [Link] = []
+        readingOrder.reserveCapacity(manifest.readingOrder.count)
+        for link in manifest.readingOrder {
+            await readingOrder.append(resolved(link))
+        }
+        manifest.readingOrder = readingOrder
+
+        var resources: [Link] = []
+        resources.reserveCapacity(manifest.resources.count)
+        for link in manifest.resources {
+            await resources.append(resolved(link))
+        }
+        manifest.resources = resources
+
+        return manifest
     }
 }
