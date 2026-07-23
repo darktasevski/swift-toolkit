@@ -75,7 +75,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         switch outcome {
         case .ready:
             return .landed
-        case .documentAvailable, .timedOut:
+        case .documentAvailable, .timedOut, .failed:
             return .miss
         case .invalidated, .cancelled:
             return .cancelled

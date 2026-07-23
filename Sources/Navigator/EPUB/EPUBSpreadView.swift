@@ -241,7 +241,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let navigation,
             provisionalNavigation == nil || provisionalNavigation === navigation
         else {
-            if readiness.invalidate(ifCurrent: generation) {
+            if readiness.fail(ifCurrent: generation) {
                 locatorCommandBridge.invalidateDocument()
             }
             return navigation
@@ -860,7 +860,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
         guard let generation = currentMainFrameGeneration(for: navigation) else {
             return
         }
-        if readiness.invalidate(ifCurrent: generation) {
+        if readiness.fail(ifCurrent: generation) {
             locatorCommandBridge.invalidateDocument()
         }
         let ns = error as NSError
@@ -875,7 +875,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
         guard let generation = currentMainFrameGeneration(for: navigation) else {
             return
         }
-        if readiness.invalidate(ifCurrent: generation) {
+        if readiness.fail(ifCurrent: generation) {
             locatorCommandBridge.invalidateDocument()
         }
         let ns = error as NSError

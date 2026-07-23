@@ -371,7 +371,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             else {
                 if !Task.isCancelled,
                    self.wrapperBootstrapGeneration == generation,
-                   self.readiness.invalidate(ifCurrent: generation)
+                   self.readiness.fail(ifCurrent: generation)
                 {
                     self.locatorCommandBridge.invalidateDocument()
                 }
@@ -395,7 +395,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             return .succeeded
         case .cancelled:
             return .cancelled
-        case .documentAvailable, .invalidated, .timedOut:
+        case .documentAvailable, .invalidated, .timedOut, .failed:
             return .failed
         }
     }

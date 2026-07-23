@@ -435,7 +435,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 guard !Task.isCancelled else { return .cancelled }
             case .cancelled:
                 return .cancelled
-            case .documentAvailable, .invalidated, .timedOut:
+            case .documentAvailable, .invalidated, .timedOut, .failed:
                 return .failed
             }
         }
@@ -519,7 +519,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 return Task.isCancelled ? .cancelled : .succeeded
             case .cancelled:
                 return .cancelled
-            case .documentAvailable, .invalidated, .timedOut:
+            case .documentAvailable, .invalidated, .timedOut, .failed:
                 return .failed
             }
         }

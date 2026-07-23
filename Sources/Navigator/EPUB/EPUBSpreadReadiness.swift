@@ -97,13 +97,15 @@ final class EPUBSpreadReadiness {
         case loading(generation: Generation)
         case initializing(generation: Generation, activeWriterLeases: Int)
         case ready(generation: Generation, frameCapability: EPUBSpreadFrameCapability)
+        case failed(generation: Generation)
 
         var generation: Generation {
             switch self {
             case let .unavailable(generation),
                  let .loading(generation),
                  let .initializing(generation, _),
-                 let .ready(generation, _):
+                 let .ready(generation, _),
+                 let .failed(generation):
                 return generation
             }
         }
@@ -120,6 +122,7 @@ final class EPUBSpreadReadiness {
         case invalidated
         case cancelled
         case timedOut
+        case failed(generation: Generation)
     }
 
     enum InitializationOutcome: Equatable, Sendable {
@@ -158,7 +161,7 @@ final class EPUBSpreadReadiness {
         switch state {
         case .initializing, .ready:
             return true
-        case .unavailable, .loading:
+        case .unavailable, .loading, .failed:
             return false
         }
     }
@@ -247,7 +250,7 @@ final class EPUBSpreadReadiness {
             return acquireWriterLease(for: generation)
         case .ready:
             return beginMutation()
-        case .unavailable, .loading:
+        case .unavailable, .loading, .failed:
             return nil
         }
     }
@@ -298,7 +301,7 @@ final class EPUBSpreadReadiness {
         case .succeeded:
             release(lease)
         case .failed:
-            invalidate()
+            fail(ifCurrent: lease.generation)
         }
     }
 
@@ -320,8 +323,23 @@ final class EPUBSpreadReadiness {
         case .succeeded, .superseded:
             release(lease)
         case .failed:
-            invalidate()
+            fail(ifCurrent: lease.generation)
         }
+    }
+
+    /// Marks a generation as terminally failed without changing its identity.
+    /// A later load advances normally, while callbacks from older generations
+    /// remain unable to affect the replacement lifecycle.
+    @discardableResult
+    func fail(ifCurrent generation: Generation) -> Bool {
+        guard state.generation == generation else {
+            return false
+        }
+        activeWriterLeaseIDs.removeAll()
+        initializingFrameCapability = nil
+        state = .failed(generation: generation)
+        drainWaiters(with: .failed(generation: generation))
+        return true
     }
 
     /// Invalidates the current document and terminates every registered wait.
@@ -431,6 +449,8 @@ final class EPUBSpreadReadiness {
             )
         case (_, .unavailable):
             return .invalidated
+        case let (_, .failed(generation)):
+            return .failed(generation: generation)
         case (_, .loading), (.commandReadiness, .initializing):
             return nil
         }

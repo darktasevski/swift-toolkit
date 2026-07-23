@@ -138,6 +138,15 @@ final class EPUBSpreadReadinessTests: XCTestCase {
 
         let outcome = await waiter.value
         XCTAssertEqual(outcome, .invalidated)
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: outcome,
+                targetIsCurrent: true,
+                generationIsCurrent: readiness.generation == generation,
+                taskIsCancelled: false
+            ),
+            .cancelled
+        )
     }
 
     func testCancelledWaiterDoesNotPoisonSharedReadiness() async throws {
@@ -217,7 +226,7 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         )
     }
 
-    func testFailedInitializationNeverPublishesCommandReadiness() async throws {
+    func testCurrentInitializationFailureMapsToNavigationMiss() async throws {
         let readiness = EPUBSpreadReadiness()
         let generation = readiness.beginLoading()
         let rootLease = try XCTUnwrap(readiness.beginInitialization(
@@ -233,19 +242,61 @@ final class EPUBSpreadReadinessTests: XCTestCase {
 
         XCTAssertFalse(readiness.isCommandReady)
         let outcome = await waiter.value
-        XCTAssertEqual(outcome, .invalidated)
+        XCTAssertEqual(outcome, .failed(generation: generation))
+        XCTAssertEqual(readiness.state, .failed(generation: generation))
+        let laterOutcome = await readiness.waitForCommandReadiness(for: generation)
+        XCTAssertEqual(laterOutcome, .failed(generation: generation))
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: laterOutcome,
+                targetIsCurrent: true,
+                generationIsCurrent: readiness.generation == generation,
+                taskIsCancelled: false
+            ),
+            .miss
+        )
     }
 
-    func testFailedRuntimeMutationInvalidatesRetainedFrameCapability() throws {
+    func testReloadAfterFailureAdvancesOnceAndIgnoresStaleFailure() throws {
+        let readiness = EPUBSpreadReadiness()
+        let failedGeneration = readiness.beginLoading()
+        let staleLease = try XCTUnwrap(readiness.beginInitialization(
+            for: failedGeneration,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+
+        readiness.finishInitialization(staleLease, outcome: .failed)
+        let replacementGeneration = readiness.beginLoading()
+
+        XCTAssertEqual(replacementGeneration, failedGeneration + 1)
+        let replacementCapability = EPUBSpreadFrameCapability(id: UUID())
+        let replacementLease = try XCTUnwrap(readiness.beginInitialization(
+            for: replacementGeneration,
+            frameCapability: replacementCapability
+        ))
+        readiness.finishInitialization(staleLease, outcome: .failed)
+        readiness.finishInitialization(replacementLease, outcome: .succeeded)
+
+        XCTAssertEqual(
+            readiness.state,
+            .ready(
+                generation: replacementGeneration,
+                frameCapability: replacementCapability
+            )
+        )
+    }
+
+    func testFailedRuntimeMutationRevokesCapabilityWithoutChangingIdentity() throws {
         let readiness = try makeReadyReadiness()
         let mutation = try XCTUnwrap(readiness.beginMutation())
 
         readiness.finishMutation(mutation, outcome: .failed)
 
         XCTAssertFalse(readiness.isCommandReady)
+        XCTAssertNil(readiness.readyFrameCapability)
         XCTAssertEqual(
             readiness.state,
-            .unavailable(generation: mutation.generation + 1)
+            .failed(generation: mutation.generation)
         )
     }
 
