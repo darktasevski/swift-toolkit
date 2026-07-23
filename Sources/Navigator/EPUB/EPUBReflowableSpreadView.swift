@@ -726,7 +726,23 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             || locator.text.highlight != nil
 
         if hasDocumentAnchor {
-            return await navigate(to: locator, animated: animated)
+            switch await navigationOutcome(to: locator, animated: animated) {
+            case .applied:
+                return true
+            case .miss:
+                // Anchor unresolvable in the live DOM (fuzzy miss / stale
+                // index): degrade to the coarse progression landing rather
+                // than failing the position command. Initialization must
+                // never fail (a blank, never-revealed spread) over a missed
+                // anchor — the caller's bridge verification remains the
+                // truthful landing authority and reports the miss to its own
+                // fallback ladder. ONLY a genuine miss degrades: a cancelled
+                // or failed command must keep failing so cancellation and
+                // failure invalidation semantics are preserved.
+                break
+            case .cancelled:
+                return false
+            }
         }
 
         let progression = locator.locations.progression ?? 0
@@ -762,17 +778,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Resolves and scrolls to a document anchor in the isolated locator
     /// command world. Publisher-derived locator data is passed as a typed
     /// argument and is never interpolated into executable source.
-    @discardableResult
-    private func navigate(to locator: Locator, animated: Bool) async -> Bool {
+    ///
+    /// Returns the bridge's closed outcome so callers can distinguish a
+    /// genuine anchor miss (degradable) from cancellation (must propagate —
+    /// collapsing them into a Bool let a cancelled command "succeed" via the
+    /// caller's progression fallback). An unencodable locator is a miss: the
+    /// anchor cannot be resolved, but nothing was interrupted.
+    private func navigationOutcome(
+        to locator: Locator,
+        animated: Bool
+    ) async -> EPUBLocatorCommandOutcome {
         guard let json = try? locator.jsonString() else {
-            return false
+            return .miss
         }
         let result = await locatorCommandBridge.navigate(
             locatorJSON: json,
             targetHREF: viewModel.url(to: spread.first.link),
             animated: animated
         )
-        return result.outcome == .applied
+        return result.outcome
     }
 
     // MARK: - Progression

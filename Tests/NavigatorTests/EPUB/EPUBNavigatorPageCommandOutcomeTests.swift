@@ -96,4 +96,34 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             .miss
         )
     }
+
+    func testBridgeVerificationIsNotAnimatedAfterAResourceHop() {
+        // A cross-resource landing positions the document at the FULL target
+        // locator during spread initialization (pre-reveal), so the bridge run
+        // that follows is a verification of an already-positioned page — it
+        // must never animate, or the user sees a second scroll after reveal.
+        XCTAssertFalse(
+            EPUBNavigatorViewController.bridgeCommandAnimated(
+                requestedAnimated: true,
+                didHopToResource: true
+            )
+        )
+    }
+
+    func testBridgeCommandKeepsCallerAnimationWithoutAResourceHop() {
+        // A same-resource landing has no pre-positioning hop: the bridge IS the
+        // user-visible motion and honors the caller's animation request.
+        XCTAssertTrue(
+            EPUBNavigatorViewController.bridgeCommandAnimated(
+                requestedAnimated: true,
+                didHopToResource: false
+            )
+        )
+        XCTAssertFalse(
+            EPUBNavigatorViewController.bridgeCommandAnimated(
+                requestedAnimated: false,
+                didHopToResource: false
+            )
+        )
+    }
 }

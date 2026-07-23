@@ -851,6 +851,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return outcome
     }
 
+    /// Whether the bridge locator command may animate its scroll. After a
+    /// resource hop the document was already positioned at the FULL target
+    /// locator during spread initialization (pre-reveal, via the pending
+    /// location), so the bridge run is a verification of an already-positioned
+    /// page and must be invisible — animating it replays the scroll after
+    /// reveal as a spurious slide. Without a hop the bridge IS the user-visible
+    /// motion and honors the caller's request.
+    nonisolated static func bridgeCommandAnimated(
+        requestedAnimated: Bool,
+        didHopToResource: Bool
+    ) -> Bool {
+        requestedAnimated && !didHopToResource
+    }
+
     /// Navigates with the bounded, fixed-source locator command bridge and
     /// reports the command's actual landing result.
     public func navigateToLocatorJSON(
@@ -886,6 +900,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let spreadView: EPUBSpreadView
+        var didHopToResource = false
         if
             paginationView.currentIndex == spreadIndex,
             let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
@@ -893,9 +908,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         {
             spreadView = loaded
         } else {
-            let resourceOnly = Locator(href: locator.href, mediaType: locator.mediaType)
+            // Hop with the FULL locator, not a resource-only one: the pending
+            // location applies it as the final initialization stage, so the
+            // spread reveals ALREADY positioned at the target (a single
+            // perceived landing — no chapter-top paint, no post-reveal slide).
+            // The bridge run below stays the truthful landing authority.
+            didHopToResource = true
             let resourceOutcome = await goToLocator(
-                resourceOnly,
+                locator,
                 options: NavigatorGoOptions(animated: animated)
             )
             switch Self.navigationDisposition(for: resourceOutcome) {
@@ -924,7 +944,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let result = await spreadView.locatorCommandBridge.navigate(
             locatorJSON: locatorJSON,
             targetHREF: locator.href,
-            animated: animated
+            animated: Self.bridgeCommandAnimated(
+                requestedAnimated: animated,
+                didHopToResource: didHopToResource
+            )
         )
         switch result.outcome {
         case .applied:
