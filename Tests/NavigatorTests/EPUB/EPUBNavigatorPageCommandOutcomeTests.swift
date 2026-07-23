@@ -126,4 +126,32 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             )
         )
     }
+
+    func testAppliedAnchorCommandLands() {
+        XCTAssertEqual(
+            EPUBReflowableSpreadView.anchorLandingDecision(for: .applied),
+            .landed
+        )
+    }
+
+    func testMissedAnchorCommandDegradesToProgression() {
+        // A genuine miss (fuzzy anchor unresolvable in the live DOM, stale
+        // index) must degrade to the coarse progression landing rather than
+        // failing initialization outright — a blank, never-revealed spread
+        // is worse than an imprecise one.
+        XCTAssertEqual(
+            EPUBReflowableSpreadView.anchorLandingDecision(for: .miss),
+            .degradeToProgression
+        )
+    }
+
+    func testCancelledAnchorCommandNeverDegrades() {
+        // Cancellation must propagate, not degrade — collapsing it into the
+        // progression fallback would let a cancelled command silently
+        // "succeed" via the caller's own fallback ladder.
+        XCTAssertEqual(
+            EPUBReflowableSpreadView.anchorLandingDecision(for: .cancelled),
+            .cancelled
+        )
+    }
 }

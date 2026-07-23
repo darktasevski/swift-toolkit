@@ -726,19 +726,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             || locator.text.highlight != nil
 
         if hasDocumentAnchor {
-            switch await navigationOutcome(to: locator, animated: animated) {
-            case .applied:
+            let outcome = await navigationOutcome(to: locator, animated: animated)
+            switch Self.anchorLandingDecision(for: outcome) {
+            case .landed:
                 return true
-            case .miss:
-                // Anchor unresolvable in the live DOM (fuzzy miss / stale
-                // index): degrade to the coarse progression landing rather
-                // than failing the position command. Initialization must
-                // never fail (a blank, never-revealed spread) over a missed
-                // anchor — the caller's bridge verification remains the
-                // truthful landing authority and reports the miss to its own
-                // fallback ladder. ONLY a genuine miss degrades: a cancelled
-                // or failed command must keep failing so cancellation and
-                // failure invalidation semantics are preserved.
+            case .degradeToProgression:
                 break
             case .cancelled:
                 return false
@@ -772,6 +764,27 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             )
             guard case .success = result else { return false }
             return true
+        }
+    }
+
+    enum AnchorLandingDecision: Equatable {
+        case landed
+        case degradeToProgression
+        case cancelled
+    }
+
+    /// Pure decision over a pending-location anchor command's bridge outcome
+    /// (mirrors `EPUBNavigatorHolder.citationRetryDecision`). A genuine
+    /// `.miss` degrades to the progression landing rather than failing
+    /// initialization outright; `.cancelled` must NOT degrade, or it would
+    /// silently "succeed" via the fallback.
+    nonisolated static func anchorLandingDecision(
+        for outcome: EPUBLocatorCommandOutcome
+    ) -> AnchorLandingDecision {
+        switch outcome {
+        case .applied: return .landed
+        case .miss: return .degradeToProgression
+        case .cancelled: return .cancelled
         }
     }
 
