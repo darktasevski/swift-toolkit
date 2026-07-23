@@ -381,6 +381,129 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         XCTAssertTrue(readiness.isCommandReady)
     }
 
+    func testCurrentFrameCapabilitySurvivesPositionMutationAndDiesWithTheDocument() throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        XCTAssertEqual(readiness.currentFrameCapability, capability)
+
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        XCTAssertEqual(readiness.currentFrameCapability, capability)
+
+        // A same-document position mutation advances the generation but keeps
+        // the frame document: the capability must survive both phases.
+        let writer = try XCTUnwrap(readiness.acquirePositionWriter())
+        XCTAssertNotEqual(writer.generation, generation)
+        XCTAssertEqual(readiness.currentFrameCapability, capability)
+
+        readiness.release(writer)
+        XCTAssertEqual(readiness.currentFrameCapability, capability)
+
+        // Document replacement/invalidation clears the capability.
+        readiness.invalidate()
+        XCTAssertNil(readiness.currentFrameCapability)
+    }
+
+    func testCurrentFrameCapabilityIsClearedByFailureAndReplacementLoad() throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        _ = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+
+        readiness.fail(ifCurrent: generation)
+        XCTAssertNil(readiness.currentFrameCapability)
+
+        readiness.beginLoading()
+        XCTAssertNil(readiness.currentFrameCapability)
+    }
+
+    func testDocumentScopedCommandReadinessReturnsImmediatelyWhenReady() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+
+        let outcome = await readiness.waitForCommandReadiness(forDocument: capability)
+        XCTAssertEqual(
+            outcome,
+            .ready(generation: generation, frameCapability: capability)
+        )
+    }
+
+    func testDocumentScopedCommandReadinessSurvivesPositionMutation() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+
+        // A position writer (a precise locator landing) races in right after
+        // readiness publishes and advances the generation.
+        let writer = try XCTUnwrap(readiness.acquirePositionWriter())
+
+        var outcome: EPUBSpreadReadiness.WaitOutcome?
+        let waiter = Task { @MainActor in
+            let value = await readiness.waitForCommandReadiness(forDocument: capability)
+            outcome = value
+            return value
+        }
+        await Task.yield()
+        XCTAssertNil(outcome)
+
+        readiness.release(writer)
+
+        let resumed = await waiter.value
+        XCTAssertEqual(
+            resumed,
+            .ready(generation: writer.generation, frameCapability: capability)
+        )
+    }
+
+    func testDocumentScopedCommandReadinessIsInvalidatedByReplacementLoad() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        _ = try XCTUnwrap(readiness.acquirePositionWriter())
+
+        let waiter = Task { @MainActor in
+            await readiness.waitForCommandReadiness(forDocument: capability)
+        }
+        await Task.yield()
+
+        readiness.beginLoading()
+
+        let outcome = await waiter.value
+        XCTAssertEqual(outcome, .invalidated)
+    }
+
+    func testDocumentScopedCommandReadinessRejectsForeignCapabilityImmediately() async throws {
+        let readiness = try makeReadyReadiness()
+
+        let outcome = await readiness.waitForCommandReadiness(
+            forDocument: EPUBSpreadFrameCapability(id: UUID())
+        )
+        XCTAssertEqual(outcome, .invalidated)
+    }
+
     private func waitUntil(
         _ predicate: @MainActor () -> Bool,
         iterations: Int = 100

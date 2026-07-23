@@ -173,6 +173,24 @@ final class EPUBSpreadReadiness {
         return frameCapability
     }
 
+    /// The frame-document capability currently owning the lifecycle, across
+    /// BOTH phases a live document can be in: `.ready`, and `.initializing`
+    /// when a same-document mutation (position/layout writer) retains the
+    /// capability while advancing the generation. Nil once the document is
+    /// gone — replacement load, invalidation, or failure — so "is this exact
+    /// document still current?" is answerable independently of generation
+    /// arithmetic.
+    var currentFrameCapability: EPUBSpreadFrameCapability? {
+        switch state {
+        case let .ready(_, frameCapability):
+            return frameCapability
+        case .initializing:
+            return initializingFrameCapability
+        case .unavailable, .loading, .failed:
+            return nil
+        }
+    }
+
     var isCommandReady: Bool {
         if case .ready = state {
             return true
@@ -369,6 +387,44 @@ final class EPUBSpreadReadiness {
 
     func waitForCommandReadiness(for generation: Generation) async -> WaitOutcome {
         await wait(for: .commandReadiness, generation: generation)
+    }
+
+    /// Waits for command readiness of the exact frame DOCUMENT rather than a
+    /// fixed render generation. A same-document mutation (a position writer
+    /// acquired the instant readiness published — e.g. a precise locator
+    /// landing) advances the generation while retaining the capability; this
+    /// wait follows the document across those advances and resumes `.ready`
+    /// when the latest same-document generation publishes. It returns
+    /// `.invalidated` once the capability is gone or replaced (replacement
+    /// load, invalidation, or a different document), and forwards `.failed` /
+    /// `.cancelled` from the underlying generation wait.
+    func waitForCommandReadiness(
+        forDocument capability: EPUBSpreadFrameCapability
+    ) async -> WaitOutcome {
+        while !Task.isCancelled {
+            guard currentFrameCapability == capability else {
+                return .invalidated
+            }
+            let outcome = await waitForCommandReadiness(for: generation)
+            switch outcome {
+            case let .ready(readyGeneration, readyCapability):
+                guard readyCapability == capability else {
+                    return .invalidated
+                }
+                return .ready(
+                    generation: readyGeneration,
+                    frameCapability: readyCapability
+                )
+            case .invalidated:
+                // The generation advanced under this wait. If the capability
+                // survived, it was a same-document mutation — wait again on
+                // the successor generation; otherwise the document is gone.
+                continue
+            case .documentAvailable, .cancelled, .timedOut, .failed:
+                return outcome
+            }
+        }
+        return .cancelled
     }
 
     /// Waits against an absolute monotonic deadline. Timing out cancels and

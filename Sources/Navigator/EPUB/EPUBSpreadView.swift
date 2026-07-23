@@ -532,9 +532,10 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
         let generation = readiness.generation
+        let frameCapability = EPUBSpreadFrameCapability()
         guard let rootLease = readiness.beginInitialization(
             for: generation,
-            frameCapability: EPUBSpreadFrameCapability()
+            frameCapability: frameCapability
         ) else {
             return
         }
@@ -549,10 +550,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
                 outcome: Task.isCancelled ? .failed : outcome
             )
 
+            // The reveal path below keys on the frame-DOCUMENT capability, not
+            // on the load generation: a position writer acquired the instant
+            // readiness publishes (a precise locator landing racing this task's
+            // suspensions) legitimately advances the generation while keeping
+            // the same document. Requiring the original generation here left
+            // the spread permanently hidden (scrollView at alpha 0, activity
+            // indicator spinning) whenever such a command interleaved. Only a
+            // replacement load, invalidation, or failure — which clear or
+            // replace the capability — may keep the spread hidden.
             guard
                 !Task.isCancelled,
-                case .ready(generation, _) = await readiness.waitForCommandReadiness(
-                    for: generation
+                case .ready = await readiness.waitForCommandReadiness(
+                    forDocument: frameCapability
                 )
             else {
                 return
@@ -561,7 +571,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             await delegate?.spreadViewDidLoad(self)
             guard
                 !Task.isCancelled,
-                case .ready(generation, _) = readiness.state
+                readiness.currentFrameCapability == frameCapability
             else {
                 return
             }
