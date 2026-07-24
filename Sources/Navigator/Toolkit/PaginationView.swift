@@ -368,6 +368,13 @@ final class PaginationView: UIView, Loggable {
             loadedViews[index] = view
             scrollView.addSubview(view)
             setNeedsLayout()
+            // The freshly added page view has no frame until the deferred layout
+            // pass runs, but `view.go(to:)` below immediately drives
+            // content-dependent navigation inside it. Commanding a zero-sized
+            // web view makes every viewport-relative computation degenerate
+            // (0-width layout viewport, clamped scroll writes), so force the
+            // already-scheduled pass to complete before the first command.
+            layoutIfNeeded()
 
             guard isCurrent(request.key), loadedViews[index] === view else {
                 return
