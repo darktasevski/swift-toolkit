@@ -165,6 +165,11 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         spreadLoadTask = nil
         readiness.invalidate()
 
+        // Revoke the frame capability and drop all frame registration so a
+        // delayed, reloaded, or self-navigated document can never register or be
+        // selected as the command target after this spread is torn down.
+        locatorCommandBridge.revokeFrameCapability()
+
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
         locatorCommandBridge.disableMessageHandler()
@@ -539,6 +544,16 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         ) else {
             return
         }
+
+        // Unify the readiness authority's capability with the command bridge's:
+        // the same token gates both spread reveal and frame registration. The
+        // bridge injects it into the main frame's current document; reflowable
+        // content registers directly, while a fixed-layout wrapper forwards it one
+        // hop to its child resource frame. Either way, only the current document
+        // (or the child it delegates to) — never a delayed old instance, same-URL
+        // reload, or nested frame — can echo it back and register as the target.
+        locatorCommandBridge.setFrameCapability(frameCapability)
+
         spreadLoadTask?.cancel()
 
         spreadLoadTask = Task { @MainActor [weak self] in

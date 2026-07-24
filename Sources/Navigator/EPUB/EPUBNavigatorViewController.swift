@@ -691,6 +691,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        // Rebuilding the spreads invalidates any in-flight precise locator
+        // landing: its target spread is about to be torn down. Drain the queue
+        // with an explicit .cancelled outcome (and abort the suspended bridge
+        // command) before the rebuild, rather than relying on the operation
+        // self-erroring once its webview vanishes. This is also the drain point
+        // for a process-termination rebuild (spreadViewDidTerminate → reload).
+        locatorNavigationTaskQueue.cancelPending()
+
         let locator = currentLocation
 
         guard
@@ -874,6 +882,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         await locatorNavigationTaskQueue.run { [weak self] in
             guard let self else { return .cancelled }
             return await self.performLocatorNavigation(locatorJSON, animated: animated)
+        } cancellationRelay: { [weak self] in
+            await self?.cancelInFlightLocatorNavigation()
         }
     }
 
@@ -941,7 +951,18 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
         defer { spreadView.readiness.release(writerLease) }
 
-        let result = await spreadView.locatorCommandBridge.navigate(
+        // Expose this bridge so a superseding request's relay can abort the
+        // command below in its own frame. Clear only if a newer request has not
+        // already claimed the tracker (the bounded-acknowledgement race).
+        let bridge = spreadView.locatorCommandBridge
+        inFlightLocatorBridge = bridge
+        defer {
+            if inFlightLocatorBridge === bridge {
+                inFlightLocatorBridge = nil
+            }
+        }
+
+        let result = await bridge.navigate(
             locatorJSON: locatorJSON,
             targetHREF: locator.href,
             animated: Self.bridgeCommandAnimated(
@@ -1116,6 +1137,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Serializes rapid locator requests with latest-request-wins semantics.
     private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
+    /// The command bridge whose navigation is currently suspended in
+    /// JavaScript. A superseding request's cancellation relay reads this to
+    /// abort the predecessor in its own frame. Cleared only when the same
+    /// bridge instance is still tracked, so a bounded-acknowledgement race
+    /// never nils a newer request's bridge.
+    private weak var inFlightLocatorBridge: EPUBLocatorCommandBridge?
+
+    /// Runs the predecessor's cancellation relay: aborts its suspended
+    /// JavaScript navigation so it acknowledges promptly. A no-op when no
+    /// navigation is in flight.
+    private func cancelInFlightLocatorNavigation() async {
+        await inFlightLocatorBridge?.cancelInFlightNavigation()
+    }
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         config.decorationTemplates.keys.contains(style)
@@ -1725,5 +1760,36 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
 
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {
         spreads[index].positionCount(in: readingOrder, positionsByReadingOrder: positionsByReadingOrder)
+    }
+}
+
+@_spi(Testing)
+public extension EPUBNavigatorViewController {
+    /// Test-only: the frame-capability UUIDs the current spread's readiness
+    /// authority and locator command bridge each hold. Proves `spreadDidLoad`
+    /// hands ONE capability to both authorities — a mismatch would mean a frame
+    /// that echoes the injected capability could never be selected by the bridge
+    /// registry, so a landed command would be impossible. Returns `nil` when no
+    /// spread is current. Content-free: only opaque UUIDs cross the seam.
+    var currentSpreadFrameCapabilityIDsForTesting: (readiness: UUID?, bridge: UUID?)? {
+        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+            return nil
+        }
+        return (
+            spreadView.readiness.currentFrameCapability?.id,
+            spreadView.locatorCommandBridge.currentFrameCapability?.id
+        )
+    }
+
+    /// Test-only: whether the current spread is a fixed-layout (pre-paginated)
+    /// spread, which loads its resource inside a child iframe of a wrapper main
+    /// frame. Lets a test prove it is exercising the wrapper→child capability
+    /// forwarding path rather than a silently reflowable resource. `nil` when no
+    /// spread is current.
+    var currentSpreadIsFixedLayoutForTesting: Bool? {
+        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+            return nil
+        }
+        return spreadView is EPUBFixedSpreadView
     }
 }

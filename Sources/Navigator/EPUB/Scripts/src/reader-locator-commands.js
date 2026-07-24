@@ -56,11 +56,23 @@ const DECORATION_WIDTHS = new Set(["wrap", "bounds", "viewport", "page"]);
 
 const utf8Encoder = new TextEncoder();
 const requestFrame = globalThis.requestAnimationFrame.bind(globalThis);
+const cancelFrame = globalThis.cancelAnimationFrame.bind(globalThis);
 const scheduleTimeout = globalThis.setTimeout.bind(globalThis);
 const cancelTimeout = globalThis.clearTimeout.bind(globalThis);
 const FRAME_DEADLINE_MILLISECONDS = 250;
 const latestSequences = new Map();
 const decorationGroups = new Map();
+// Per-command cancellation relay: maps a command's `tokenKey` to the
+// `AbortController` for the command currently in flight under that key. This is
+// the JS half of the relay — the exported `invalidate(token)` positively aborts
+// an in-flight command that cooperative sequence-polling (`isCurrent`) would
+// otherwise never notice (a caller cancellation with no successor bumps no
+// sequence). The native bridge round-trip that CALLS `invalidate(token)` on
+// supersession/caller cancellation is a separate, still-pending step; until it
+// lands nothing invokes `invalidate` in production. Each `execute` registers its
+// controller synchronously before its first suspension so a relay `invalidate()`
+// issued in the next JS turn finds it.
+const inFlightCommands = new Map();
 let documentIdentity = null;
 
 class CommandRejection {
@@ -575,7 +587,11 @@ function resolveLocator(locator) {
   );
 }
 
-async function boundedTextContentExcludingUnrenderedSubtrees(root, token) {
+async function boundedTextContentExcludingUnrenderedSubtrees(
+  root,
+  token,
+  signal
+) {
   if (root.matches("script,style,noscript")) {
     return { status: "ready", text: "" };
   }
@@ -605,7 +621,7 @@ async function boundedTextContentExcludingUnrenderedSubtrees(root, token) {
     }
     if (visitedNodes % 2_048 === 0) {
       await new Promise((resolve) => scheduleTimeout(resolve, 0));
-      if (!isCurrent(token)) {
+      if (signal?.aborted || !isCurrent(token)) {
         return { status: "stale" };
       }
     }
@@ -629,7 +645,7 @@ function normalizeDOMText(value) {
     .replace(/[\s\u0085]+/g, " ");
 }
 
-async function validateUniqueTextMatch(command, token) {
+async function validateUniqueTextMatch(command, token, signal) {
   requireOnlyKeys(command, VALIDATE_UNIQUE_TEXT_KEYS);
   if (
     command.kind !== "validateUniqueTextMatch" ||
@@ -650,7 +666,7 @@ async function validateUniqueTextMatch(command, token) {
           LIMITS.selectorUTF16,
           "selectorTooLong"
         );
-  if (!isCurrent(token)) {
+  if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
   const root = selector === undefined ? document.body : uniqueElement(selector);
@@ -659,7 +675,8 @@ async function validateUniqueTextMatch(command, token) {
   }
   const extraction = await boundedTextContentExcludingUnrenderedSubtrees(
     root,
-    token
+    token,
+    signal
   );
   if (extraction.status === "stale") {
     return commandResult(token, "cancelled", "staleToken");
@@ -683,7 +700,7 @@ async function validateUniqueTextMatch(command, token) {
       break;
     }
   }
-  if (!isCurrent(token)) {
+  if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
   return commandResult(
@@ -972,23 +989,42 @@ function scrollToRange(range, animated) {
   return true;
 }
 
-function nextFrame(token) {
+function nextFrame(token, signal) {
   return new Promise((resolve) => {
     let settled = false;
+    let frameID = 0;
     const finish = (status) => {
       if (settled) {
         return;
       }
       settled = true;
       cancelTimeout(timeoutID);
+      if (frameID) {
+        cancelFrame(frameID);
+      }
+      if (signal) {
+        signal.removeEventListener("abort", onAbort);
+      }
       resolve(status);
     };
+    const onAbort = () => finish("stale");
     const timeoutID = scheduleTimeout(
       () => finish("timeout"),
       FRAME_DEADLINE_MILLISECONDS
     );
+    if (signal) {
+      if (signal.aborted) {
+        finish("stale");
+        return;
+      }
+      signal.addEventListener("abort", onAbort, { once: true });
+    }
     try {
-      requestFrame(() => finish(isCurrent(token) ? "current" : "stale"));
+      frameID = requestFrame(() =>
+        finish(
+          isCurrent(token) && !(signal && signal.aborted) ? "current" : "stale"
+        )
+      );
     } catch (_) {
       finish("timeout");
     }
@@ -1358,7 +1394,7 @@ function frameChainVerdict(localSubRect) {
 // viewport before any viewport-relative work runs. Returns "usable",
 // "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
 // never arrived), or "stale".
-async function awaitUsableViewport(token) {
+async function awaitUsableViewport(token, signal) {
   for (let frame = 0; frame <= VIEWPORT_READY_FRAMES; frame += 1) {
     const viewport = effectiveRootViewportSize();
     if (viewport.width > 0 && viewport.height > 0) {
@@ -1367,27 +1403,27 @@ async function awaitUsableViewport(token) {
     if (frame === VIEWPORT_READY_FRAMES) {
       return "notReady";
     }
-    if (!isCurrent(token)) {
+    if (signal?.aborted || !isCurrent(token)) {
       return "stale";
     }
-    const frameStatus = await nextFrame(token);
-    if (frameStatus !== "current" || !isCurrent(token)) {
+    const frameStatus = await nextFrame(token, signal);
+    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
   }
   return "notReady";
 }
 
-async function awaitOffsetStability(token, maximumFrames) {
+async function awaitOffsetStability(token, maximumFrames, signal) {
   let previousX = globalThis.scrollX;
   let previousY = globalThis.scrollY;
   let stableFrames = 0;
   for (let frame = 0; frame < maximumFrames; frame += 1) {
-    if (!isCurrent(token)) {
+    if (signal?.aborted || !isCurrent(token)) {
       return "stale";
     }
-    const frameStatus = await nextFrame(token);
-    if (frameStatus !== "current" || !isCurrent(token)) {
+    const frameStatus = await nextFrame(token, signal);
+    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
     const currentX = globalThis.scrollX;
@@ -1488,8 +1524,8 @@ function verifyEffectiveVisibility(locator) {
 // the caller's single smooth animation when requested), then re-resolves and verifies
 // the target is actually visible — correcting, at most twice and always without
 // animation, if a late reflow moved it after the offset settled.
-async function landAndVerify(locator, initialRange, token, animated) {
-  const viewportStatus = await awaitUsableViewport(token);
+async function landAndVerify(locator, initialRange, token, animated, signal) {
+  const viewportStatus = await awaitUsableViewport(token, signal);
   if (viewportStatus === "stale") {
     return { status: "cancelled" };
   }
@@ -1510,7 +1546,11 @@ async function landAndVerify(locator, initialRange, token, animated) {
     return { status: "cancelled" };
   }
 
-  let settleOutcome = await awaitOffsetStability(token, animated ? 120 : 2);
+  let settleOutcome = await awaitOffsetStability(
+    token,
+    animated ? 120 : 2,
+    signal
+  );
   for (
     let correction = 0;
     correction <= MAX_VISIBILITY_CORRECTIONS;
@@ -1543,12 +1583,16 @@ async function landAndVerify(locator, initialRange, token, animated) {
     if (!isCurrent(token)) {
       return { status: "cancelled" };
     }
-    settleOutcome = await awaitOffsetStability(token, CORRECTION_SETTLE_FRAMES);
+    settleOutcome = await awaitOffsetStability(
+      token,
+      CORRECTION_SETTLE_FRAMES,
+      signal
+    );
   }
   return { status: "miss", reason: "rangeNotVisible" };
 }
 
-async function navigateLocator(command, token) {
+async function navigateLocator(command, token, signal) {
   requireOnlyKeys(command, NAVIGATE_KEYS);
   if (
     command.kind !== "navigateLocator" ||
@@ -1560,24 +1604,30 @@ async function navigateLocator(command, token) {
     reject("invalidToken");
   }
   const locator = decodeLocator(command.payload);
-  if (!isCurrent(token)) {
+  if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
   const range = resolveLocator(locator);
   if (!range) {
     return commandResult(token, "miss", "notFound");
   }
-  if (!isCurrent(token)) {
+  if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const preScrollFrame = await nextFrame(token);
+  const preScrollFrame = await nextFrame(token, signal);
   if (preScrollFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (preScrollFrame !== "current" || !isCurrent(token)) {
+  if (preScrollFrame !== "current" || signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const landing = await landAndVerify(locator, range, token, command.animated);
+  const landing = await landAndVerify(
+    locator,
+    range,
+    token,
+    command.animated,
+    signal
+  );
   if (landing.status === "cancelled") {
     return commandResult(token, "cancelled", "staleToken");
   }
@@ -1587,9 +1637,9 @@ async function navigateLocator(command, token) {
   return commandResult(token, "applied", "none");
 }
 
-async function replaceDecorationGroup(command, token) {
+async function replaceDecorationGroup(command, token, signal) {
   const value = validateReplaceDecorations(command, token);
-  if (!isCurrent(token)) {
+  if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
 
@@ -1605,11 +1655,11 @@ async function replaceDecorationGroup(command, token) {
     return commandResult(token, "miss", "invalidField");
   }
 
-  const prePaintFrame = await nextFrame(token);
+  const prePaintFrame = await nextFrame(token, signal);
   if (prePaintFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (prePaintFrame !== "current" || !isCurrent(token)) {
+  if (prePaintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
 
@@ -1625,8 +1675,8 @@ async function replaceDecorationGroup(command, token) {
   decorationGroups.set(value.groupID, state);
 
   for (let frame = 0; frame < 2; frame += 1) {
-    const paintFrame = await nextFrame(token);
-    if (paintFrame !== "current" || !isCurrent(token)) {
+    const paintFrame = await nextFrame(token, signal);
+    if (paintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
       if (decorationGroups.get(value.groupID) === state) {
         restoreDecorationGroup(value.groupID, previous);
       }
@@ -1642,29 +1692,91 @@ async function replaceDecorationGroup(command, token) {
 
 async function execute(commandValue, tokenValue) {
   let token;
+  let key;
+  let controller;
   try {
     token = validateToken(tokenValue);
     if (!acceptToken(token)) {
       return commandResult(token, "cancelled", "staleToken");
     }
+    // Register the cancellation channel SYNCHRONOUSLY, before the first
+    // suspension, so a relay `invalidate(token)` issued in the next JS turn —
+    // while this command is parked at a frame/settle await — finds and aborts
+    // it. A newer command for the same key overwrites this entry and owns its
+    // own teardown; the `finally` below only clears its own registration.
+    key = tokenKey(token);
+    controller = new AbortController();
+    inFlightCommands.set(key, { sequence: token.sequence, controller });
     if (!isObject(commandValue)) {
       reject("invalidCommand");
     }
     switch (commandValue.kind) {
       case "navigateLocator":
-        return await navigateLocator(commandValue, token);
+        return await navigateLocator(commandValue, token, controller.signal);
       case "replaceDecorationGroup":
-        return await replaceDecorationGroup(commandValue, token);
+        return await replaceDecorationGroup(
+          commandValue,
+          token,
+          controller.signal
+        );
       case "validateUniqueTextMatch":
-        return await validateUniqueTextMatch(commandValue, token);
+        return await validateUniqueTextMatch(
+          commandValue,
+          token,
+          controller.signal
+        );
       default:
         reject("invalidCommand");
     }
   } catch (error) {
+    // Cancellation and receipt currency take precedence over classifying a
+    // current-document WebKit/DOM failure as a miss: a command aborted mid-flight
+    // (or superseded) reports `cancelled`, never a spurious `miss` that would let
+    // a consumer fall back and fight the newer navigation.
+    if (token && (controller?.signal.aborted || !isCurrent(token))) {
+      return commandResult(token, "cancelled", "staleToken");
+    }
     const reasonCode =
       error instanceof CommandRejection ? error.reasonCode : "internalError";
     return commandResult(token ?? null, "miss", reasonCode);
+  } finally {
+    // Teardown on every terminal path (success, miss, cancellation, timeout,
+    // document invalidation): abort the controller so any listener registered
+    // with its signal is released, and clear our own registry entry. Per-await
+    // timers/rAF ids self-clean in their own `finish`; aborting here is the
+    // single teardown point future stylesheet/font/scrollend/visibility/pagehide
+    // listeners must register against.
+    if (controller) {
+      controller.abort();
+    }
+    if (key !== undefined && token !== undefined) {
+      const entry = inFlightCommands.get(key);
+      if (entry && entry.sequence === token.sequence) {
+        inFlightCommands.delete(key);
+      }
+    }
   }
+}
+
+// The fixed-source entry point the native cancellation relay calls. Positively
+// aborts the in-flight command registered under `token`'s key when the sequence
+// matches, returning a benign `invalidated: false` acknowledgement when no such
+// live command exists (already completed, superseded, an older/stale sequence,
+// or never started) rather than throwing. Never mutates `latestSequences` —
+// supersession is the caller's channel; this is orthogonal.
+function invalidate(tokenValue) {
+  let token;
+  try {
+    token = validateToken(tokenValue);
+  } catch (_) {
+    return { token: null, invalidated: false };
+  }
+  const entry = inFlightCommands.get(tokenKey(token));
+  if (entry && entry.sequence === token.sequence) {
+    entry.controller.abort();
+    return { token, invalidated: true };
+  }
+  return { token, invalidated: false };
 }
 
 function decorationAtPoint(x, y) {
@@ -1728,18 +1840,112 @@ document.addEventListener(
   true
 );
 
+// The unforgeable per-document capability the native side issues to THIS document
+// instance (via callAsyncJavaScript into the frame's current document). It starts
+// null: the document does not register as a command target until it has received a
+// capability, so a bare document-start href announcement can never register.
+let frameCapability = null;
+
+// The postMessage discriminator for a wrapper->child capability hand-off. Fixed
+// layout loads the resource inside a child iframe, which native cannot reach with
+// `callAsyncJavaScript(in: nil)` (that runs in the wrapper's main frame). The
+// wrapper forwards the capability one hop to its direct child; the child accepts
+// it but never re-forwards, so a nested/self-navigated grandchild can never
+// obtain it.
+const FRAME_CAPABILITY_MESSAGE_TYPE = "readium.locator.frameCapability";
+
+function postFrameReady() {
+  if (frameCapability === null) {
+    return;
+  }
+  try {
+    globalThis.webkit?.messageHandlers?.readerLocatorFrameReady?.postMessage({
+      href: document.location.href,
+      capability: frameCapability,
+    });
+  } catch (_) {
+    // Native frame registration is best-effort. The native registry rejects a
+    // command unless it can select exactly one eligible frame for the document.
+  }
+}
+
+// Forwards the capability to every DIRECT child iframe of this document, once,
+// same-origin. Only the frame the native side injected into (the wrapper's main
+// frame) forwards; a frame that accepted a forwarded capability never re-forwards.
+// The child validates that the message came from its parent, that its parent is
+// the top frame, and that the origin matches, so nothing but the wrapper's direct
+// resource child can consume it.
+function forwardCapabilityToChildFrames(token) {
+  const targetOrigin = globalThis.location.origin;
+  for (const frame of document.querySelectorAll("iframe")) {
+    try {
+      frame.contentWindow?.postMessage(
+        { type: FRAME_CAPABILITY_MESSAGE_TYPE, capability: token },
+        targetOrigin
+      );
+    } catch (_) {
+      // A cross-origin or detached child cannot be the eligible resource frame,
+      // so a failed forward is not an error.
+    }
+  }
+}
+
+// Called by the native side, once per document generation, with the capability it
+// minted for this document instance. Only the document that receives the current
+// capability can register: a delayed old document, a same-URL reload, or a
+// nested/self-navigated frame never received it, so their announcements never
+// present the current capability and are rejected. Reflowable content is the main
+// frame and registers directly; a fixed-layout wrapper is the main frame and
+// forwards the capability to its child resource frame.
+function acceptFrameCapability(token) {
+  if (typeof token !== "string" || token.length === 0) {
+    return;
+  }
+  frameCapability = token;
+  postFrameReady();
+  forwardCapabilityToChildFrames(token);
+}
+
+// Receives a capability forwarded by the parent wrapper frame. Accepts it only
+// from a direct child of the top frame, over the same origin, and never
+// re-forwards it — so the resource frame registers while a nested grandchild or a
+// self-navigated frame (whose parent is not the top frame) can never consume it.
+globalThis.addEventListener("message", (event) => {
+  if (
+    globalThis.self === globalThis.top ||
+    globalThis.parent !== globalThis.top ||
+    event.source !== globalThis.parent ||
+    event.origin !== globalThis.location.origin
+  ) {
+    return;
+  }
+  const data = event.data;
+  if (
+    !data ||
+    data.type !== FRAME_CAPABILITY_MESSAGE_TYPE ||
+    typeof data.capability !== "string" ||
+    data.capability.length === 0
+  ) {
+    return;
+  }
+  frameCapability = data.capability;
+  postFrameReady();
+});
+
+// A document being unloaded — navigated away, reloaded, terminated, or moved
+// into the back/forward cache — self-revokes its capability so a queued or
+// bfcache-restored frameReady can never present a stale capability after the
+// document has stopped being the current target. The native side clears its own
+// currentFrameCapability on teardown (EPUBSpreadView.clear()); this is the
+// document-side half, covering a child self-navigation or reload the native
+// spread load never observes.
+globalThis.addEventListener("pagehide", () => {
+  frameCapability = null;
+});
+
 Object.defineProperty(globalThis, "readerLocatorCommands", {
   configurable: false,
   enumerable: false,
   writable: false,
-  value: Object.freeze({ execute }),
+  value: Object.freeze({ execute, invalidate, acceptFrameCapability }),
 });
-
-try {
-  globalThis.webkit?.messageHandlers?.readerLocatorFrameReady?.postMessage({
-    href: document.location.href,
-  });
-} catch (_) {
-  // Native frame registration is best-effort. The native registry rejects a
-  // command unless it can select exactly one eligible frame for the document.
-}

@@ -37,7 +37,7 @@ struct EPUBLocatorFrameRegistry: Sendable {
     private struct Entry: Sendable {
         let id: String
         let href: String
-        let documentEpoch: Int
+        let capability: EPUBSpreadFrameCapability
         let isMainFrame: Bool
         let isSameOrigin: Bool
     }
@@ -52,14 +52,14 @@ struct EPUBLocatorFrameRegistry: Sendable {
     mutating func register(
         id: String,
         href: String,
-        documentEpoch: Int,
+        capability: EPUBSpreadFrameCapability,
         isMainFrame: Bool,
         isSameOrigin: Bool
     ) {
         entriesByID[id] = Entry(
             id: id,
             href: href,
-            documentEpoch: documentEpoch,
+            capability: capability,
             isMainFrame: isMainFrame,
             isSameOrigin: isSameOrigin
         )
@@ -69,13 +69,19 @@ struct EPUBLocatorFrameRegistry: Sendable {
         entriesByID.removeAll(keepingCapacity: true)
     }
 
-    func select(href: String, documentEpoch: Int) -> EPUBLocatorFrameSelection {
+    /// Selects the single eligible frame that echoed the current document
+    /// capability. A `nil` current capability (no document has yet received a
+    /// capability from the native side) matches no entry and fails closed.
+    func select(
+        href: String,
+        capability: EPUBSpreadFrameCapability?
+    ) -> EPUBLocatorFrameSelection {
         let matchingHref = entriesByID.values.filter { $0.href == href }
         guard !matchingHref.isEmpty else {
             return .miss(.frameMissing)
         }
 
-        let current = matchingHref.filter { $0.documentEpoch == documentEpoch }
+        let current = matchingHref.filter { $0.capability == capability }
         guard !current.isEmpty else {
             return .miss(.staleDocument)
         }
@@ -226,7 +232,15 @@ struct EPUBDecorationCommandItem: Sendable {
 final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private struct StoredFrame {
         let info: WKFrameInfo
-        let documentEpoch: Int
+        let capability: EPUBSpreadFrameCapability
+    }
+
+    /// The navigation command currently suspended inside `callAsyncJavaScript`.
+    /// `cancelInFlightNavigation()` reads this to run the `invalidate(token)`
+    /// round-trip in the exact frame the command is executing in.
+    private struct InFlightNavigation {
+        let token: EPUBLocatorCommandToken
+        let frame: WKFrameInfo
     }
 
     private struct DecorationActivationState {
@@ -248,6 +262,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private static let frameReadyMessageName = "readerLocatorFrameReady"
     private static let decorationActivatedMessageName = "readerLocatorDecorationActivated"
     private static let commandScript = "return await readerLocatorCommands.execute(command, token);"
+    private static let invalidateScript = "return readerLocatorCommands.invalidate(token);"
+    private static let acceptFrameCapabilityScript = "readerLocatorCommands.acceptFrameCapability(capability);"
     private static let visibleTextScript = """
     const range = document.caretRangeFromPoint(globalThis.innerWidth / 2, globalThis.innerHeight / 2);
     if (!range) return '';
@@ -275,7 +291,14 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private var framesByID: [String: StoredFrame] = [:]
     private var latestSequences: [CommandSequenceKey: Int] = [:]
     private var decorationActivationStates: [DecorationActivationStateKey: DecorationActivationState] = [:]
+    private var inFlightNavigation: InFlightNavigation?
     private(set) var documentEpoch = 0
+    /// The unforgeable capability for the frame document the current spread
+    /// generation minted. Only a frame that echoes this exact capability may
+    /// register as the command target. Cleared on every new document so a
+    /// delayed old document cannot register before the next capability is
+    /// injected.
+    private(set) var currentFrameCapability: EPUBSpreadFrameCapability?
     private weak var webView: WKWebView?
     private weak var userContentController: WKUserContentController?
     private var isMessageHandlerEnabled = false
@@ -343,14 +366,65 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
     func beginDocument() {
         documentEpoch += 1
+        currentFrameCapability = nil
         framesByID.removeAll(keepingCapacity: true)
         registry.removeAll()
         latestSequences.removeAll(keepingCapacity: true)
         decorationActivationStates.removeAll(keepingCapacity: true)
+        inFlightNavigation = nil
     }
 
     func invalidateDocument() {
         beginDocument()
+    }
+
+    /// Revokes the current frame capability and drops all frame registration so a
+    /// delayed, reloaded, or self-navigated document can never register or be
+    /// selected as the command target after the spread is torn down.
+    ///
+    /// Wired to `EPUBSpreadView.clear()` (removal, disappearance, deinit). Unlike
+    /// `beginDocument()` it does not advance the command epoch: `clear()` is a
+    /// teardown, not the start of a new document, and the readiness authority
+    /// already owns in-flight command cancellation (`readiness.invalidate()`).
+    /// The JavaScript side self-revokes its own copy on `pagehide` (see
+    /// `reader-locator-commands.js`), covering a child self-navigation or reload
+    /// the native spread load never observes.
+    func revokeFrameCapability() {
+        currentFrameCapability = nil
+        framesByID.removeAll(keepingCapacity: true)
+        registry.removeAll()
+    }
+
+    /// Publishes the capability the current spread generation minted and injects
+    /// it into the main frame's *current* document via `callAsyncJavaScript(in: nil)`.
+    /// WebKit runs the injection in whichever document currently occupies the
+    /// main frame, so a superseded or old document instance can never receive it.
+    /// Reflowable content is the main frame and registers directly; a fixed-layout
+    /// wrapper is the main frame and the JS side forwards the capability one hop to
+    /// its child resource frame (see `forwardCapabilityToChildFrames` in
+    /// `reader-locator-commands.js`), which is where registration happens for that
+    /// layout. Either way only the current document tree can echo it back.
+    func setFrameCapability(_ capability: EPUBSpreadFrameCapability) {
+        currentFrameCapability = capability
+        guard let webView else {
+            return
+        }
+        Task { @MainActor in
+            _ = try? await webView.callAsyncJavaScript(
+                Self.acceptFrameCapabilityScript,
+                arguments: ["capability": capability.id.uuidString],
+                in: nil,
+                contentWorld: Self.contentWorld
+            )
+        }
+    }
+
+    /// Test-only: the number of frames currently registered as eligible command
+    /// targets. Lets an integration test await the capability-handshake round-trip
+    /// (`setFrameCapability` → JS echo → `didReceive` registration) before issuing
+    /// a command — the deterministic stand-in for a live spread's readiness gate.
+    var registeredFrameCountForTesting: Int {
+        framesByID.count
     }
 
     func navigate(
@@ -386,7 +460,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
 
         let selectedID: String
-        switch registry.select(href: targetKey, documentEpoch: token.documentEpoch) {
+        switch registry.select(href: targetKey, capability: currentFrameCapability) {
         case let .selected(id):
             selectedID = id
         case let .miss(reason):
@@ -399,7 +473,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
         guard
             let storedFrame = framesByID[selectedID],
-            storedFrame.documentEpoch == token.documentEpoch,
+            storedFrame.capability == currentFrameCapability,
             let webView
         else {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .staleDocument)
@@ -410,6 +484,16 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             "payload": locatorJSON,
             "animated": animated,
         ]
+
+        // Record the suspended command so a superseding request's relay can
+        // abort it in the exact frame it is running in. Cleared on every exit,
+        // but only if a newer navigation has not already replaced it.
+        inFlightNavigation = InFlightNavigation(token: token, frame: storedFrame.info)
+        defer {
+            if inFlightNavigation?.token == token {
+                inFlightNavigation = nil
+            }
+        }
 
         let rawResult: Any?
         do {
@@ -427,6 +511,25 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
         return Self.decodeResult(rawResult, expectedToken: token)
+    }
+
+    /// Positively cancels the navigation command currently suspended inside
+    /// `callAsyncJavaScript`, if any, by running the fixed-source
+    /// `invalidate(token)` relay in the same frame and content world. The
+    /// JavaScript aborts its `AbortController`, so the suspended command
+    /// unwinds to `cancelled` promptly instead of after its frame timeout. A
+    /// detached frame (the round-trip throws) means the predecessor is already
+    /// being torn down, so there is nothing to cancel.
+    func cancelInFlightNavigation() async {
+        guard let inFlight = inFlightNavigation, let webView else {
+            return
+        }
+        _ = try? await webView.callAsyncJavaScript(
+            Self.invalidateScript,
+            arguments: ["token": inFlight.token.javascriptValue],
+            in: inFlight.frame,
+            contentWorld: Self.contentWorld
+        )
     }
 
     func replaceDecorations(
@@ -488,7 +591,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
 
         let selectedID: String
-        switch registry.select(href: targetKey, documentEpoch: token.documentEpoch) {
+        switch registry.select(href: targetKey, capability: currentFrameCapability) {
         case let .selected(id):
             selectedID = id
         case let .miss(reason):
@@ -501,7 +604,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
         guard
             let storedFrame = framesByID[selectedID],
-            storedFrame.documentEpoch == token.documentEpoch,
+            storedFrame.capability == currentFrameCapability,
             let webView
         else {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .staleDocument)
@@ -575,7 +678,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
 
         let selectedID: String
-        switch registry.select(href: targetKey, documentEpoch: token.documentEpoch) {
+        switch registry.select(href: targetKey, capability: currentFrameCapability) {
         case let .selected(id):
             selectedID = id
         case let .miss(reason):
@@ -587,7 +690,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
         guard
             let storedFrame = framesByID[selectedID],
-            storedFrame.documentEpoch == token.documentEpoch,
+            storedFrame.capability == currentFrameCapability,
             let webView
         else {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .staleDocument)
@@ -626,7 +729,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             return nil
         }
         let selectedID: String
-        switch registry.select(href: targetKey, documentEpoch: documentEpoch) {
+        switch registry.select(href: targetKey, capability: currentFrameCapability) {
         case let .selected(id):
             selectedID = id
         case .miss:
@@ -634,7 +737,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
         guard
             let storedFrame = framesByID[selectedID],
-            storedFrame.documentEpoch == documentEpoch,
+            storedFrame.capability == currentFrameCapability,
             let webView
         else {
             return nil
@@ -728,7 +831,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             let frameKey = frameKey(for: requestURL),
             case let .selected(selectedID) = registry.select(
                 href: frameKey,
-                documentEpoch: documentEpoch
+                capability: currentFrameCapability
             ),
             Self.validActivationRect(body["rect"]),
             Self.validActivationClick(body["click"])
@@ -738,7 +841,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
         guard
             let storedFrame = framesByID[selectedID],
-            storedFrame.documentEpoch == documentEpoch,
+            storedFrame.capability == currentFrameCapability,
             let state = decorationActivationStates[
                 DecorationActivationStateKey(frameID: selectedID, groupID: groupID)
             ],
@@ -866,6 +969,52 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     }
 }
 
+extension EPUBLocatorCommandBridge {
+    /// The parameters for registering a frame that passed the capability gate.
+    struct FrameReadyRegistration: Equatable {
+        let id: String
+        let key: String
+        let capability: EPUBSpreadFrameCapability
+        let isSameOrigin: Bool
+    }
+
+    /// The capability gate for an incoming frame-ready announcement. Returns the
+    /// registration parameters only when the announcement echoes the exact
+    /// current capability for its own request URL; `nil` rejects it — no current
+    /// capability (a delayed old document that never received one, or a spread
+    /// torn down by `revokeFrameCapability()`), a stale or forged capability, an
+    /// oversized or malformed href, or an href that does not match the frame's
+    /// own request URL. No book prose crosses this seam: the href is a resource
+    /// path and the capability is an opaque UUID string.
+    func resolveFrameReady(
+        announcedHREF: String?,
+        announcedCapability: String?,
+        requestURL: URL?,
+        frameID: String
+    ) -> FrameReadyRegistration? {
+        guard
+            let announcedHREF,
+            announcedHREF.utf16.count <= 4 * 1024,
+            let announcedURL = URL(string: announcedHREF),
+            let requestURL,
+            let announcedKey = frameKey(for: announcedURL),
+            let requestKey = frameKey(for: requestURL),
+            announcedKey == requestKey,
+            let capability = currentFrameCapability,
+            let announcedCapability,
+            announcedCapability == capability.id.uuidString
+        else {
+            return nil
+        }
+        return FrameReadyRegistration(
+            id: frameID,
+            key: requestKey,
+            capability: capability,
+            isSameOrigin: publicationBaseURL.relativize(requestURL) != nil
+        )
+    }
+}
+
 extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
     func userContentController(
         _ userContentController: WKUserContentController,
@@ -879,26 +1028,31 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
         }
         guard
             message.name == Self.frameReadyMessageName,
-            let body = message.body as? [String: Any],
-            let announcedHREF = body["href"] as? String,
-            announcedHREF.utf16.count <= 4 * 1024,
-            let announcedURL = URL(string: announcedHREF),
-            let requestURL = message.frameInfo.request.url,
-            frameKey(for: announcedURL) == frameKey(for: requestURL),
-            let key = frameKey(for: requestURL)
+            let body = message.body as? [String: Any]
         else {
             return
         }
 
-        let id = String(UInt(bitPattern: ObjectIdentifier(message.frameInfo)), radix: 16)
-        let isSameOrigin = publicationBaseURL.relativize(requestURL) != nil
-        framesByID[id] = StoredFrame(info: message.frameInfo, documentEpoch: documentEpoch)
+        let frameID = String(UInt(bitPattern: ObjectIdentifier(message.frameInfo)), radix: 16)
+        guard let registration = resolveFrameReady(
+            announcedHREF: body["href"] as? String,
+            announcedCapability: body["capability"] as? String,
+            requestURL: message.frameInfo.request.url,
+            frameID: frameID
+        ) else {
+            return
+        }
+
+        framesByID[registration.id] = StoredFrame(
+            info: message.frameInfo,
+            capability: registration.capability
+        )
         registry.register(
-            id: id,
-            href: key,
-            documentEpoch: documentEpoch,
+            id: registration.id,
+            href: registration.key,
+            capability: registration.capability,
             isMainFrame: message.frameInfo.isMainFrame,
-            isSameOrigin: isSameOrigin
+            isSameOrigin: registration.isSameOrigin
         )
     }
 }
