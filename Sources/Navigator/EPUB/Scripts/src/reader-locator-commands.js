@@ -771,12 +771,9 @@ function positionDecorationElement(element, rect, bounds, style) {
   const writingMode = decorationWritingMode();
   const isVertical = writingMode.startsWith("vertical");
   const isVerticalRL = writingMode === "vertical-rl";
-  const viewportWidth = isVertical
-    ? globalThis.innerHeight
-    : globalThis.innerWidth;
-  const viewportHeight = isVertical
-    ? globalThis.innerWidth
-    : globalThis.innerHeight;
+  const rootViewport = effectiveRootViewportSize();
+  const viewportWidth = isVertical ? rootViewport.height : rootViewport.width;
+  const viewportHeight = isVertical ? rootViewport.width : rootViewport.height;
   const columnCount =
     Number.parseInt(
       globalThis
@@ -949,7 +946,7 @@ function isRTL() {
 }
 
 function snapOffset(offset) {
-  const viewportWidth = globalThis.innerWidth;
+  const viewportWidth = effectiveRootViewportSize().width;
   const delta = isRTL() ? -1 : 1;
   const value = offset + delta;
   return value - (value % viewportWidth);
@@ -998,11 +995,87 @@ function nextFrame(token) {
   });
 }
 
-async function awaitFinalPaint(token, animated) {
+// Bounded per the decoration engine's own per-item rect count (buildDecorationGroup
+// has no explicit rect cap today, but its callers bound decoration count at 4096 and
+// this check exists purely to defend the interior hit-test below against a hostile
+// document producing pathological fragment counts for one range).
+const MAX_VISIBILITY_FRAGMENTS = 64;
+// A late reflow (font/layout settle finishing after the scroll offset itself already
+// stabilized) can leave the scroll position correct for a now-stale target rect. Bound
+// the number of corrective re-scroll attempts rather than looping unboundedly.
+const MAX_VISIBILITY_CORRECTIONS = 2;
+const CORRECTION_SETTLE_FRAMES = 10;
+// A freshly attached spread web view learns its size from the UI process
+// asynchronously; until then the layout viewport is 0×0 and every
+// viewport-relative computation is degenerate (NaN page snapping, clamped
+// scroll writes, structurally false visibility). Frozen as
+// `locatorNavigationBudgets.viewportReadyFrames` in
+// docs/benchmarks/render-faithful-v7-budgets.json (measured propagation is
+// ~5 frames; the cap is a generous bound, not a tuning knob).
+const VIEWPORT_READY_FRAMES = 60;
+
+function rectIsUsable(rect) {
+  return (
+    Number.isFinite(rect.left) &&
+    Number.isFinite(rect.top) &&
+    Number.isFinite(rect.right) &&
+    Number.isFinite(rect.bottom) &&
+    rect.width > 0 &&
+    rect.height > 0
+  );
+}
+
+// `document.documentElement.clientWidth/clientHeight` (the CSS layout viewport) rather
+// than `window.innerWidth/innerHeight`: the latter reflects WebKit's visual viewport,
+// which can transiently read 0 immediately after a resource transition even though the
+// layout viewport — the same coordinate space `Range.getClientRects()` reports in — is
+// already correctly sized. Comparing against the layout viewport keeps this check
+// self-consistent with the geometry it is inspecting.
+function effectiveRootViewportSize() {
+  return {
+    width: document.documentElement.clientWidth,
+    height: document.documentElement.clientHeight,
+  };
+}
+
+function rectIntersectsViewport(rect) {
+  const viewport = effectiveRootViewportSize();
+  return (
+    rect.right > 0 &&
+    rect.left < viewport.width &&
+    rect.bottom > 0 &&
+    rect.top < viewport.height
+  );
+}
+
+// Waits, bounded, for the document to have a usable (non-zero) layout
+// viewport before any viewport-relative work runs. Returns "usable",
+// "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
+// never arrived), or "stale".
+async function awaitUsableViewport(token) {
+  for (let frame = 0; frame <= VIEWPORT_READY_FRAMES; frame += 1) {
+    const viewport = effectiveRootViewportSize();
+    if (viewport.width > 0 && viewport.height > 0) {
+      return "usable";
+    }
+    if (frame === VIEWPORT_READY_FRAMES) {
+      return "notReady";
+    }
+    if (!isCurrent(token)) {
+      return "stale";
+    }
+    const frameStatus = await nextFrame(token);
+    if (frameStatus !== "current" || !isCurrent(token)) {
+      return frameStatus === "timeout" ? "timeout" : "stale";
+    }
+  }
+  return "notReady";
+}
+
+async function awaitOffsetStability(token, maximumFrames) {
   let previousX = globalThis.scrollX;
   let previousY = globalThis.scrollY;
   let stableFrames = 0;
-  const maximumFrames = animated ? 120 : 2;
   for (let frame = 0; frame < maximumFrames; frame += 1) {
     if (!isCurrent(token)) {
       return "stale";
@@ -1016,7 +1089,7 @@ async function awaitFinalPaint(token, animated) {
     if (currentX === previousX && currentY === previousY) {
       stableFrames += 1;
       if (stableFrames >= 2) {
-        return "painted";
+        return "stable";
       }
     } else {
       stableFrames = 0;
@@ -1025,6 +1098,93 @@ async function awaitFinalPaint(token, animated) {
     }
   }
   return "timeout";
+}
+
+// Re-resolves the locator against the CURRENT DOM/layout rather than trusting a
+// previously resolved Range object, then proves the resolved range is visible in the
+// effective viewport: not collapsed, still attached, has usable (finite, positive-area)
+// fragments bounded below a hostile-document cap, and at least one fragment intersects
+// the visual viewport. Never inspects geometry beyond what this closed status requires.
+function verifyEffectiveVisibility(locator) {
+  const range = resolveLocator(locator);
+  if (!range) {
+    return { status: "miss", reason: "notFound", range: null };
+  }
+  if (range.collapsed) {
+    return { status: "miss", reason: "rangeCollapsed", range };
+  }
+  if (!range.startContainer.isConnected || !range.endContainer.isConnected) {
+    return { status: "miss", reason: "rangeDetached", range };
+  }
+  const rects = Array.from(range.getClientRects()).filter(rectIsUsable);
+  if (rects.length > MAX_VISIBILITY_FRAGMENTS) {
+    return { status: "miss", reason: "rangeTooComplex", range };
+  }
+  if (rects.length === 0 || !rects.some(rectIntersectsViewport)) {
+    return { status: "miss", reason: "rangeNotVisible", range };
+  }
+  return { status: "visible", range };
+}
+
+// Scrolls toward the target, waits for the scroll offset itself to settle (preserving
+// the caller's single smooth animation when requested), then re-resolves and verifies
+// the target is actually visible — correcting, at most twice and always without
+// animation, if a late reflow moved it after the offset settled.
+async function landAndVerify(locator, initialRange, token, animated) {
+  const viewportStatus = await awaitUsableViewport(token);
+  if (viewportStatus === "stale") {
+    return { status: "cancelled" };
+  }
+  if (viewportStatus === "timeout") {
+    return { status: "miss", reason: "paintTimeout" };
+  }
+  if (viewportStatus === "notReady") {
+    return { status: "miss", reason: "viewportNotReady" };
+  }
+
+  if (!scrollToRange(initialRange, animated)) {
+    return { status: "miss", reason: "notScrollable" };
+  }
+  if (!isCurrent(token)) {
+    return { status: "cancelled" };
+  }
+
+  let settleOutcome = await awaitOffsetStability(token, animated ? 120 : 2);
+  for (
+    let correction = 0;
+    correction <= MAX_VISIBILITY_CORRECTIONS;
+    correction += 1
+  ) {
+    if (settleOutcome === "stale") {
+      return { status: "cancelled" };
+    }
+    if (settleOutcome === "timeout") {
+      return { status: "miss", reason: "paintTimeout" };
+    }
+    if (!isCurrent(token)) {
+      return { status: "cancelled" };
+    }
+
+    const verification = verifyEffectiveVisibility(locator);
+    if (verification.status === "visible") {
+      return { status: "visible" };
+    }
+    if (verification.reason !== "rangeNotVisible" || !verification.range) {
+      return { status: "miss", reason: verification.reason };
+    }
+    if (correction === MAX_VISIBILITY_CORRECTIONS) {
+      return { status: "miss", reason: "rangeNotVisible" };
+    }
+
+    if (!scrollToRange(verification.range, false)) {
+      return { status: "miss", reason: "notScrollable" };
+    }
+    if (!isCurrent(token)) {
+      return { status: "cancelled" };
+    }
+    settleOutcome = await awaitOffsetStability(token, CORRECTION_SETTLE_FRAMES);
+  }
+  return { status: "miss", reason: "rangeNotVisible" };
 }
 
 async function navigateLocator(command, token) {
@@ -1056,18 +1216,12 @@ async function navigateLocator(command, token) {
   if (preScrollFrame !== "current" || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  if (!scrollToRange(range, command.animated)) {
-    return commandResult(token, "miss", "notScrollable");
-  }
-  if (!isCurrent(token)) {
+  const landing = await landAndVerify(locator, range, token, command.animated);
+  if (landing.status === "cancelled") {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const finalPaint = await awaitFinalPaint(token, command.animated);
-  if (finalPaint === "timeout") {
-    return commandResult(token, "miss", "paintTimeout");
-  }
-  if (finalPaint !== "painted" || !isCurrent(token)) {
-    return commandResult(token, "cancelled", "staleToken");
+  if (landing.status === "miss") {
+    return commandResult(token, "miss", landing.reason);
   }
   return commandResult(token, "applied", "none");
 }

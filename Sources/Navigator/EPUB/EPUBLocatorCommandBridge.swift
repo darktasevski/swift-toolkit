@@ -166,6 +166,11 @@ enum EPUBLocatorCommandReason: String, Sendable {
     case matchRootTooLarge
     case paintTimeout
     case notScrollable
+    case rangeCollapsed
+    case rangeDetached
+    case rangeNotVisible
+    case rangeTooComplex
+    case viewportNotReady
     case internalError
     case invalidResult
     case webKitFailure
