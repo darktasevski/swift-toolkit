@@ -170,6 +170,9 @@ enum EPUBLocatorCommandReason: String, Sendable {
     case rangeDetached
     case rangeNotVisible
     case rangeTooComplex
+    case rangeSuppressed
+    case rangeObscured
+    case geometryUnverifiable
     case viewportNotReady
     case internalError
     case invalidResult

@@ -1013,6 +1013,24 @@ const CORRECTION_SETTLE_FRAMES = 10;
 // docs/benchmarks/render-faithful-v7-budgets.json (measured propagation is
 // ~5 frames; the cap is a generous bound, not a tuning knob).
 const VIEWPORT_READY_FRAMES = 60;
+// Node-span preflight budget, aligned with the visited-node cap of
+// `boundedTextContentExcludingUnrenderedSubtrees` above: a range spanning more
+// nodes than this is rejected BEFORE `Range.getClientRects()` materializes a
+// fragment list for it. Legitimate ranges (a quote, a chapter element) span
+// far fewer nodes; only a hostile document exceeds it.
+const MAX_VISIBILITY_NODE_SPAN = 100_000;
+const MAX_CLIP_ANCESTOR_DEPTH = 256;
+const MAX_FRAME_CHAIN_DEPTH = 8;
+// At most this many visible fragments are interior hit-tested, five probes
+// each — a fixed probe budget independent of document size.
+const MAX_OCCLUSION_FRAGMENTS = 8;
+const OCCLUSION_PROBE_FRACTIONS = [
+  [0.5, 0.5],
+  [0.25, 0.25],
+  [0.75, 0.25],
+  [0.25, 0.75],
+  [0.75, 0.75],
+];
 
 function rectIsUsable(rect) {
   return (
@@ -1038,14 +1056,302 @@ function effectiveRootViewportSize() {
   };
 }
 
-function rectIntersectsViewport(rect) {
-  const viewport = effectiveRootViewportSize();
+function nearestElement(node) {
+  return node.nodeType === Node.ELEMENT_NODE ? node : node.parentElement;
+}
+
+function rectComponentsFinite(rect) {
   return (
-    rect.right > 0 &&
-    rect.left < viewport.width &&
-    rect.bottom > 0 &&
-    rect.top < viewport.height
+    Number.isFinite(rect.left) &&
+    Number.isFinite(rect.top) &&
+    Number.isFinite(rect.right) &&
+    Number.isFinite(rect.bottom)
   );
+}
+
+function intersectRects(a, b) {
+  return {
+    left: Math.max(a.left, b.left),
+    top: Math.max(a.top, b.top),
+    right: Math.min(a.right, b.right),
+    bottom: Math.min(a.bottom, b.bottom),
+  };
+}
+
+function rectIsNonEmpty(rect) {
+  return rect.right > rect.left && rect.bottom > rect.top;
+}
+
+// Counts the nodes the range actually spans, pruning non-intersecting subtrees,
+// and stops as soon as the budget is exceeded — so the walk itself is bounded by
+// the budget, not by document size. Fail closed on any DOM API throw.
+function rangeSpanExceedsBudget(range) {
+  const common = range.commonAncestorContainer;
+  const root =
+    common.nodeType === Node.ELEMENT_NODE ||
+    common.nodeType === Node.DOCUMENT_NODE
+      ? common
+      : common.parentNode;
+  if (!root) {
+    return false;
+  }
+  let walker;
+  try {
+    walker = document.createTreeWalker(
+      root,
+      NodeFilter.SHOW_ELEMENT | NodeFilter.SHOW_TEXT,
+      {
+        acceptNode(node) {
+          try {
+            return range.intersectsNode(node)
+              ? NodeFilter.FILTER_ACCEPT
+              : NodeFilter.FILTER_REJECT;
+          } catch (_) {
+            return NodeFilter.FILTER_REJECT;
+          }
+        },
+      }
+    );
+  } catch (_) {
+    return true;
+  }
+  let count = 0;
+  for (let node = walker.nextNode(); node; node = walker.nextNode()) {
+    count += 1;
+    if (count > MAX_VISIBILITY_NODE_SPAN) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// Computed `visibility` on the nearest element is inheritance-correct on its own
+// (a descendant `visibility: visible` overrides a hidden ancestor and computes
+// visible), so no ancestor walk is needed for it. Opacity does NOT inherit — it
+// composites multiplicatively, so an ancestor with computed opacity 0 blanks the
+// subtree while the descendant still computes 1 — that one needs a bounded
+// ancestor walk. `display: none` and `content-visibility: hidden` subtrees
+// produce no client rects at all and surface as `rangeNotVisible` downstream.
+function endpointCSSSuppression(node) {
+  const element = nearestElement(node);
+  if (!element) {
+    return "suppressed";
+  }
+  let style;
+  try {
+    style = globalThis.getComputedStyle(element);
+  } catch (_) {
+    return "unverifiable";
+  }
+  if (style.visibility === "hidden" || style.visibility === "collapse") {
+    return "suppressed";
+  }
+  let ancestor = element;
+  let depth = 0;
+  while (ancestor) {
+    depth += 1;
+    if (depth > MAX_CLIP_ANCESTOR_DEPTH) {
+      return "unverifiable";
+    }
+    let ancestorStyle;
+    try {
+      ancestorStyle = globalThis.getComputedStyle(ancestor);
+    } catch (_) {
+      return "unverifiable";
+    }
+    if (Number.parseFloat(ancestorStyle.opacity) === 0) {
+      return "suppressed";
+    }
+    ancestor = ancestor.parentElement;
+  }
+  return "visible";
+}
+
+// Collects the clip boxes of every overflow-clipping ancestor of the range's
+// common ancestor. `html`/`body` are excluded: the root clip is the layout
+// viewport (applied separately), and the pagination engine's own multicolumn
+// boxes on the root elements would over-clip every fragment.
+function ancestorClipChain(range) {
+  const start = nearestElement(range.commonAncestorContainer);
+  if (!start) {
+    return { status: "unverifiable" };
+  }
+  const clips = [];
+  let element = start;
+  let depth = 0;
+  while (
+    element &&
+    element !== document.body &&
+    element !== document.documentElement
+  ) {
+    depth += 1;
+    if (depth > MAX_CLIP_ANCESTOR_DEPTH) {
+      return { status: "unverifiable" };
+    }
+    let style;
+    try {
+      style = globalThis.getComputedStyle(element);
+    } catch (_) {
+      return { status: "unverifiable" };
+    }
+    if (style.overflowX !== "visible" || style.overflowY !== "visible") {
+      const box = element.getBoundingClientRect();
+      if (!rectComponentsFinite(box)) {
+        return { status: "unverifiable" };
+      }
+      clips.push(box);
+    }
+    element = element.parentElement;
+  }
+  return { status: "ok", clips };
+}
+
+// Intersects a fragment rect with the root layout viewport and every ancestor
+// clip box; null when nothing of the fragment survives.
+function effectivelyVisibleSubRect(rect, clips) {
+  const viewport = effectiveRootViewportSize();
+  let visible = intersectRects(rect, {
+    left: 0,
+    top: 0,
+    right: viewport.width,
+    bottom: viewport.height,
+  });
+  if (!rectIsNonEmpty(visible)) {
+    return null;
+  }
+  for (const clip of clips) {
+    visible = intersectRects(visible, clip);
+    if (!rectIsNonEmpty(visible)) {
+      return null;
+    }
+  }
+  return visible;
+}
+
+// Decoration overlays are `pointer-events: none`, so `elementFromPoint` never
+// reports them as occluders. A probe confirms the target when the topmost
+// element at an interior point of a visible fragment is the range's own content
+// (intersects the range) or one of its ancestors — the topmost paintable at a
+// glyph point when nothing covers it.
+function probeConfirmsRange(range, subRect) {
+  for (const [fractionX, fractionY] of OCCLUSION_PROBE_FRACTIONS) {
+    const x = subRect.left + (subRect.right - subRect.left) * fractionX;
+    const y = subRect.top + (subRect.bottom - subRect.top) * fractionY;
+    let hit;
+    try {
+      hit = document.elementFromPoint(x, y);
+    } catch (_) {
+      continue;
+    }
+    if (!hit) {
+      continue;
+    }
+    try {
+      if (
+        range.intersectsNode(hit) ||
+        hit.contains(range.commonAncestorContainer)
+      ) {
+        return true;
+      }
+    } catch (_) {
+      continue;
+    }
+  }
+  return false;
+}
+
+// Capped same-origin ancestor-frame chain: transforms a locally visible
+// sub-rect into each parent frame (offset plus uniform scale — a rotated frame
+// is unverifiable), intersects it with that frame's layout viewport, and probes
+// its center so a parent-document overlay covering the frame is rejected.
+// Dormant today: fixed layout is command-ineligible and reflowable resources
+// load in the main frame, so this returns "visible" at depth 0.
+function frameChainVerdict(localSubRect) {
+  let rect = {
+    left: localSubRect.left,
+    top: localSubRect.top,
+    right: localSubRect.right,
+    bottom: localSubRect.bottom,
+  };
+  let currentWindow = globalThis;
+  let currentDocument = document;
+  let depth = 0;
+  const visited = [];
+  for (;;) {
+    let frameElement;
+    try {
+      frameElement = currentWindow.frameElement;
+    } catch (_) {
+      return "unverifiable";
+    }
+    if (!frameElement) {
+      return "visible";
+    }
+    depth += 1;
+    if (depth > MAX_FRAME_CHAIN_DEPTH || visited.includes(currentWindow)) {
+      return "unverifiable";
+    }
+    visited.push(currentWindow);
+    const parentDocument = frameElement.ownerDocument;
+    const parentWindow = parentDocument ? parentDocument.defaultView : null;
+    if (!parentWindow || !parentDocument.documentElement) {
+      return "unverifiable";
+    }
+    const frameBox = frameElement.getBoundingClientRect();
+    const childWidth = currentDocument.documentElement.clientWidth;
+    const childHeight = currentDocument.documentElement.clientHeight;
+    if (
+      !rectComponentsFinite(frameBox) ||
+      !(childWidth > 0) ||
+      !(childHeight > 0)
+    ) {
+      return "unverifiable";
+    }
+    const scaleX = frameBox.width / childWidth;
+    const scaleY = frameBox.height / childHeight;
+    if (
+      !Number.isFinite(scaleX) ||
+      !Number.isFinite(scaleY) ||
+      scaleX <= 0 ||
+      scaleY <= 0
+    ) {
+      return "unverifiable";
+    }
+    rect = {
+      left: frameBox.left + rect.left * scaleX,
+      top: frameBox.top + rect.top * scaleY,
+      right: frameBox.left + rect.right * scaleX,
+      bottom: frameBox.top + rect.bottom * scaleY,
+    };
+    rect = intersectRects(rect, {
+      left: 0,
+      top: 0,
+      right: parentDocument.documentElement.clientWidth,
+      bottom: parentDocument.documentElement.clientHeight,
+    });
+    if (!rectIsNonEmpty(rect)) {
+      return "clipped";
+    }
+    let hit;
+    try {
+      hit = parentDocument.elementFromPoint(
+        (rect.left + rect.right) / 2,
+        (rect.top + rect.bottom) / 2
+      );
+    } catch (_) {
+      return "unverifiable";
+    }
+    if (
+      !hit ||
+      (hit !== frameElement &&
+        !frameElement.contains(hit) &&
+        !hit.contains(frameElement))
+    ) {
+      return "obscured";
+    }
+    currentWindow = parentWindow;
+    currentDocument = parentDocument;
+  }
 }
 
 // Waits, bounded, for the document to have a usable (non-zero) layout
@@ -1101,10 +1407,14 @@ async function awaitOffsetStability(token, maximumFrames) {
 }
 
 // Re-resolves the locator against the CURRENT DOM/layout rather than trusting a
-// previously resolved Range object, then proves the resolved range is visible in the
-// effective viewport: not collapsed, still attached, has usable (finite, positive-area)
-// fragments bounded below a hostile-document cap, and at least one fragment intersects
-// the visual viewport. Never inspects geometry beyond what this closed status requires.
+// previously resolved Range object, then proves the resolved range is EFFECTIVELY
+// visible: not collapsed, still attached, within the node-span budget (checked
+// BEFORE getClientRects materializes geometry), not CSS-suppressed, with usable
+// (finite, positive-area) fragments below the hostile-document cap of which at
+// least one survives the ancestor clip chain plus the root layout viewport, is
+// not completely occluded under bounded interior hit-testing, and stays visible
+// through the capped same-origin ancestor-frame chain. Returns only closed
+// reason codes — never text, locators, hrefs, or geometry.
 function verifyEffectiveVisibility(locator) {
   const range = resolveLocator(locator);
   if (!range) {
@@ -1116,12 +1426,60 @@ function verifyEffectiveVisibility(locator) {
   if (!range.startContainer.isConnected || !range.endContainer.isConnected) {
     return { status: "miss", reason: "rangeDetached", range };
   }
+  if (rangeSpanExceedsBudget(range)) {
+    return { status: "miss", reason: "rangeTooComplex", range };
+  }
+  const startSuppression = endpointCSSSuppression(range.startContainer);
+  const endSuppression = endpointCSSSuppression(range.endContainer);
+  if (
+    startSuppression === "unverifiable" ||
+    endSuppression === "unverifiable"
+  ) {
+    return { status: "miss", reason: "geometryUnverifiable", range };
+  }
+  if (startSuppression === "suppressed" && endSuppression === "suppressed") {
+    return { status: "miss", reason: "rangeSuppressed", range };
+  }
   const rects = Array.from(range.getClientRects()).filter(rectIsUsable);
   if (rects.length > MAX_VISIBILITY_FRAGMENTS) {
     return { status: "miss", reason: "rangeTooComplex", range };
   }
-  if (rects.length === 0 || !rects.some(rectIntersectsViewport)) {
+  if (rects.length === 0) {
     return { status: "miss", reason: "rangeNotVisible", range };
+  }
+  const chain = ancestorClipChain(range);
+  if (chain.status !== "ok") {
+    return { status: "miss", reason: "geometryUnverifiable", range };
+  }
+  const visibleSubRects = [];
+  for (const rect of rects) {
+    const subRect = effectivelyVisibleSubRect(rect, chain.clips);
+    if (subRect) {
+      visibleSubRects.push(subRect);
+    }
+  }
+  if (visibleSubRects.length === 0) {
+    return { status: "miss", reason: "rangeNotVisible", range };
+  }
+  let confirmed = null;
+  for (const subRect of visibleSubRects.slice(0, MAX_OCCLUSION_FRAGMENTS)) {
+    if (probeConfirmsRange(range, subRect)) {
+      confirmed = subRect;
+      break;
+    }
+  }
+  if (!confirmed) {
+    return { status: "miss", reason: "rangeObscured", range };
+  }
+  const frameVerdict = frameChainVerdict(confirmed);
+  if (frameVerdict === "clipped") {
+    return { status: "miss", reason: "rangeNotVisible", range };
+  }
+  if (frameVerdict === "obscured") {
+    return { status: "miss", reason: "rangeObscured", range };
+  }
+  if (frameVerdict !== "visible") {
+    return { status: "miss", reason: "geometryUnverifiable", range };
   }
   return { status: "visible", range };
 }
@@ -1142,6 +1500,9 @@ async function landAndVerify(locator, initialRange, token, animated) {
     return { status: "miss", reason: "viewportNotReady" };
   }
 
+  if (rangeSpanExceedsBudget(initialRange)) {
+    return { status: "miss", reason: "rangeTooComplex" };
+  }
   if (!scrollToRange(initialRange, animated)) {
     return { status: "miss", reason: "notScrollable" };
   }
