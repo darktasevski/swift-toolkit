@@ -1291,16 +1291,43 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         else {
                             continue
                         }
-                        _ = await spreadView.locatorCommandBridge.replaceDecorations(
-                            items,
-                            in: group,
-                            targetHREF: href,
-                            activable: true
-                        )
+                        _ = await Self.runDecorationReplayWrite(
+                            on: spreadView.readiness
+                        ) {
+                            _ = await spreadView.locatorCommandBridge.replaceDecorations(
+                                items,
+                                in: group,
+                                targetHREF: href,
+                                activable: true
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Runs a decoration replay write under a generation-bound writer lease so
+    /// re-applying committed decorations onto a live spread can never paint a
+    /// superseded generation. Returns `false` without running `write` unless
+    /// the spread currently publishes command readiness, mirroring the
+    /// apply/rollback lease discipline. The `isCommandReady` gate runs before
+    /// `acquirePositionWriter()` so a spread mid-initialization is skipped
+    /// rather than joined as an additional writer.
+    @MainActor
+    static func runDecorationReplayWrite(
+        on readiness: EPUBSpreadReadiness,
+        _ write: @MainActor () async -> Void
+    ) async -> Bool {
+        guard
+            readiness.isCommandReady,
+            let lease = readiness.acquirePositionWriter()
+        else {
+            return false
+        }
+        defer { readiness.release(lease) }
+        await write()
+        return true
     }
 
     // MARK: - Configurable

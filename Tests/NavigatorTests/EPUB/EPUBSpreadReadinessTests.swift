@@ -504,6 +504,90 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         XCTAssertEqual(outcome, .invalidated)
     }
 
+    // MARK: - Decoration replay lease discipline
+
+    func testDecorationReplayWriteHoldsALeaseDuringTheWriteOnAReadySpread() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        XCTAssertEqual(
+            readiness.state,
+            .ready(generation: generation, frameCapability: capability)
+        )
+
+        var observedInitializingLeaseCount: Int?
+        let didWrite = await EPUBNavigatorViewController.runDecorationReplayWrite(
+            on: readiness
+        ) {
+            if case let .initializing(_, leases) = readiness.state {
+                observedInitializingLeaseCount = leases
+            }
+        }
+
+        XCTAssertTrue(didWrite)
+        // The write ran while a single generation-bound lease was held, so a
+        // concurrent command-readiness reader could not observe `.ready`
+        // mid-write.
+        XCTAssertEqual(observedInitializingLeaseCount, 1)
+        // The mutation advanced the generation and republished readiness against
+        // the SAME frame document.
+        XCTAssertEqual(
+            readiness.state,
+            .ready(generation: generation + 1, frameCapability: capability)
+        )
+    }
+
+    func testDecorationReplayWriteSkipsASpreadThatIsNotCommandReady() async {
+        let loading = EPUBSpreadReadiness()
+        _ = loading.beginLoading()
+
+        var wrote = false
+        let didWrite = await EPUBNavigatorViewController.runDecorationReplayWrite(
+            on: loading
+        ) {
+            wrote = true
+        }
+
+        XCTAssertFalse(didWrite)
+        XCTAssertFalse(wrote)
+        XCTAssertEqual(loading.state, .loading(generation: 1))
+    }
+
+    func testDecorationReplayWriteSkipsASpreadMidInitialization() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        _ = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+        XCTAssertEqual(
+            readiness.state,
+            .initializing(generation: generation, activeWriterLeases: 1)
+        )
+
+        var wrote = false
+        let didWrite = await EPUBNavigatorViewController.runDecorationReplayWrite(
+            on: readiness
+        ) {
+            wrote = true
+        }
+
+        // The `isCommandReady` gate rejects the write before
+        // `acquirePositionWriter()` could join the in-flight initialization as
+        // an additional writer, so the lease count is untouched.
+        XCTAssertFalse(didWrite)
+        XCTAssertFalse(wrote)
+        XCTAssertEqual(
+            readiness.state,
+            .initializing(generation: generation, activeWriterLeases: 1)
+        )
+    }
+
     private func waitUntil(
         _ predicate: @MainActor () -> Bool,
         iterations: Int = 100
