@@ -201,7 +201,11 @@ enum EPUBLocatorCommandReason: String, Sendable {
     /// world without reporting termination. Distinct from `webKitFailure` (the
     /// call returned an error) and from `paintTimeout` (the script ran and gave
     /// up waiting for a frame): only this one means no script outcome exists.
-    /// Native-only; the JavaScript side cannot produce it, by definition.
+    /// Native-only: the script never emits this code, by definition — a script that
+    /// reported an outcome is a script that ran. Note the decoder does not ENFORCE
+    /// that, since it maps any `reasonCode` through `init(rawValue:)`; a page that
+    /// echoed this string would produce a misleading log line and nothing more,
+    /// because `reason` is never switched on.
     case commandUnresponsive
 }
 

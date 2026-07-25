@@ -997,9 +997,9 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// Known weaker than the contract: matching `.failed` without its
     /// generation lets a regression that invalidated-then-failed (landing
     /// `.failed(generation + 1)`) pass, while `fail(ifCurrent:)` promises the
-    /// identity is unchanged. Pinning the expected generation here is tracked
-    /// rather than done, because four of the five call sites must first capture
-    /// the generation before the act that fails.
+    /// identity is unchanged. Pinning the expected generation here is tracked in
+    /// issue #1708 rather than done, because four of the five call sites must
+    /// first capture the generation before the act that fails.
     private func assertCommandCapabilityRevoked(
         in spreadView: EPUBSpreadView,
         _ message: String,
