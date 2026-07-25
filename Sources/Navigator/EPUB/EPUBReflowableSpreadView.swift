@@ -706,7 +706,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             if turn.animated {
                 await scrollAnimationCoordinator.waitUntilSettled()
             }
-            guard await waitForLayoutStability(until: settleDeadline.expiresAt) else {
+            let layoutCap = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+            guard await waitForLayoutStability(
+                until: settleDeadline.effectiveDeadline(cappedBy: layoutCap)
+            ) else {
                 return false
             }
             return await waitForScrollPosition(targetX, until: settleDeadline)

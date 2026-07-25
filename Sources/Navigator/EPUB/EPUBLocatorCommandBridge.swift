@@ -784,12 +784,13 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// operation-wide deadline, taken from the frozen
     /// `locatorNavigationBudgets.totalCommandDeadlineMilliseconds`.
     ///
-    /// This is the per-command floor of the contract, not its finished form: a
-    /// caller that spans several commands (a cross-resource hop followed by its
-    /// landing) must mint ONE deadline at operation start and pass the remainder
-    /// into each command, otherwise the budget still restarts per resource.
-    /// Threading that caller-owned deadline down from the navigator and the
-    /// navigation queue is the remaining half of the single-deadline contract.
+    /// The NAVIGATION path no longer reaches this: `navigate` takes a required
+    /// `deadline`, which `performLocatorNavigation` mints once at operation start
+    /// and spends across the hop, page identity, readiness, and the command
+    /// itself. This default now serves only the decoration and validation
+    /// commands, whose callers do not yet own a deadline — so for those two a
+    /// caller spanning several commands still restarts the budget per command.
+    /// Giving them caller-owned deadlines is the remaining half of the contract.
     static let totalCommandDeadlineMilliseconds = 5000
 
     private func nextToken(

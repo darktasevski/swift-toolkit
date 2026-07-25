@@ -1858,11 +1858,32 @@ public extension EPUBNavigatorViewController {
         else {
             return false
         }
-        guard case .ready = await spreadView.readiness.waitForCommandReadiness(
-            forDocument: capability
-        ) else {
-            return false
+        // Bounded deliberately. `waitForCommandReadiness(forDocument:)` loops while the
+        // capability survives, re-waiting on each successor generation — so a document
+        // whose generation keeps advancing (exactly the font/stylesheet/progression churn
+        // this probe exists to wait out) would never return. Unbounded, that is a suite
+        // HANG rather than a failure: no assertion message, no diagnostic, the whole run
+        // dies. Racing a deadline converts that into an ordinary `false`.
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: ContinuousClock().now,
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
+        return await withTaskGroup(of: Bool.self) { group in
+            group.addTask { @MainActor in
+                guard case .ready = await spreadView.readiness.waitForCommandReadiness(
+                    forDocument: capability
+                ) else {
+                    return false
+                }
+                return true
+            }
+            group.addTask {
+                try? await ContinuousClock().sleep(until: deadline.expiresAt)
+                return false
+            }
+            let result = await group.next() ?? false
+            group.cancelAll()
+            return result
         }
-        return true
     }
 }
