@@ -635,9 +635,11 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// PRELOADED NEIGHBOUR initializing during someone else's operation — keeps its own
     /// full allowance.
     func resolveInitializationStabilityDeadline() -> ContinuousClock.Instant {
-        EPUBInitializationStabilityInheritance.resolve(
-            ownCap: EPUBSpreadReadiness.makeInitializationStabilityDeadline(),
-            inheritedFrom: delegate?.spreadViewLocatorOperationDeadline(self)
+        let clock = EPUBMonotonicClock.continuous
+        return EPUBInitializationStabilityInheritance.resolve(
+            ownCap: EPUBSpreadReadiness.makeInitializationStabilityDeadline(clock: clock),
+            inheritedFrom: delegate?.spreadViewLocatorOperationDeadline(self),
+            at: clock.now()
         )
     }
 

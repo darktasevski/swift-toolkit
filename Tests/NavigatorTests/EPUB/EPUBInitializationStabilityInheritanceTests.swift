@@ -111,7 +111,8 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
 
         let resolved = EPUBInitializationStabilityInheritance.resolve(
             ownCap: ownCap,
-            inheritedFrom: active.deadline
+            inheritedFrom: active.deadline,
+            at: base
         )
 
         XCTAssertEqual(resolved, active.deadline.expiresAt)
@@ -128,7 +129,8 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
         XCTAssertEqual(
             EPUBInitializationStabilityInheritance.resolve(
                 ownCap: ownCap,
-                inheritedFrom: nil
+                inheritedFrom: nil,
+                at: base
             ),
             ownCap
         )
@@ -147,24 +149,25 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
         XCTAssertEqual(
             EPUBInitializationStabilityInheritance.resolve(
                 ownCap: ownCap,
-                inheritedFrom: active.deadline
+                inheritedFrom: active.deadline,
+                at: base
             ),
             ownCap
         )
     }
 
-    /// The anti-extension property stated directly: however long the hop took, the
-    /// resolved instant never lands after the operation's own expiry.
-    func testInheritanceCanNeverExtendStabilizationPastTheOperationDeadline() {
+    /// The anti-extension property stated directly: for as long as the operation is
+    /// live, however much of it the hop already spent, the resolved instant never lands
+    /// after the operation's own expiry.
+    func testInheritanceCanNeverExtendStabilizationPastALiveOperation() {
         let active = operation(readingOrderIndex: 4, startingAt: base)
 
-        for elapsedMilliseconds in [0, 250, 1000, 4000, 4999, 6000] {
-            let ownCap = base
-                .advanced(by: .milliseconds(elapsedMilliseconds))
-                .advanced(by: .milliseconds(5000))
+        for elapsedMilliseconds in [0, 250, 1000, 4000, 4999] {
+            let now = base.advanced(by: .milliseconds(elapsedMilliseconds))
             let resolved = EPUBInitializationStabilityInheritance.resolve(
-                ownCap: ownCap,
-                inheritedFrom: active.deadline
+                ownCap: now.advanced(by: .milliseconds(5000)),
+                inheritedFrom: active.deadline,
+                at: now
             )
             XCTAssertLessThanOrEqual(
                 resolved,
@@ -174,29 +177,58 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
         }
     }
 
-    /// An operation already overrun hands on an expired instant rather than a fresh
-    /// allowance, so the stage's own remaining-budget guard rejects it immediately
-    /// instead of starting a wait the operation cannot afford.
+    /// An operation that has ALREADY expired is not inherited at all.
+    ///
+    /// Handing on a spent instant is not a harmless zero wait: the stage's
+    /// remaining-budget guard turns it into a failed initialization, which fails the
+    /// render generation and leaves the spread permanently hidden. Declining is not a
+    /// re-arm — the operation is over and gains nothing from starving the spread.
     @MainActor
-    func testAnAlreadyOverrunOperationLeavesTheStageNoBudget() {
+    func testAnAlreadyExpiredOperationIsNotInheritedAndLeavesTheStageItsOwnBudget() {
         let active = operation(readingOrderIndex: 4, startingAt: base)
         let afterOverrun = base.advanced(by: .milliseconds(6000))
+        let ownCap = afterOverrun.advanced(by: .milliseconds(5000))
 
         let resolved = EPUBInitializationStabilityInheritance.resolve(
-            ownCap: afterOverrun.advanced(by: .milliseconds(5000)),
-            inheritedFrom: active.deadline
+            ownCap: ownCap,
+            inheritedFrom: active.deadline,
+            at: afterOverrun
         )
 
-        let stopped = EPUBMonotonicClock(
-            now: { afterOverrun },
-            sleep: { _ in }
-        )
+        XCTAssertEqual(resolved, ownCap)
+        let stopped = EPUBMonotonicClock(now: { afterOverrun }, sleep: { _ in })
         XCTAssertEqual(
             EPUBSpreadReadiness.remainingInitializationStabilityMilliseconds(
                 until: resolved,
                 clock: stopped
             ),
-            0
+            5000,
+            "an expired operation must not starve the spread that outlives it"
+        )
+    }
+
+    /// The residual the expired-case fix deliberately does NOT close: a live operation
+    /// with only a sliver left still hands on that sliver. Pinned so the boundary is
+    /// explicit rather than assumed — closing it needs a minimum-budget floor, which
+    /// would be a genuine re-arm.
+    @MainActor
+    func testALiveOperationWithASliverLeftStillHandsOnOnlyThatSliver() {
+        let active = operation(readingOrderIndex: 4, startingAt: base)
+        let nearlySpent = base.advanced(by: .milliseconds(4999))
+
+        let resolved = EPUBInitializationStabilityInheritance.resolve(
+            ownCap: nearlySpent.advanced(by: .milliseconds(5000)),
+            inheritedFrom: active.deadline,
+            at: nearlySpent
+        )
+
+        let stopped = EPUBMonotonicClock(now: { nearlySpent }, sleep: { _ in })
+        XCTAssertEqual(
+            EPUBSpreadReadiness.remainingInitializationStabilityMilliseconds(
+                until: resolved,
+                clock: stopped
+            ),
+            1
         )
     }
 }

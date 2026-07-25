@@ -1000,20 +1000,31 @@ function supportsScrollEnd() {
 
 // Registers the belt for exactly one scroll. Returns null where the platform has no
 // `scrollend`, so the caller takes the pure rAF path with no listener to tear down.
+//
+// A `scrollend` reaching this window is NOT by itself proof that the scroll this belt
+// was armed for has finished. Two ways it can be someone else's: an event queued by the
+// PREVIOUS rung's scroll can be dispatched after that rung's belt was disposed and land
+// here (a correction re-scroll arms its belt before its own write, so the window is
+// real), and any foreign scroll — user momentum, a nested scroller — ends during the
+// poll. Accepting either would conclude the settle at the pre-scroll offset and burn one
+// of the two visibility corrections. So the belt latches only for an event observed at
+// an offset that has actually MOVED from where it was armed; the listener is not `once`,
+// so an early foreign event does not consume it and a later genuine one still lands.
 function observeScrollEnd() {
   if (!supportsScrollEnd()) {
     return null;
   }
-  let fired = false;
+  const originX = globalThis.scrollX;
+  const originY = globalThis.scrollY;
+  let movedAndEnded = false;
   const onScrollEnd = () => {
-    fired = true;
+    if (globalThis.scrollX !== originX || globalThis.scrollY !== originY) {
+      movedAndEnded = true;
+    }
   };
-  globalThis.addEventListener("scrollend", onScrollEnd, {
-    once: true,
-    passive: true,
-  });
+  globalThis.addEventListener("scrollend", onScrollEnd, { passive: true });
   return {
-    fired: () => fired,
+    fired: () => movedAndEnded,
     dispose: () => globalThis.removeEventListener("scrollend", onScrollEnd),
   };
 }
@@ -1066,13 +1077,16 @@ async function scrollAndSettle(
   deadlineAt
 ) {
   let belt = null;
-  const outcome = scrollToRange(range, animated, () => {
-    belt = observeScrollEnd();
-  });
-  if (outcome === "notScrollable") {
-    return "notScrollable";
-  }
+  // The scroll write itself is INSIDE the try: `armBelt` runs immediately before it, so
+  // a throw from `scrollTo` would otherwise leave the listener registered with the
+  // `finally` never entered.
   try {
+    const outcome = scrollToRange(range, animated, () => {
+      belt = observeScrollEnd();
+    });
+    if (outcome === "notScrollable") {
+      return "notScrollable";
+    }
     if (!isCurrent(token)) {
       return "stale";
     }

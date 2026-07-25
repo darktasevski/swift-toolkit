@@ -69,18 +69,31 @@ enum EPUBInitializationStabilityInheritance {
         return activeOperation.deadline
     }
 
-    /// Takes the EARLIER of the stage's own cap and the inherited operation deadline.
+    /// Takes the EARLIER of the stage's own cap and the inherited operation deadline,
+    /// but only while the operation is still live.
     ///
     /// Composition is one-directional, matching every other rung: an inherited deadline
     /// can only SHORTEN stabilization, and the stage's own cap can only shorten the
-    /// operation. Neither re-arms the other, so an overrun operation hands on an already
-    /// expired instant and the stage's remaining-budget guard rejects it immediately
-    /// rather than starting a wait the operation cannot afford.
+    /// operation. Neither re-arms the other.
+    ///
+    /// An ALREADY-EXPIRED operation is not inherited at all. Handing on a spent instant
+    /// is not a harmless zero wait: the stage's remaining-budget guard turns it into a
+    /// failed initialization, which fails the whole render generation and leaves the
+    /// spread permanently hidden. Declining it is not a re-arm — the operation is over
+    /// and gains nothing from starving the spread, while the navigation still reports
+    /// its own timeout — it is refusing to let a dead operation destroy the lifecycle of
+    /// an object that outlives it.
+    ///
+    /// - Note: a live operation with only a sliver left still yields a sliver, which the
+    ///   stage can still fail on. This closes the expired case only; the residual is
+    ///   tracked rather than fixed by a minimum-budget floor, which would be a genuine
+    ///   re-arm.
     static func resolve(
         ownCap: ContinuousClock.Instant,
-        inheritedFrom operationDeadline: EPUBLocatorOperationDeadline?
+        inheritedFrom operationDeadline: EPUBLocatorOperationDeadline?,
+        at now: ContinuousClock.Instant
     ) -> ContinuousClock.Instant {
-        guard let operationDeadline else {
+        guard let operationDeadline, !operationDeadline.hasExpired(at: now) else {
             return ownCap
         }
         return operationDeadline.effectiveDeadline(cappedBy: ownCap)
