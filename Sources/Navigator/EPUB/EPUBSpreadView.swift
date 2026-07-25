@@ -696,15 +696,32 @@ class EPUBSpreadView: UIView, Loggable, PageView {
                 guard let latest else { return true }
                 return await self.applyCSSScript(latest)
             }
-            let outcome: EPUBSpreadReadiness.MutationOutcome
-            if succeeded {
-                outcome = .succeeded
-            } else if Task.isCancelled {
-                outcome = .superseded
-            } else {
-                outcome = .failed
-            }
-            self.readiness.finishMutation(writerLease, outcome: outcome)
+            self.readiness.finishMutation(
+                writerLease,
+                outcome: Self.cssMutationOutcome(
+                    succeeded: succeeded,
+                    cancelled: Task.isCancelled
+                )
+            )
+        }
+    }
+
+    /// Maps a CSS settings mutation's apply result to a readiness outcome. A
+    /// cancelled mutation is a supersession — a newer settings change or a
+    /// teardown replaced it — so it releases its lease cleanly and the document
+    /// stays command-ready; only a genuine, non-cancelled apply failure revokes
+    /// it. Success takes precedence over a late cancellation. Mirrors the
+    /// extract-and-pin shape of `readinessGateDisposition`.
+    static func cssMutationOutcome(
+        succeeded: Bool,
+        cancelled: Bool
+    ) -> EPUBSpreadReadiness.MutationOutcome {
+        if succeeded {
+            return .succeeded
+        } else if cancelled {
+            return .superseded
+        } else {
+            return .failed
         }
     }
 

@@ -215,4 +215,39 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             .failed
         )
     }
+
+    // MARK: - CSS settings mutation outcome
+
+    func testSucceededCSSMutationSucceeds() {
+        XCTAssertEqual(
+            EPUBSpreadView.cssMutationOutcome(succeeded: true, cancelled: false),
+            .succeeded
+        )
+    }
+
+    func testCancelledCSSMutationIsSupersededNotFailed() {
+        // A cancelled CSS mutation was replaced by a newer settings change or a
+        // teardown; releasing it as superseded keeps the document command-ready
+        // rather than revoking it as a genuine failure would.
+        XCTAssertEqual(
+            EPUBSpreadView.cssMutationOutcome(succeeded: false, cancelled: true),
+            .superseded
+        )
+    }
+
+    func testFailedCSSMutationFails() {
+        XCTAssertEqual(
+            EPUBSpreadView.cssMutationOutcome(succeeded: false, cancelled: false),
+            .failed
+        )
+    }
+
+    func testSucceededCSSMutationWinsOverLateCancellation() {
+        // A write that completed before cancellation landed is a success, not a
+        // supersession — the DOM already carries the new CSS.
+        XCTAssertEqual(
+            EPUBSpreadView.cssMutationOutcome(succeeded: true, cancelled: true),
+            .succeeded
+        )
+    }
 }
