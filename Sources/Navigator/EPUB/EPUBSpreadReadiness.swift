@@ -64,18 +64,18 @@ final class EPUBSpreadReadiness {
     static let initializationStabilityBudgetMilliseconds = 5000
 
     static func makeInitializationStabilityDeadline(
-        clock: ContinuousClock = ContinuousClock()
+        clock: EPUBMonotonicClock = .continuous
     ) -> ContinuousClock.Instant {
-        clock.now.advanced(by: .milliseconds(
+        clock.now().advanced(by: .milliseconds(
             initializationStabilityBudgetMilliseconds
         ))
     }
 
     static func remainingInitializationStabilityMilliseconds(
         until deadline: ContinuousClock.Instant,
-        clock: ContinuousClock = ContinuousClock()
+        clock: EPUBMonotonicClock = .continuous
     ) -> Int {
-        let remaining = clock.now.duration(to: deadline)
+        let remaining = clock.now().duration(to: deadline)
         guard remaining > .zero else { return 0 }
 
         let components = remaining.components
@@ -151,7 +151,14 @@ final class EPUBSpreadReadiness {
 
     private var activeWriterLeaseIDs: Set<UUID> = []
     private var initializingFrameCapability: EPUBSpreadFrameCapability?
+    /// The monotonic source every bounded wait below sleeps on. Injected so a test
+    /// can drive a readiness deadline without waiting out the real budget.
+    private let clock: EPUBMonotonicClock
     private var waiters: [UUID: Waiter] = [:]
+
+    init(clock: EPUBMonotonicClock = .continuous) {
+        self.clock = clock
+    }
 
     var generation: Generation {
         state.generation
@@ -438,9 +445,10 @@ final class EPUBSpreadReadiness {
                 guard let self else { return .cancelled }
                 return await self.waitForCommandReadiness(for: generation)
             }
+            let clock = self.clock
             group.addTask {
                 do {
-                    try await ContinuousClock().sleep(until: deadline)
+                    try await clock.sleep(deadline)
                     return .timedOut
                 } catch {
                     return .cancelled

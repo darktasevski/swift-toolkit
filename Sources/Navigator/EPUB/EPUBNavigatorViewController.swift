@@ -915,7 +915,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // the wall-clock cost of a landing can no longer grow with the number of
         // resources it passes through.
         let deadline = EPUBLocatorOperationDeadline(
-            startingAt: ContinuousClock().now,
+            startingAt: locatorClock.now(),
             budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
         )
         guard
@@ -1083,7 +1083,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // Bounded by the SMALLER of this rung's own cap and what is left of the
         // operation: the per-rung cap still limits a single stuck readiness wait,
         // but it can no longer extend a landing past the operation deadline.
-        let readinessCap = ContinuousClock().now.advanced(
+        let readinessCap = locatorClock.now().advanced(
             by: EPUBSpreadReadiness.commandReadinessBudget
         )
         let outcome = await spreadView.readiness.waitForCommandReadiness(
@@ -1171,6 +1171,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Serializes rapid locator requests with latest-request-wins semantics.
     private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
+    /// The single monotonic source this authority mints deadlines from, measures
+    /// remaining budget against, and sleeps on. One seam rather than a
+    /// `ContinuousClock()` read per rung: scattered reads are individually correct
+    /// but collectively unsubstitutable, so nothing below could be driven to its
+    /// deadline in a test without waiting out the real budget.
+    let locatorClock: EPUBMonotonicClock = .continuous
 
     /// The command bridge whose navigation is currently suspended in
     /// JavaScript. A superseding request's cancellation relay reads this to
@@ -1865,9 +1872,10 @@ public extension EPUBNavigatorViewController {
         // HANG rather than a failure: no assertion message, no diagnostic, the whole run
         // dies. Racing a deadline converts that into an ordinary `false`.
         let deadline = EPUBLocatorOperationDeadline(
-            startingAt: ContinuousClock().now,
+            startingAt: locatorClock.now(),
             budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
         )
+        let clock = locatorClock
         return await withTaskGroup(of: Bool.self) { group in
             group.addTask { @MainActor in
                 guard case .ready = await spreadView.readiness.waitForCommandReadiness(
@@ -1878,7 +1886,7 @@ public extension EPUBNavigatorViewController {
                 return true
             }
             group.addTask {
-                try? await ContinuousClock().sleep(until: deadline.expiresAt)
+                try? await clock.sleep(deadline.expiresAt)
                 return false
             }
             let result = await group.next() ?? false

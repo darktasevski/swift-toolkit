@@ -196,6 +196,13 @@ enum EPUBLocatorCommandReason: String, Sendable {
     case internalError
     case invalidResult
     case webKitFailure
+    /// The script call never returned before the operation's deadline elapsed —
+    /// a wedged page main thread or a content process that stopped servicing the
+    /// world without reporting termination. Distinct from `webKitFailure` (the
+    /// call returned an error) and from `paintTimeout` (the script ran and gave
+    /// up waiting for a frame): only this one means no script outcome exists.
+    /// Native-only; the JavaScript side cannot produce it, by definition.
+    case commandUnresponsive
 }
 
 struct EPUBLocatorCommandResult: Sendable {
@@ -299,6 +306,10 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     }()
 
     private let publicationBaseURL: AbsoluteURL
+    /// The monotonic source for the remaining-budget read and for the watchdog that
+    /// bounds `callAsyncJavaScript`. Injected so a test can drive a command to its
+    /// deadline without waiting out the real budget.
+    private let clock: EPUBMonotonicClock
     private let webViewInstanceID = UUID().uuidString
     private var registry: EPUBLocatorFrameRegistry
     private var framesByID: [String: StoredFrame] = [:]
@@ -317,8 +328,13 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private var isMessageHandlerEnabled = false
     var onDecorationActivated: ((Any) -> Void)?
 
-    init(layout: EPUBLocatorFrameLayout, publicationBaseURL: AbsoluteURL) {
+    init(
+        layout: EPUBLocatorFrameLayout,
+        publicationBaseURL: AbsoluteURL,
+        clock: EPUBMonotonicClock = .continuous
+    ) {
         self.publicationBaseURL = publicationBaseURL
+        self.clock = clock
         registry = EPUBLocatorFrameRegistry(layout: layout)
         super.init()
     }
@@ -452,7 +468,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     ) async -> EPUBLocatorCommandResult {
         let token = nextToken(
             for: .navigation,
-            budgetMilliseconds: deadline.remainingMilliseconds(at: ContinuousClock().now)
+            budgetMilliseconds: deadline.remainingMilliseconds(at: clock.now())
         )
 
         guard !Task.isCancelled else {
@@ -516,22 +532,46 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             }
         }
 
-        let rawResult: Any?
+        // The command's own budget lives inside the script, which cannot enforce it
+        // while the page is not running it. The watchdog is what makes the operation
+        // deadline true at this boundary: it abandons a call that never returns
+        // instead of suspending on it forever. Decoding happens inside the guarded
+        // body because a task-group-free race can only carry a `Sendable` value out,
+        // and `Any?` is not one.
+        let decoded: EPUBLocatorCommandResult
         do {
-            rawResult = try await webView.callAsyncJavaScript(
-                Self.commandScript,
-                arguments: ["command": command, "token": token.javascriptValue],
-                in: storedFrame.info,
-                contentWorld: Self.contentWorld
-            )
+            decoded = try await EPUBLocatorCommandWatchdog.run(
+                until: deadline,
+                clock: clock
+            ) {
+                let rawResult = try await webView.callAsyncJavaScript(
+                    Self.commandScript,
+                    arguments: ["command": command, "token": token.javascriptValue],
+                    in: storedFrame.info,
+                    contentWorld: Self.contentWorld
+                )
+                return Self.decodeResult(rawResult, expectedToken: token)
+            }
         } catch {
-            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .webKitFailure)
+            // Cancellation and receipt currency outrank every failure classification:
+            // a superseded or torn-down command reports `.cancelled`, never a miss
+            // invented from how its abandoned call happened to fail.
+            guard !Task.isCancelled, isCurrent(token), !(error is CancellationError) else {
+                return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
+            }
+            return EPUBLocatorCommandResult(
+                token: token,
+                outcome: .miss,
+                reason: error is EPUBLocatorCommandWatchdog.Expired
+                    ? .commandUnresponsive
+                    : .webKitFailure
+            )
         }
 
         guard !Task.isCancelled, isCurrent(token) else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
-        return Self.decodeResult(rawResult, expectedToken: token)
+        return decoded
     }
 
     /// Positively cancels the navigation command currently suspended inside
