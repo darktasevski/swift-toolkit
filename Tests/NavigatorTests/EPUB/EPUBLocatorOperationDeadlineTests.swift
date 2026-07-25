@@ -59,6 +59,32 @@ final class EPUBLocatorOperationDeadlineTests: XCTestCase {
         XCTAssertTrue(deadline.hasExpired(at: base.advanced(by: .milliseconds(250))))
     }
 
+    /// Rungs that keep their own settle cap (layout stability, scroll position) must
+    /// observe the EARLIER of that cap and the operation deadline. Taking the earlier of
+    /// the two is what makes a rung's cap unable to extend an operation: it can only ever
+    /// shorten one.
+    func testARungCapIsTakenOnlyWhenItExpiresBeforeTheOperationDoes() {
+        let deadline = EPUBLocatorOperationDeadline(startingAt: base, budget: .milliseconds(5000))
+        let earlyRungCap = base.advanced(by: .milliseconds(1000))
+        XCTAssertEqual(deadline.effectiveDeadline(cappedBy: earlyRungCap), earlyRungCap)
+    }
+
+    func testAnOperationDeadlineOverridesARungCapThatWouldOutliveIt() {
+        let deadline = EPUBLocatorOperationDeadline(startingAt: base, budget: .milliseconds(300))
+        let lateRungCap = base.advanced(by: .milliseconds(1000))
+        XCTAssertEqual(deadline.effectiveDeadline(cappedBy: lateRungCap), deadline.expiresAt)
+    }
+
+    /// The case the page turn actually hits: earlier rungs ran long, so the operation is
+    /// nearly spent and a full fresh settle cap must NOT be granted.
+    func testANearlySpentOperationDoesNotGrantAFreshRungCap() {
+        let deadline = EPUBLocatorOperationDeadline(startingAt: base, budget: .milliseconds(5000))
+        let now = base.advanced(by: .milliseconds(4800))
+        let rungCap = now.advanced(by: .seconds(1))
+        XCTAssertEqual(deadline.effectiveDeadline(cappedBy: rungCap), deadline.expiresAt)
+        XCTAssertEqual(deadline.remainingMilliseconds(at: now), 200)
+    }
+
     /// Sub-millisecond remainders must not round UP into a budget the operation no longer
     /// has; truncation toward zero keeps the deadline an upper bound at every rung.
     func testSubMillisecondRemaindersTruncateRatherThanRoundUp() {

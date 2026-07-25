@@ -692,22 +692,40 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return .failed
         }
 
+        // One deadline for the whole page turn, spent by BOTH settle rungs. Each
+        // previously minted its own allowance, so a slow layout settle bought the
+        // scroll-position wait a fresh second rather than eating into a shared
+        // budget. Taking the earlier of this and each rung's own cap can only
+        // tighten a turn, never extend one.
+        let settleDeadline = EPUBLocatorOperationDeadline(
+            startingAt: ContinuousClock().now,
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
         let settlement = Task { @MainActor [weak self] in
             guard let self else { return false }
             if turn.animated {
                 await scrollAnimationCoordinator.waitUntilSettled()
             }
-            guard await waitForLayoutStability() else { return false }
-            return await waitForScrollPosition(targetX)
+            guard await waitForLayoutStability(until: settleDeadline.expiresAt) else {
+                return false
+            }
+            return await waitForScrollPosition(targetX, until: settleDeadline)
         }
         let didSettle = await settlement.value
         guard didSettle else { return .failed }
         return Task.isCancelled ? .cancelled : .succeeded
     }
 
-    private func waitForScrollPosition(_ targetX: CGFloat) async -> Bool {
+    /// - Parameter operationDeadline: the page turn's single deadline. This rung is
+    ///   bounded by the EARLIER of its own settle cap and what remains of the turn, so
+    ///   it can no longer re-arm a full second after the rungs above it ran long.
+    private func waitForScrollPosition(
+        _ targetX: CGFloat,
+        until operationDeadline: EPUBLocatorOperationDeadline
+    ) async -> Bool {
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(1))
+        let settleCap = clock.now.advanced(by: .seconds(1))
+        let deadline = operationDeadline.effectiveDeadline(cappedBy: settleCap)
         while clock.now < deadline {
             if abs(scrollView.contentOffset.x - targetX) <= 1 {
                 return true

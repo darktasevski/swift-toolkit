@@ -1088,7 +1088,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
         let outcome = await spreadView.readiness.waitForCommandReadiness(
             for: generation,
-            until: min(readinessCap, deadline.expiresAt)
+            until: deadline.effectiveDeadline(cappedBy: readinessCap)
         )
         let targetIsCurrent = self.paginationView === paginationView
             && paginationView.currentIndex == index

@@ -32,6 +32,19 @@ struct EPUBLocatorOperationDeadline: Equatable, Sendable {
         now >= expiresAt
     }
 
+    /// The instant a rung that keeps its own settle cap must actually stop at.
+    ///
+    /// Some rungs legitimately bound themselves more tightly than the operation does — a
+    /// layout settle or a scroll-position poll should give up long before the whole
+    /// operation is spent. Those caps stay, but they are only ever allowed to SHORTEN the
+    /// operation: taking the earlier of the two means a rung whose cap would outlive the
+    /// operation cannot re-arm a fresh allowance after the rungs above it ran long.
+    func effectiveDeadline(
+        cappedBy rungCap: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant {
+        min(rungCap, expiresAt)
+    }
+
     /// What remains, in whole milliseconds, clamped to zero.
     ///
     /// Truncates toward zero rather than rounding, so a sub-millisecond remainder can
