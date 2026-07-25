@@ -986,11 +986,20 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// without a fresh load. Asserting the case is what pins that distinction:
     /// it goes red if a failure path reverts to invalidating the generation.
     ///
-    /// The `currentFrameCapability` assertion cannot fail independently while
-    /// that property maps `.failed` to nil — it is deliberate redundancy across
-    /// files, so a later change that let a failed generation keep its capability
-    /// (making a delayed frame registrable against the retired document) is
-    /// caught here rather than only at the state case these sites now pin.
+    /// Neither projection can fail independently today: `isCommandReady` and
+    /// `currentFrameCapability` are both switches over the same `state`, and
+    /// both return the negative for `.failed`. Letting a failed generation keep
+    /// its capability would take two coordinated edits — that property's
+    /// `.failed` arm AND `fail(ifCurrent:)`, which already clears the field. So
+    /// they are defense in depth and a legible failure message, not independent
+    /// catches; do not cite them as proof the capability is separately checked.
+    ///
+    /// Known weaker than the contract: matching `.failed` without its
+    /// generation lets a regression that invalidated-then-failed (landing
+    /// `.failed(generation + 1)`) pass, while `fail(ifCurrent:)` promises the
+    /// identity is unchanged. Pinning the expected generation here is tracked
+    /// rather than done, because four of the five call sites must first capture
+    /// the generation before the act that fails.
     private func assertCommandCapabilityRevoked(
         in spreadView: EPUBSpreadView,
         _ message: String,
