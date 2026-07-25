@@ -438,13 +438,24 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         guard let webView else {
             return
         }
+        // Bounded even though nothing awaits it: a wedged page would otherwise retain
+        // this task — and through it the bridge and the capability — for the process
+        // lifetime, once per document.
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: clock.now(),
+            budget: .milliseconds(Self.totalCommandDeadlineMilliseconds)
+        )
+        // Captured by value so the task retains no reference to the bridge.
+        let injectionClock = clock
         Task { @MainActor in
-            _ = try? await webView.callAsyncJavaScript(
-                Self.acceptFrameCapabilityScript,
-                arguments: ["capability": capability.id.uuidString],
-                in: nil,
-                contentWorld: Self.contentWorld
-            )
+            _ = try? await EPUBLocatorCommandWatchdog.run(until: deadline, clock: injectionClock) {
+                _ = try await webView.callAsyncJavaScript(
+                    Self.acceptFrameCapabilityScript,
+                    arguments: ["capability": capability.id.uuidString],
+                    in: nil,
+                    contentWorld: Self.contentWorld
+                )
+            }
         }
     }
 
@@ -553,19 +564,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                 return Self.decodeResult(rawResult, expectedToken: token)
             }
         } catch {
-            // Cancellation and receipt currency outrank every failure classification:
-            // a superseded or torn-down command reports `.cancelled`, never a miss
-            // invented from how its abandoned call happened to fail.
-            guard !Task.isCancelled, isCurrent(token), !(error is CancellationError) else {
-                return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
-            }
-            return EPUBLocatorCommandResult(
-                token: token,
-                outcome: .miss,
-                reason: error is EPUBLocatorCommandWatchdog.Expired
-                    ? .commandUnresponsive
-                    : .webKitFailure
-            )
+            return Self.failure(for: error, token: token, isCurrent: isCurrent(token))
         }
 
         guard !Task.isCancelled, isCurrent(token) else {
@@ -581,25 +580,44 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// unwinds to `cancelled` promptly instead of after its frame timeout. A
     /// detached frame (the round-trip throws) means the predecessor is already
     /// being torn down, so there is nothing to cancel.
-    func cancelInFlightNavigation() async {
+    ///
+    /// - Parameter deadline: bounds the relay itself. The successor awaits this
+    ///   round-trip BEFORE its own bounded predecessor acknowledgement, so an
+    ///   unbounded relay into a wedged page would stall the successor indefinitely —
+    ///   the acknowledgement bound below it cannot help, because the wait that
+    ///   precedes it never returns.
+    func cancelInFlightNavigation(deadline: EPUBLocatorOperationDeadline) async {
         guard let inFlight = inFlightNavigation, let webView else {
             return
         }
-        _ = try? await webView.callAsyncJavaScript(
-            Self.invalidateScript,
-            arguments: ["token": inFlight.token.javascriptValue],
-            in: inFlight.frame,
-            contentWorld: Self.contentWorld
-        )
+        _ = try? await EPUBLocatorCommandWatchdog.run(until: deadline, clock: clock) {
+            _ = try await webView.callAsyncJavaScript(
+                Self.invalidateScript,
+                arguments: ["token": inFlight.token.javascriptValue],
+                in: inFlight.frame,
+                contentWorld: Self.contentWorld
+            )
+        }
     }
 
+    /// - Parameter deadline: the deadline of the enclosing decoration operation —
+    ///   one apply/rollback transaction, or one replay sweep — NOT of this single
+    ///   resource. A decoration operation spans every affected resource, so minting
+    ///   per command made the operation's worst case the per-command budget times
+    ///   the number of preloaded resources it touched, and doubled again by
+    ///   rollback. Sharing one deadline is what bounds the transaction itself.
     func replaceDecorations(
         _ decorations: [EPUBDecorationCommandItem],
         in groupID: String,
         targetHREF: AnyURL,
-        activable: Bool
+        activable: Bool,
+        deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
-        let token = nextToken(for: .decoration, groupID: groupID)
+        let token = nextToken(
+            for: .decoration,
+            groupID: groupID,
+            budgetMilliseconds: deadline.remainingMilliseconds(at: clock.now())
+        )
 
         guard !Task.isCancelled else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
@@ -677,22 +695,28 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             "decorations": decorations.map(\.javascriptValue),
             "activable": activable,
         ]
-        let rawResult: Any?
+        let decoded: EPUBLocatorCommandResult
         do {
-            rawResult = try await webView.callAsyncJavaScript(
-                Self.commandScript,
-                arguments: ["command": command, "token": token.javascriptValue],
-                in: storedFrame.info,
-                contentWorld: Self.contentWorld
-            )
+            decoded = try await EPUBLocatorCommandWatchdog.run(
+                until: deadline,
+                clock: clock
+            ) {
+                let rawResult = try await webView.callAsyncJavaScript(
+                    Self.commandScript,
+                    arguments: ["command": command, "token": token.javascriptValue],
+                    in: storedFrame.info,
+                    contentWorld: Self.contentWorld
+                )
+                return Self.decodeResult(rawResult, expectedToken: token)
+            }
         } catch {
-            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .webKitFailure)
+            return Self.failure(for: error, token: token, isCurrent: isCurrent(token))
         }
 
         guard !Task.isCancelled, isCurrent(token) else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
-        let result = Self.decodeResult(rawResult, expectedToken: token)
+        let result = decoded
         if result.outcome == .applied {
             let key = DecorationActivationStateKey(frameID: selectedID, groupID: groupID)
             if activable {
@@ -707,12 +731,20 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         return result
     }
 
+    /// - Parameter deadline: the deadline of the enclosing uniqueness check. Owned by
+    ///   the caller for the same reason navigation's is: the check is one step of a
+    ///   larger operation (a citation landing that then decorates), and a step that
+    ///   mints its own allowance is a step that can re-arm a spent budget.
     func validateUniqueTextMatch(
         locatorJSON: String,
         targetHREF: AnyURL,
-        cssSelector: String?
+        cssSelector: String?,
+        deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
-        let token = nextToken(for: .validation)
+        let token = nextToken(
+            for: .validation,
+            budgetMilliseconds: deadline.remainingMilliseconds(at: clock.now())
+        )
 
         guard !Task.isCancelled else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
@@ -764,24 +796,37 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         if let cssSelector {
             command["cssSelector"] = cssSelector
         }
-        let rawResult: Any?
+        let decoded: EPUBLocatorCommandResult
         do {
-            rawResult = try await webView.callAsyncJavaScript(
-                Self.commandScript,
-                arguments: ["command": command, "token": token.javascriptValue],
-                in: storedFrame.info,
-                contentWorld: Self.contentWorld
-            )
+            decoded = try await EPUBLocatorCommandWatchdog.run(
+                until: deadline,
+                clock: clock
+            ) {
+                let rawResult = try await webView.callAsyncJavaScript(
+                    Self.commandScript,
+                    arguments: ["command": command, "token": token.javascriptValue],
+                    in: storedFrame.info,
+                    contentWorld: Self.contentWorld
+                )
+                return Self.decodeResult(rawResult, expectedToken: token)
+            }
         } catch {
-            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .webKitFailure)
+            return Self.failure(for: error, token: token, isCurrent: isCurrent(token))
         }
         guard !Task.isCancelled, isCurrent(token) else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
-        return Self.decodeResult(rawResult, expectedToken: token)
+        return decoded
     }
 
-    func visibleText(targetHREF: AnyURL, maximumLength: Int) async -> String? {
+    /// - Parameter deadline: bounds the extraction. A read has no token to supersede
+    ///   and no outcome to classify, so without a deadline a wedged page would suspend
+    ///   the caller indefinitely on a call that reports nothing either way.
+    func visibleText(
+        targetHREF: AnyURL,
+        maximumLength: Int,
+        deadline: EPUBLocatorOperationDeadline
+    ) async -> String? {
         guard
             (1 ... 4096).contains(maximumLength),
             let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
@@ -803,40 +848,69 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         else {
             return nil
         }
-        let rawValue: Any?
+        let text: String?
         do {
-            rawValue = try await webView.callAsyncJavaScript(
-                Self.visibleTextScript,
-                arguments: ["maximumLength": maximumLength],
-                in: storedFrame.info,
-                contentWorld: Self.contentWorld
-            )
+            text = try await EPUBLocatorCommandWatchdog.run(
+                until: deadline,
+                clock: clock
+            ) {
+                let rawValue = try await webView.callAsyncJavaScript(
+                    Self.visibleTextScript,
+                    arguments: ["maximumLength": maximumLength],
+                    in: storedFrame.info,
+                    contentWorld: Self.contentWorld
+                )
+                return rawValue as? String
+            }
         } catch {
             return nil
         }
-        guard let text = rawValue as? String, text.utf16.count <= maximumLength else {
+        guard let text, text.utf16.count <= maximumLength else {
             return nil
         }
         return text
     }
 
-    /// Remaining budget handed to a command whose caller has not yet supplied an
-    /// operation-wide deadline, taken from the frozen
-    /// `locatorNavigationBudgets.totalCommandDeadlineMilliseconds`.
+    /// The budget one whole operation gets, taken from the frozen
+    /// `locatorNavigationBudgets.totalCommandDeadlineMilliseconds` and pinned across
+    /// manifest, Swift, and script by `check-locator-command-budget-agreement.sh`.
     ///
-    /// The NAVIGATION path no longer reaches this: `navigate` takes a required
-    /// `deadline`, which `performLocatorNavigation` mints once at operation start
-    /// and spends across the hop, page identity, readiness, and the command
-    /// itself. This default now serves only the decoration and validation
-    /// commands, whose callers do not yet own a deadline — so for those two a
-    /// caller spanning several commands still restarts the budget per command.
-    /// Giving them caller-owned deadlines is the remaining half of the contract.
+    /// It is the budget of an OPERATION, not of a command: a navigation spends it
+    /// across the cross-resource hop, page identity, readiness, and the bridge run; a
+    /// decoration transaction spends it across every affected resource plus rollback;
+    /// a replay sweep spends it across the whole sweep. Every command path now takes
+    /// its deadline from its caller, so no operation's cost can grow with the number
+    /// of resources it happens to touch.
     static let totalCommandDeadlineMilliseconds = 5000
+
+    /// The single place a failed command call is classified, so the precedence
+    /// cannot drift between the command paths.
+    ///
+    /// Cancellation and receipt currency outrank every other classification: a
+    /// superseded or torn-down command reports `.cancelled`, never a miss invented
+    /// from how its abandoned call happened to fail. Below that, a call that never
+    /// returned (`Expired`) stays distinct from one that returned an error.
+    private static func failure(
+        for error: any Error,
+        token: EPUBLocatorCommandToken,
+        isCurrent: Bool
+    ) -> EPUBLocatorCommandResult {
+        guard !Task.isCancelled, isCurrent, !(error is CancellationError) else {
+            return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
+        }
+        return EPUBLocatorCommandResult(
+            token: token,
+            outcome: .miss,
+            reason: error is EPUBLocatorCommandWatchdog.Expired
+                ? .commandUnresponsive
+                : .webKitFailure
+        )
+    }
 
     private func nextToken(
         for operationKind: EPUBLocatorCommandOperationKind,
         groupID: String? = nil,
-        budgetMilliseconds: Int = EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds
+        budgetMilliseconds: Int
     ) -> EPUBLocatorCommandToken {
         let key = CommandSequenceKey(operationKind: operationKind, groupID: groupID)
         let sequence = (latestSequences[key] ?? 0) + 1

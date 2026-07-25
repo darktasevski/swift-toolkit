@@ -1032,7 +1032,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let result = await spreadView.locatorCommandBridge.validateUniqueTextMatch(
             locatorJSON: locatorJSON,
             targetHREF: locator.href,
-            cssSelector: cssSelector
+            cssSelector: cssSelector,
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            )
         )
         return result.outcome == .applied
     }
@@ -1050,7 +1054,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let targetHREF = currentLocation?.href ?? spreadView.spread.first.link.url()
         return await spreadView.locatorCommandBridge.visibleText(
             targetHREF: targetHREF,
-            maximumLength: maximumLength
+            maximumLength: maximumLength,
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            )
         )
     }
 
@@ -1190,7 +1198,27 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// JavaScript navigation so it acknowledges promptly. A no-op when no
     /// navigation is in flight.
     private func cancelInFlightLocatorNavigation() async {
-        await inFlightLocatorBridge?.cancelInFlightNavigation()
+        guard let bridge = inFlightLocatorBridge else {
+            return
+        }
+        // Bounded by the supersession backstop rather than a command budget: this
+        // relay exists to make the predecessor acknowledge promptly, and the
+        // successor is already only willing to wait that long for it.
+        await bridge.cancelInFlightNavigation(
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: EPUBLocatorNavigationTaskQueue.predecessorAcknowledgementBudget
+            )
+        )
+    }
+
+    /// The deadline for one whole decoration operation — an apply/rollback
+    /// transaction, or a replay sweep — rather than one per affected resource.
+    private func makeDecorationOperationDeadline() -> EPUBLocatorOperationDeadline {
+        EPUBLocatorOperationDeadline(
+            startingAt: locatorClock.now(),
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
     }
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
@@ -1243,6 +1271,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     .commandItems(styles: decorationTemplates)
             }
 
+            // ONE deadline for the whole transaction — apply across every affected
+            // resource plus any rollback — rather than one per resource. Minting per
+            // command made a transaction's worst case the per-command budget times the
+            // number of preloaded resources it touched, doubled again by rollback, with
+            // no relationship to the frozen total.
+            let deadline = self.makeDecorationOperationDeadline()
             let resourceTransaction = DecorationApplyResourceTransaction(resources: affectedHREFs)
             let didApply = await resourceTransaction.run(
                 apply: { href in
@@ -1265,7 +1299,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         items,
                         in: group,
                         targetHREF: href,
-                        activable: activable
+                        activable: activable,
+                        deadline: deadline
                     )
                     guard result.outcome == .applied else {
                         self.log(.warning, "Decoration command rejected reason=\(result.reason.rawValue)")
@@ -1293,7 +1328,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                         items,
                         in: group,
                         targetHREF: href,
-                        activable: activable
+                        activable: activable,
+                        deadline: deadline
                     )
                     guard result.outcome == .applied else {
                         self.log(.warning, "Decoration rollback rejected reason=\(result.reason.rawValue)")
@@ -1320,6 +1356,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 await self.initialized()
 
                 guard let paginationView = self.paginationView else { return }
+                // One deadline for the whole sweep: it spans every loaded spread and
+                // every reading-order index within each, so a per-command budget would
+                // scale the sweep's cost with the preload window.
+                let deadline = self.makeDecorationOperationDeadline()
                 let committed = self.decorations[group] ?? []
                 for (_, view) in paginationView.loadedViews {
                     guard let spreadView = view as? EPUBSpreadView else { continue }
@@ -1339,7 +1379,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                                 items,
                                 in: group,
                                 targetHREF: href,
-                                activable: true
+                                activable: true,
+                                deadline: deadline
                             )
                         }
                     }
@@ -1571,6 +1612,8 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         for group in Array(decorations.keys) {
             await decorationApplyTaskQueue.replay(in: group) { [weak self, weak spreadView] in
                 guard let self, let spreadView else { return }
+                // One deadline for this spread's whole replay, across all its links.
+                let deadline = self.makeDecorationOperationDeadline()
                 let committed = self.decorations[group] ?? []
                 for link in links {
                     let href = link.url()
@@ -1584,7 +1627,8 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
                         items,
                         in: group,
                         targetHREF: href,
-                        activable: !(self.decorationCallbacks[group] ?? []).isEmpty
+                        activable: !(self.decorationCallbacks[group] ?? []).isEmpty,
+                        deadline: deadline
                     )
                     if result.outcome != .applied {
                         self.log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
