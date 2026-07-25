@@ -1479,7 +1479,7 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
         invalidatePaginationView()
     }
 
-    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope) {
+    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, applyCSSSettings script: String) {
         Task {
             await initialized()
 
@@ -1487,31 +1487,13 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
                 return
             }
 
-            switch scope {
-            case .currentResource:
-                await (paginationView.currentView as? EPUBSpreadView)?.evaluateScript(script)
-
-            case .loadedResources:
-                await withTaskGroup(of: Void.self) { tasks in
-                    for (_, view) in paginationView.loadedViews {
-                        tasks.addTask {
-                            await (view as? EPUBSpreadView)?.evaluateScript(script)
-                        }
-                    }
-                }
-
-            case let .resource(href):
-                for (_, view) in paginationView.loadedViews {
-                    guard
-                        let view = view as? EPUBSpreadView,
-                        let index = readingOrder.firstIndexWithHREF(href),
-                        view.spread.contains(index: index)
-                    else {
-                        continue
-                    }
-                    await view.evaluateScript(script, inHREF: href)
-                    return
-                }
+            // Each spread runs the CSS change as its own generation-bound,
+            // latest-wins mutation. The call is fire-and-forget here: the spread
+            // holds a readiness lease for the duration, so any subsequent
+            // command awaits the reflow through the authority — there is nothing
+            // for the fan-out to await.
+            for (_, view) in paginationView.loadedViews {
+                (view as? EPUBSpreadView)?.applyCSSSettings(script)
             }
         }
     }

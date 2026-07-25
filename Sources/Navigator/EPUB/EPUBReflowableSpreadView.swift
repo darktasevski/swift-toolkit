@@ -194,6 +194,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         updateContentInset()
     }
 
+    override func applyCSSScript(_ script: String) async -> Bool {
+        guard case .success = await evaluateDocumentScript(script) else {
+            return false
+        }
+        // Reflowable content repaginates on a CSS settings change; hold command
+        // readiness until the reflow settles so a following command lands on the
+        // new geometry.
+        return await waitForLayoutStability()
+    }
+
     private func updateContentInset() {
         let contentInset = delegate?.spreadViewContentInset(self) ?? .zero
         let configuration = ContentInsetConfiguration(
@@ -430,12 +440,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         if !readiness.isCommandReady, activePositionCommand == nil {
             guard !Task.isCancelled else { return .cancelled }
             let generation = readiness.generation
-            switch await readiness.waitForCommandReadiness(for: generation) {
-            case .ready:
+            switch await Self.readinessGateDisposition(
+                for: readiness.waitForCommandReadiness(for: generation)
+            ) {
+            case .proceed:
                 guard !Task.isCancelled else { return .cancelled }
             case .cancelled:
                 return .cancelled
-            case .documentAvailable, .invalidated, .timedOut, .failed:
+            case .failed:
                 return .failed
             }
         }
@@ -484,6 +496,16 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         activePositionCommand?.ownership.isSupersessionAcknowledged = true
     }
 
+    override func cancelInFlightCommandForUserInteraction() {
+        // The user grabbed the page: acknowledge the active command as
+        // superseded so it releases its lease cleanly (the document stays
+        // command-ready at the user's new spot rather than failing), then cancel
+        // it. The command surfaces `.cancelled`, so no fallback scroll fights
+        // the gesture. Idle when nothing is in flight.
+        acknowledgeCommandSupersession()
+        activePositionCommand?.task.cancel()
+    }
+
     override func go(
         to location: PageLocation,
         animated: Bool
@@ -514,12 +536,14 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
         guard readiness.isCommandReady || activePositionCommand != nil else {
             let generation = readiness.generation
-            switch await readiness.waitForCommandReadiness(for: generation) {
-            case .ready:
+            switch await Self.readinessGateDisposition(
+                for: readiness.waitForCommandReadiness(for: generation)
+            ) {
+            case .proceed:
                 return Task.isCancelled ? .cancelled : .succeeded
             case .cancelled:
                 return .cancelled
-            case .documentAvailable, .invalidated, .timedOut, .failed:
+            case .failed:
                 return .failed
             }
         }

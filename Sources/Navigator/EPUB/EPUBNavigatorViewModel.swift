@@ -9,15 +9,13 @@ import ReadiumShared
 import UIKit
 
 protocol EPUBNavigatorViewModelDelegate: AnyObject {
-    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope)
+    /// Applies a runtime CSS settings change (font family, theme, font size,
+    /// publisher styles) to every loaded spread. Each spread runs it as a
+    /// generation-bound, latest-wins same-document mutation so it participates
+    /// in the readiness authority rather than racing an in-flight command.
+    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, applyCSSSettings script: String)
     func epubNavigatorViewModelInvalidatePaginationView(_ viewModel: EPUBNavigatorViewModel)
     func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, didFailToLoadResourceAt href: RelativeURL, withError error: ReadError)
-}
-
-enum EPUBScriptScope {
-    case currentResource
-    case loadedResources
-    case resource(href: AnyURL)
 }
 
 @MainActor final class EPUBNavigatorViewModel: Loggable {
@@ -444,34 +442,40 @@ enum EPUBScriptScope {
     }
 
     private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {
-        var properties: [String: String?] = [:]
         let rsProperties = new.rsProperties.cssProperties()
-        if previous.rsProperties.cssProperties() != rsProperties {
-            for (k, v) in rsProperties {
-                properties[k] = v
-            }
-        }
         let userProperties = new.userProperties.cssProperties()
-        if previous.userProperties.cssProperties() != userProperties {
-            for (k, v) in userProperties {
-                properties[k] = v
-            }
+        let changed = previous.rsProperties.cssProperties() != rsProperties
+            || previous.userProperties.cssProperties() != userProperties
+        guard changed else {
+            return
         }
-        if !properties.isEmpty {
-            guard
-                let data = try? JSONSerialization.data(withJSONObject: properties),
-                let json = String(data: data, encoding: .utf8)
-            else {
-                log(.error, "Failed to serialize CSS properties to JSON")
-                return
-            }
 
-            delegate?.epubNavigatorViewModel(
-                self,
-                runScript: "readium.setCSSProperties(\(json));",
-                in: .loadedResources
-            )
+        // Send the FULL current property set, not just the changed bucket. The
+        // spread applies this as a newest-wins coalesced mutation: a later
+        // settings change that supersedes an in-flight one must carry every
+        // property, or the earlier change's properties would be dropped from the
+        // live DOM (they were only ever queued, never written). An absolute
+        // snapshot makes the coalescing sound.
+        var properties: [String: String?] = [:]
+        for (key, value) in rsProperties {
+            properties[key] = value
         }
+        for (key, value) in userProperties {
+            properties[key] = value
+        }
+
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: properties),
+            let json = String(data: data, encoding: .utf8)
+        else {
+            log(.error, "Failed to serialize CSS properties to JSON")
+            return
+        }
+
+        delegate?.epubNavigatorViewModel(
+            self,
+            applyCSSSettings: "readium.setCSSProperties(\(json));"
+        )
     }
 
     // MARK: - Accessibility

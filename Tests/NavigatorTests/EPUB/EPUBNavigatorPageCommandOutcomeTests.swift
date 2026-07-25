@@ -154,4 +154,65 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             .cancelled
         )
     }
+
+    // MARK: - Spread-level readiness gate disposition
+
+    func testReadyReadinessGateProceeds() {
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(
+                for: .ready(
+                    generation: 3,
+                    frameCapability: EPUBSpreadFrameCapability()
+                )
+            ),
+            .proceed
+        )
+    }
+
+    func testCancelledReadinessGateIsCancelled() {
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(for: .cancelled),
+            .cancelled
+        )
+    }
+
+    func testInvalidatedReadinessGateIsCancelledNotFailed() {
+        // A stale-lifecycle `.invalidated` — the generation advanced under the
+        // wait via teardown, reload, or replacement — is an interruption, not a
+        // hard failure. Surfacing it as `.cancelled` (mirroring the
+        // controller-level `readySpreadNavigationDisposition`) keeps a caller's
+        // progression / cross-resource fallback from fighting the new document.
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(for: .invalidated),
+            .cancelled
+        )
+    }
+
+    func testFailedReadinessGateFails() {
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(
+                for: .failed(generation: 5)
+            ),
+            .failed
+        )
+    }
+
+    func testTimedOutReadinessGateFails() {
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(for: .timedOut),
+            .failed
+        )
+    }
+
+    func testDocumentAvailableReadinessGateFails() {
+        // A command-readiness gate never expects a bare document-availability
+        // resolution; treat the unexpected outcome as a hard failure rather
+        // than silently proceeding to write geometry.
+        XCTAssertEqual(
+            EPUBSpreadView.readinessGateDisposition(
+                for: .documentAvailable(generation: 2)
+            ),
+            .failed
+        )
+    }
 }

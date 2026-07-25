@@ -390,12 +390,14 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         // Fixed layout resources are always fully visible so we don't use the
         // location.
         let generation = readiness.generation
-        switch await readiness.waitForCommandReadiness(for: generation) {
-        case .ready:
+        switch await Self.readinessGateDisposition(
+            for: readiness.waitForCommandReadiness(for: generation)
+        ) {
+        case .proceed:
             return .succeeded
         case .cancelled:
             return .cancelled
-        case .documentAvailable, .invalidated, .timedOut, .failed:
+        case .failed:
             return .failed
         }
     }

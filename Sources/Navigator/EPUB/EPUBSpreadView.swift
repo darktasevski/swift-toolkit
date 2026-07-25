@@ -80,6 +80,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     let readiness = EPUBSpreadReadiness()
     private var spreadLoadTask: Task<Void, Never>?
 
+    /// Latest runtime CSS settings, replayed newest-wins if a rapid sequence
+    /// (e.g. a font-size slider drag) arrives while one apply is in flight.
+    /// `nil` is the never-applied initial value.
+    private let pendingCSSMutation = EPUBLatestMutation<String?>(initialValue: nil)
+    private var cssMutationTask: Task<Void, Never>?
+
     private struct MainFrameNavigationRecord {
         let navigation: WKNavigation
         let generation: EPUBSpreadReadiness.Generation
@@ -163,6 +169,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        cssMutationTask?.cancel()
+        cssMutationTask = nil
         readiness.invalidate()
 
         // Revoke the frame capability and drop all frame registration so a
@@ -648,6 +656,79 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         assert(Thread.isMainThread, "User settings must be updated from the main thread")
     }
 
+    /// Applies a runtime CSS settings change (font family, theme, font size,
+    /// publisher styles) as a generation-bound, latest-wins same-document
+    /// mutation. Acquiring a position writer transitions the spread
+    /// ready → initializing → ready in a new generation, so an in-flight precise
+    /// landing is superseded rather than racing the reflow, and any later
+    /// command awaits the settle through command readiness. Rapid changes
+    /// coalesce newest-wins — the view model sends the FULL property snapshot,
+    /// so coalescing never drops an earlier change's properties.
+    ///
+    /// A spread that is still loading applies the change once it publishes
+    /// command readiness (its load generation resolves to `.ready` unchanged),
+    /// so an offscreen neighbor mid-load is not left on stale CSS. A terminal or
+    /// replaced document (a reload, invalidation, or failure supersedes it)
+    /// drops out.
+    func applyCSSSettings(_ script: String) {
+        pendingCSSMutation.update(script)
+        let predecessor = cssMutationTask
+        predecessor?.cancel()
+        cssMutationTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+
+            if !self.readiness.isCommandReady {
+                guard case .ready = await self.readiness.waitForCommandReadiness(
+                    for: self.readiness.generation
+                ) else {
+                    return
+                }
+            }
+            guard
+                !Task.isCancelled,
+                let writerLease = self.readiness.acquirePositionWriter()
+            else {
+                return
+            }
+
+            let succeeded = await self.pendingCSSMutation.applyLatest { latest in
+                guard let latest else { return true }
+                return await self.applyCSSScript(latest)
+            }
+            let outcome: EPUBSpreadReadiness.MutationOutcome
+            if succeeded {
+                outcome = .succeeded
+            } else if Task.isCancelled {
+                outcome = .superseded
+            } else {
+                outcome = .failed
+            }
+            self.readiness.finishMutation(writerLease, outcome: outcome)
+        }
+    }
+
+    /// Applies the CSS settings script into the live document, returning whether
+    /// it succeeded. The reflowable spread overrides this to also await the
+    /// resulting layout reflow, so command readiness is not republished until
+    /// the new geometry settles. Fixed-layout content does not reflow on these
+    /// properties, so the base implementation returns as soon as the write
+    /// lands.
+    func applyCSSScript(_ script: String) async -> Bool {
+        guard case .success = await evaluateDocumentScript(script) else {
+            return false
+        }
+        return true
+    }
+
+    /// A user drag takes over positioning; any in-flight precise navigation or
+    /// page-turn command must yield so no programmatic scroll fights the
+    /// gesture. Overridden by the reflowable spread, whose position commands
+    /// scroll. Fixed-layout content is fully visible and runs no scrolling
+    /// command (its only user gesture is zoom, which moves no command), so the
+    /// base is a no-op.
+    func cancelInFlightCommandForUserInteraction() {}
+
     // MARK: - Location and progression.
 
     /// Current progression in the resource with given href.
@@ -677,6 +758,39 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         case boundary
         case failed
         case cancelled
+    }
+
+    /// Pure disposition for a spread-level readiness gate — a `go`/page-turn
+    /// that awaits command readiness before writing geometry.
+    enum ReadinessGateDisposition: Equatable {
+        /// The document is command-ready; the caller may write geometry.
+        case proceed
+        /// The wait was interrupted: caller cancellation, or a stale-lifecycle
+        /// `.invalidated` (the generation advanced under the wait via teardown,
+        /// reload, or replacement). The caller must NOT run a fallback.
+        case cancelled
+        /// A genuine, non-lifecycle failure.
+        case failed
+    }
+
+    /// Maps a command-readiness wait outcome to a gate disposition. A
+    /// stale-lifecycle `.invalidated` maps to `.cancelled`, NOT `.failed`, so a
+    /// caller's progression / cross-resource fallback never fights a reader
+    /// interruption (teardown, reload, replacement). This mirrors the
+    /// controller-level `readySpreadNavigationDisposition`; keeping the two
+    /// layers in agreement is the point. A genuine `.failed`, a `.timedOut`, or
+    /// an unexpected `.documentAvailable` at a command gate stays a failure.
+    static func readinessGateDisposition(
+        for outcome: EPUBSpreadReadiness.WaitOutcome
+    ) -> ReadinessGateDisposition {
+        switch outcome {
+        case .ready:
+            return .proceed
+        case .cancelled, .invalidated:
+            return .cancelled
+        case .documentAvailable, .timedOut, .failed:
+            return .failed
+        }
     }
 
     func go(
@@ -947,6 +1061,7 @@ extension EPUBSpreadView: UIScrollViewDelegate {
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         webView.clearSelection()
+        cancelInFlightCommandForUserInteraction()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
