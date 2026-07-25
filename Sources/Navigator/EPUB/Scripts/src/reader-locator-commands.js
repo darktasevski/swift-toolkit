@@ -22,7 +22,12 @@ const TOKEN_KEYS = new Set([
   "operationKind",
   "sequence",
   "groupID",
+  "budgetMilliseconds",
 ]);
+// Upper bound on the injected remaining budget. The budget is minted by the
+// native side from one absolute monotonic deadline, so this is a validation
+// ceiling against a malformed/hostile value, not a policy timeout.
+const MAX_BUDGET_MILLISECONDS = 600000;
 const LOCATOR_KEYS = new Set(["href", "type", "title", "locations", "text"]);
 const LOCATION_KEYS = new Set([
   "fragments",
@@ -412,11 +417,20 @@ function validateToken(value) {
   if ("groupID" in value) {
     requireString(value.groupID, LIMITS.hrefOrTitleUTF16);
   }
+  // The remaining budget is REQUIRED: it is the JavaScript end of the single
+  // absolute deadline the native side mints at operation start. Accepting a
+  // token without it would silently restore the unbounded, reset-per-rung
+  // behaviour this replaces, so a missing budget is a rejected token.
+  requireNonnegativeInteger(value.budgetMilliseconds);
+  if (value.budgetMilliseconds > MAX_BUDGET_MILLISECONDS) {
+    reject("invalidToken");
+  }
   return {
     webViewInstanceID,
     documentEpoch: value.documentEpoch,
     operationKind,
     sequence: value.sequence,
+    budgetMilliseconds: value.budgetMilliseconds,
     ...(value.groupID === undefined ? {} : { groupID: value.groupID }),
   };
 }
@@ -992,8 +1006,22 @@ function scrollToRange(range, animated) {
   return true;
 }
 
-function nextFrame(token, signal) {
+// `deadlineAt` is an absolute `performance.now()` instant derived ONCE per
+// command from the native side's monotonic deadline. Each frame wait is bounded
+// by whatever remains of it, never by a fresh per-frame allowance — so a
+// starved rAF can no longer multiply a per-rung timeout across the viewport,
+// offset-settle, and correction rungs and overrun the total command budget.
+function nextFrame(token, signal, deadlineAt) {
   return new Promise((resolve) => {
+    const remaining = deadlineAt - performance.now();
+    if (!(remaining > 0)) {
+      // Budget already spent (or a non-finite deadline): terminal now, before
+      // any timer/rAF/listener is registered, so there is nothing to tear down.
+      // Resolving here is what stops an exhausted command from buying one more
+      // frame at every remaining rung.
+      resolve("timeout");
+      return;
+    }
     let settled = false;
     let frameID = 0;
     const finish = (status) => {
@@ -1013,7 +1041,7 @@ function nextFrame(token, signal) {
     const onAbort = () => finish("stale");
     const timeoutID = scheduleTimeout(
       () => finish("timeout"),
-      FRAME_DEADLINE_MILLISECONDS
+      Math.min(FRAME_DEADLINE_MILLISECONDS, remaining)
     );
     if (signal) {
       if (signal.aborted) {
@@ -1397,7 +1425,7 @@ function frameChainVerdict(localSubRect) {
 // viewport before any viewport-relative work runs. Returns "usable",
 // "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
 // never arrived), or "stale".
-async function awaitUsableViewport(token, signal) {
+async function awaitUsableViewport(token, signal, deadlineAt) {
   for (let frame = 0; frame <= VIEWPORT_READY_FRAMES; frame += 1) {
     const viewport = effectiveRootViewportSize();
     if (viewport.width > 0 && viewport.height > 0) {
@@ -1409,7 +1437,7 @@ async function awaitUsableViewport(token, signal) {
     if (signal?.aborted || !isCurrent(token)) {
       return "stale";
     }
-    const frameStatus = await nextFrame(token, signal);
+    const frameStatus = await nextFrame(token, signal, deadlineAt);
     if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
@@ -1417,7 +1445,7 @@ async function awaitUsableViewport(token, signal) {
   return "notReady";
 }
 
-async function awaitOffsetStability(token, maximumFrames, signal) {
+async function awaitOffsetStability(token, maximumFrames, signal, deadlineAt) {
   let previousX = globalThis.scrollX;
   let previousY = globalThis.scrollY;
   let stableFrames = 0;
@@ -1425,7 +1453,7 @@ async function awaitOffsetStability(token, maximumFrames, signal) {
     if (signal?.aborted || !isCurrent(token)) {
       return "stale";
     }
-    const frameStatus = await nextFrame(token, signal);
+    const frameStatus = await nextFrame(token, signal, deadlineAt);
     if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
@@ -1527,8 +1555,15 @@ function verifyEffectiveVisibility(locator) {
 // the caller's single smooth animation when requested), then re-resolves and verifies
 // the target is actually visible — correcting, at most twice and always without
 // animation, if a late reflow moved it after the offset settled.
-async function landAndVerify(locator, initialRange, token, animated, signal) {
-  const viewportStatus = await awaitUsableViewport(token, signal);
+async function landAndVerify(
+  locator,
+  initialRange,
+  token,
+  animated,
+  signal,
+  deadlineAt
+) {
+  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt);
   if (viewportStatus === "stale") {
     return { status: "cancelled" };
   }
@@ -1552,7 +1587,8 @@ async function landAndVerify(locator, initialRange, token, animated, signal) {
   let settleOutcome = await awaitOffsetStability(
     token,
     animated ? 120 : 2,
-    signal
+    signal,
+    deadlineAt
   );
   for (
     let correction = 0;
@@ -1589,13 +1625,14 @@ async function landAndVerify(locator, initialRange, token, animated, signal) {
     settleOutcome = await awaitOffsetStability(
       token,
       CORRECTION_SETTLE_FRAMES,
-      signal
+      signal,
+      deadlineAt
     );
   }
   return { status: "miss", reason: "rangeNotVisible" };
 }
 
-async function navigateLocator(command, token, signal) {
+async function navigateLocator(command, token, signal, deadlineAt) {
   requireOnlyKeys(command, NAVIGATE_KEYS);
   if (
     command.kind !== "navigateLocator" ||
@@ -1617,7 +1654,7 @@ async function navigateLocator(command, token, signal) {
   if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const preScrollFrame = await nextFrame(token, signal);
+  const preScrollFrame = await nextFrame(token, signal, deadlineAt);
   if (preScrollFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
@@ -1629,7 +1666,8 @@ async function navigateLocator(command, token, signal) {
     range,
     token,
     command.animated,
-    signal
+    signal,
+    deadlineAt
   );
   if (landing.status === "cancelled") {
     return commandResult(token, "cancelled", "staleToken");
@@ -1640,7 +1678,7 @@ async function navigateLocator(command, token, signal) {
   return commandResult(token, "applied", "none");
 }
 
-async function replaceDecorationGroup(command, token, signal) {
+async function replaceDecorationGroup(command, token, signal, deadlineAt) {
   const value = validateReplaceDecorations(command, token);
   if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
@@ -1658,7 +1696,7 @@ async function replaceDecorationGroup(command, token, signal) {
     return commandResult(token, "miss", "invalidField");
   }
 
-  const prePaintFrame = await nextFrame(token, signal);
+  const prePaintFrame = await nextFrame(token, signal, deadlineAt);
   if (prePaintFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
@@ -1678,7 +1716,7 @@ async function replaceDecorationGroup(command, token, signal) {
   decorationGroups.set(value.groupID, state);
 
   for (let frame = 0; frame < 2; frame += 1) {
-    const paintFrame = await nextFrame(token, signal);
+    const paintFrame = await nextFrame(token, signal, deadlineAt);
     if (paintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
       if (decorationGroups.get(value.groupID) === state) {
         restoreDecorationGroup(value.groupID, previous);
@@ -1710,17 +1748,28 @@ async function execute(commandValue, tokenValue) {
     key = tokenKey(token);
     controller = new AbortController();
     inFlightCommands.set(key, { sequence: token.sequence, controller });
+    // The ONE absolute deadline for this command, converted from the remaining
+    // budget the native side derived from its own monotonic deadline at
+    // operation start. Everything downstream reads what is LEFT of this instant;
+    // nothing re-derives, extends, or resets it per frame, resource, or rung.
+    const deadlineAt = performance.now() + token.budgetMilliseconds;
     if (!isObject(commandValue)) {
       reject("invalidCommand");
     }
     switch (commandValue.kind) {
       case "navigateLocator":
-        return await navigateLocator(commandValue, token, controller.signal);
+        return await navigateLocator(
+          commandValue,
+          token,
+          controller.signal,
+          deadlineAt
+        );
       case "replaceDecorationGroup":
         return await replaceDecorationGroup(
           commandValue,
           token,
-          controller.signal
+          controller.signal,
+          deadlineAt
         );
       case "validateUniqueTextMatch":
         return await validateUniqueTextMatch(

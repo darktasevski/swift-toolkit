@@ -121,6 +121,18 @@ struct EPUBLocatorCommandToken: Equatable, Sendable {
     let operationKind: EPUBLocatorCommandOperationKind
     let sequence: Int
     let groupID: String?
+    /// What remains of the ONE absolute monotonic deadline minted at operation
+    /// start, in milliseconds. The script converts this to a `performance.now()`
+    /// instant once and bounds every wait by what is left of it, so a starved
+    /// frame callback can no longer multiply a per-rung allowance across the
+    /// viewport, offset-settle, and correction rungs. It is injected rather than
+    /// hardcoded in JavaScript for two reasons: the deadline belongs to the whole
+    /// operation (which begins on the native side, before any script runs), and a
+    /// JavaScript-internal constant would be untestable — the only tier that can
+    /// observe the script is the shipping-bundle suite, whose visible-window host
+    /// lets frames fire normally so an internal deadline could never be driven to
+    /// expiry.
+    let budgetMilliseconds: Int
 
     var javascriptValue: [String: Any] {
         var value: [String: Any] = [
@@ -128,6 +140,7 @@ struct EPUBLocatorCommandToken: Equatable, Sendable {
             "documentEpoch": documentEpoch,
             "operationKind": operationKind.rawValue,
             "sequence": sequence,
+            "budgetMilliseconds": budgetMilliseconds,
         ]
         if let groupID {
             value["groupID"] = groupID
@@ -759,9 +772,22 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         return text
     }
 
+    /// Remaining budget handed to a command whose caller has not yet supplied an
+    /// operation-wide deadline, taken from the frozen
+    /// `locatorNavigationBudgets.totalCommandDeadlineMilliseconds`.
+    ///
+    /// This is the per-command floor of the contract, not its finished form: a
+    /// caller that spans several commands (a cross-resource hop followed by its
+    /// landing) must mint ONE deadline at operation start and pass the remainder
+    /// into each command, otherwise the budget still restarts per resource.
+    /// Threading that caller-owned deadline down from the navigator and the
+    /// navigation queue is the remaining half of the single-deadline contract.
+    static let totalCommandDeadlineMilliseconds = 5000
+
     private func nextToken(
         for operationKind: EPUBLocatorCommandOperationKind,
-        groupID: String? = nil
+        groupID: String? = nil,
+        budgetMilliseconds: Int = EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds
     ) -> EPUBLocatorCommandToken {
         let key = CommandSequenceKey(operationKind: operationKind, groupID: groupID)
         let sequence = (latestSequences[key] ?? 0) + 1
@@ -771,7 +797,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             documentEpoch: documentEpoch,
             operationKind: operationKind,
             sequence: sequence,
-            groupID: groupID
+            groupID: groupID,
+            budgetMilliseconds: max(0, budgetMilliseconds)
         )
     }
 
@@ -950,7 +977,12 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             documentEpoch: documentEpoch,
             operationKind: operationKind,
             sequence: sequence,
-            groupID: groupID
+            groupID: groupID,
+            // The script echoes the normalized token verbatim, so the budget
+            // round-trips. Decoding it keeps an echoed token `==` to the minted
+            // one; defaulting it would silently break that equality and with it
+            // the relay's token-identity guards.
+            budgetMilliseconds: exactInteger(value["budgetMilliseconds"]) ?? 0
         )
     }
 
