@@ -68,10 +68,13 @@ const decorationGroups = new Map();
 // an in-flight command that cooperative sequence-polling (`isCurrent`) would
 // otherwise never notice (a caller cancellation with no successor bumps no
 // sequence). The native bridge round-trip that CALLS `invalidate(token)` on
-// supersession/caller cancellation is a separate, still-pending step; until it
-// lands nothing invokes `invalidate` in production. Each `execute` registers its
-// controller synchronously before its first suspension so a relay `invalidate()`
-// issued in the next JS turn finds it.
+// supersession/caller cancellation is in place: the bridge records the in-flight
+// (token, frame) synchronously before `callAsyncJavaScript` and runs
+// `invalidate(token)` in that same stored frame and content world, and the
+// navigation queue fires that relay before awaiting its predecessor's bounded
+// acknowledgement. Each `execute` registers its controller synchronously before
+// its first suspension so a relay `invalidate()` issued in the next JS turn
+// finds it.
 const inFlightCommands = new Map();
 let documentIdentity = null;
 
