@@ -1816,4 +1816,34 @@ public extension EPUBNavigatorViewController {
         }
         return spreadView is EPUBFixedSpreadView
     }
+
+    /// Test-only: awaits the point at which the current spread's initialization
+    /// becomes idle — command readiness published for the LATEST generation of
+    /// the same frame document, with every generation-bound position/layout
+    /// writer released.
+    ///
+    /// A precise landing is only trustworthy if it survives the writers that
+    /// were still in flight when it returned. Because a same-document mutation
+    /// (a font/stylesheet settle, a pending progression apply, a relayout offset
+    /// correction) advances the generation while retaining the frame capability,
+    /// this follows the DOCUMENT rather than a fixed generation and resolves on
+    /// the last one to publish. That lets a test re-verify a landing's visibility
+    /// against a deterministic lifecycle gate instead of a sleep.
+    ///
+    /// Returns `false` when no spread is current, when the document holds no
+    /// capability, or when the document was replaced/invalidated before readiness
+    /// republished. Content-free: only a Boolean crosses the seam.
+    func awaitCurrentSpreadDocumentIdleForTesting() async -> Bool {
+        guard let spreadView = paginationView?.currentView as? EPUBSpreadView,
+              let capability = spreadView.readiness.currentFrameCapability
+        else {
+            return false
+        }
+        guard case .ready = await spreadView.readiness.waitForCommandReadiness(
+            forDocument: capability
+        ) else {
+            return false
+        }
+        return true
+    }
 }
