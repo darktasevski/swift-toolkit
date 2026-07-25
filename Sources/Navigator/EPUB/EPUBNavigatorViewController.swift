@@ -331,8 +331,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             switch state {
             case .initializing, .loading, .jumping, .moving:
                 paginationView?.isUserInteractionEnabled = false
+                _ = idleNotificationGate.setIdle(false)
             case .idle:
                 paginationView?.isUserInteractionEnabled = true
+                // Drain a request coalesced mid-navigation the instant we settle.
+                if idleNotificationGate.setIdle(true) {
+                    Task { @MainActor [weak self] in
+                        await self?.notifyCurrentLocation()
+                    }
+                }
             }
         }
     }
@@ -805,25 +812,33 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
 
-    private lazy var updateCurrentLocation = execute(
-        // If we're not in an `idle` state, we postpone the notification.
-        when: { [weak self] in self?.state == .idle },
-        pollingInterval: 0.1
-    ) { [weak self] in
-        guard let self = self else {
+    /// Postpones the location notification until the navigator settles into
+    /// its `idle` state. An edge-triggered gate coalesces requests made
+    /// mid-navigation and drains them on the `busy → idle` transition (see the
+    /// `state` observer) instead of polling every fixed interval.
+    private let idleNotificationGate = EPUBIdleNotificationGate(isIdle: false)
+
+    private func updateCurrentLocation() {
+        guard idleNotificationGate.request() else {
             return
         }
+        Task { @MainActor [weak self] in
+            await self?.notifyCurrentLocation()
+        }
+    }
 
+    private func notifyCurrentLocation() async {
         (currentLocation, viewport) = await computeCurrentLocationAndViewport()
 
-        if
+        guard
             let delegate = delegate,
             let location = currentLocation,
             location != notifiedCurrentLocation
-        {
-            notifiedCurrentLocation = location
-            delegate.navigator(self, locationDidChange: location)
+        else {
+            return
         }
+        notifiedCurrentLocation = location
+        delegate.navigator(self, locationDidChange: location)
     }
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
