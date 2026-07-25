@@ -909,6 +909,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         guard !Task.isCancelled else {
             return .cancelled
         }
+        // Operation start: the ONE deadline every rung below spends from — the
+        // cross-resource hop, page identity, command readiness, and the bridge
+        // command's own viewport/settle/correction waits. No rung re-mints it, so
+        // the wall-clock cost of a landing can no longer grow with the number of
+        // resources it passes through.
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: ContinuousClock().now,
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
         guard
             let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
             let decoded = try? Locator(json: payload.locator)
@@ -951,7 +960,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             case .cancelled:
                 return .cancelled
             }
-            switch await waitForReadySpread(at: spreadIndex) {
+            switch await waitForReadySpread(at: spreadIndex, deadline: deadline) {
             case let .ready(loaded):
                 spreadView = loaded
             case .miss:
@@ -983,7 +992,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             animated: Self.bridgeCommandAnimated(
                 requestedAnimated: animated,
                 didHopToResource: didHopToResource
-            )
+            ),
+            deadline: deadline
         )
         switch result.outcome {
         case .applied:
@@ -1050,7 +1060,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         case cancelled
     }
 
-    private func waitForReadySpread(at index: Int) async -> ReadySpreadWaitResult {
+    /// - Parameter deadline: the operation-wide deadline; this rung is bounded by the
+    ///   smaller of its own cap and what remains of it.
+    private func waitForReadySpread(
+        at index: Int,
+        deadline: EPUBLocatorOperationDeadline
+    ) async -> ReadySpreadWaitResult {
         guard
             let paginationView,
             paginationView.currentIndex == index
@@ -1065,11 +1080,15 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let generation = spreadView.readiness.generation
+        // Bounded by the SMALLER of this rung's own cap and what is left of the
+        // operation: the per-rung cap still limits a single stuck readiness wait,
+        // but it can no longer extend a landing past the operation deadline.
+        let readinessCap = ContinuousClock().now.advanced(
+            by: EPUBSpreadReadiness.commandReadinessBudget
+        )
         let outcome = await spreadView.readiness.waitForCommandReadiness(
             for: generation,
-            until: ContinuousClock().now.advanced(
-                by: EPUBSpreadReadiness.commandReadinessBudget
-            )
+            until: min(readinessCap, deadline.expiresAt)
         )
         let targetIsCurrent = self.paginationView === paginationView
             && paginationView.currentIndex == index

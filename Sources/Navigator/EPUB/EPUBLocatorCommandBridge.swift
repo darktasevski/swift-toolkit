@@ -440,12 +440,20 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         framesByID.count
     }
 
+    /// - Parameter deadline: the operation-wide deadline minted by the caller at
+    ///   operation start. The command spends what remains of it; it never mints its
+    ///   own, so a navigation that already hopped resources and waited for readiness
+    ///   arrives here with correspondingly less time rather than a fresh allowance.
     func navigate(
         locatorJSON: String,
         targetHREF: AnyURL,
-        animated: Bool
+        animated: Bool,
+        deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
-        let token = nextToken(for: .navigation)
+        let token = nextToken(
+            for: .navigation,
+            budgetMilliseconds: deadline.remainingMilliseconds(at: ContinuousClock().now)
+        )
 
         guard !Task.isCancelled else {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)

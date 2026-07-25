@@ -828,10 +828,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard let json = try? locator.jsonString() else {
             return .miss
         }
+        // A DISTINCT operation, not a rung of `performLocatorNavigation`: this is the
+        // spread's own anchor apply, reached through `go(to:animated:)` during spread
+        // setup, and no operation deadline exists above it to inherit. Minting here is
+        // therefore the operation start — not the per-rung re-arming the single-deadline
+        // contract forbids.
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: ContinuousClock().now,
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
         let result = await locatorCommandBridge.navigate(
             locatorJSON: json,
             targetHREF: viewModel.url(to: spread.first.link),
-            animated: animated
+            animated: animated,
+            deadline: deadline
         )
         return result.outcome
     }
