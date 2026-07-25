@@ -438,6 +438,67 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertEqual(failing.goCallCount, 1)
     }
 
+    /// The motivating case for decoupling the queue from the current page's
+    /// outcome: a user drag cancels the spread's in-flight position command,
+    /// which surfaces here as `.cancelled` with the generation untouched — so
+    /// unlike every `invalidateLoads` cancellation, it reaches the recursion.
+    func testCancelledCurrentPageCommandStillPreloadsNeighbor() async {
+        let cancelled = TestPageView(commandOutcome: .cancelled)
+        let neighbor = TestPageView()
+        let delegate = TestPaginationDelegate(pages: [0: cancelled, 1: neighbor])
+        let pagination = makePaginationView(preloadPositionCount: 1)
+        pagination.delegate = delegate
+
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+
+        await waitUntil { neighbor.goCallCount == 1 }
+        XCTAssertEqual(delegate.requestedIndices, [0, 1])
+        XCTAssertEqual(cancelled.goCallCount, 1)
+    }
+
+    /// The `.failed` twin of `testSupersededTargetReportsCancellationRatherThanFailure`:
+    /// classifying supersession as `.cancelled` must not swallow a genuinely
+    /// broken resource, whose `.failed` is what drives the consumer's `.miss`
+    /// fallback ladder.
+    func testMissingPageFactorySurfacesAsFailureThroughTheCommandStage() async {
+        let initial = TestPageView()
+        let delegate = TestPaginationDelegate(pages: [0: initial])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let outcome = await pagination.goToIndex(
+            1,
+            location: .start,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .failed)
+        XCTAssertEqual(delegate.requestedIndices, [0, 1])
+    }
+
+    /// `currentPageCommandEntryOutcome` classifies an out-of-bounds index as
+    /// supersession *because* callers bounds-validate first. Pin that premise
+    /// at its source, so relaxing this guard cannot silently turn a genuinely
+    /// invalid request into a silent `.cancelled`.
+    func testOutOfBoundsNavigationRequestIsAFailureNotSupersession() async {
+        let initial = TestPageView()
+        let delegate = TestPaginationDelegate(pages: [0: initial])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 1, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        let outcome = await pagination.goToIndex(
+            1,
+            location: .start,
+            options: NavigatorGoOptions(animated: false)
+        )
+
+        XCTAssertEqual(outcome, .failed)
+    }
+
     func testCurrentPageCommandEntryOutcomeProceedsForTheCurrentInBoundsPage() {
         XCTAssertNil(PaginationView.currentPageCommandEntryOutcome(
             index: 1,
@@ -471,6 +532,17 @@ final class PaginationViewCurrentPageTests: XCTestCase {
                 index: -1,
                 currentIndex: -1,
                 pageCount: 3
+            ),
+            .cancelled
+        )
+        // The pre-`reloadAtIndex` state, and the only input where the two
+        // clauses disagree: the index IS current, and only the bounds clause
+        // forces supersession.
+        XCTAssertEqual(
+            PaginationView.currentPageCommandEntryOutcome(
+                index: 0,
+                currentIndex: 0,
+                pageCount: 0
             ),
             .cancelled
         )
