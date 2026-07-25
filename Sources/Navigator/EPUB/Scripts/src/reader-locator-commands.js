@@ -986,24 +986,108 @@ function snapOffset(offset) {
   return value - (value % viewportWidth);
 }
 
-function scrollToRange(range, animated) {
+// `scrollend` is the platform's authoritative "this scroll, including any smooth
+// animation, has finished" signal. It is a BELT over the rAF offset poll below, never a
+// replacement, for two independent reasons: it does not exist on iOS 18 or pre-26.2
+// Safari, and the spec dispatches it ONLY when a scroll actually occurred — so a wait
+// that depended on it would hang forever on an already-visible target. The poll
+// therefore stays the deterministic bound in every case; the belt only lets a settled
+// scroll be recognized from the platform's own signal instead of inferred from two
+// consecutive equal frames.
+function supportsScrollEnd() {
+  return "onscrollend" in globalThis;
+}
+
+// Registers the belt for exactly one scroll. Returns null where the platform has no
+// `scrollend`, so the caller takes the pure rAF path with no listener to tear down.
+function observeScrollEnd() {
+  if (!supportsScrollEnd()) {
+    return null;
+  }
+  let fired = false;
+  const onScrollEnd = () => {
+    fired = true;
+  };
+  globalThis.addEventListener("scrollend", onScrollEnd, {
+    once: true,
+    passive: true,
+  });
+  return {
+    fired: () => fired,
+    dispose: () => globalThis.removeEventListener("scrollend", onScrollEnd),
+  };
+}
+
+// Returns "notScrollable" when the document has no scrolling element, "unchanged" when
+// the requested offset already equals the current one, and "requested" after writing.
+//
+// `armBelt` runs BEFORE the write and only for "requested". Before, because `scrollend`
+// is dispatched as a task and an instant scroll completes synchronously — registering
+// after the write races the event. Only for "requested", because the no-op case
+// produces no `scrollend` at all and must not leave a listener waiting on one. The
+// comparison is deliberately conservative: it skips only when the offset is PROVABLY
+// unchanged, so a clamped write still arms a belt that never fires, which costs
+// nothing because the offset poll remains the bound.
+function scrollToRange(range, animated, armBelt) {
   const rect = range.getBoundingClientRect();
   const scrollingElement = document.scrollingElement;
   if (!scrollingElement) {
-    return false;
+    return "notScrollable";
   }
-  if (isScrollModeEnabled() && !isVerticalWritingMode()) {
-    scrollingElement.scrollTo({
-      top: rect.top + globalThis.scrollY,
-      behavior: animated ? "smooth" : "instant",
-    });
-  } else {
-    scrollingElement.scrollTo({
-      left: snapOffset(rect.left + globalThis.scrollX),
-      behavior: animated ? "smooth" : "instant",
-    });
+  const scrollsVertically = isScrollModeEnabled() && !isVerticalWritingMode();
+  const target = scrollsVertically
+    ? rect.top + globalThis.scrollY
+    : snapOffset(rect.left + globalThis.scrollX);
+  const current = scrollsVertically
+    ? scrollingElement.scrollTop
+    : scrollingElement.scrollLeft;
+  if (target === current) {
+    return "unchanged";
   }
-  return true;
+  armBelt();
+  const behavior = animated ? "smooth" : "instant";
+  scrollingElement.scrollTo(
+    scrollsVertically ? { top: target, behavior } : { left: target, behavior }
+  );
+  return "requested";
+}
+
+// Issues one scroll and waits for it to settle. The belt is armed only for a scroll
+// that was actually requested and only where the platform provides `scrollend`, and is
+// released on EVERY exit — settled, timed out, cancelled, or thrown — so a listener can
+// never outlive the command that registered it and retain its token through the
+// closure.
+async function scrollAndSettle(
+  range,
+  animated,
+  token,
+  maximumFrames,
+  signal,
+  deadlineAt
+) {
+  let belt = null;
+  const outcome = scrollToRange(range, animated, () => {
+    belt = observeScrollEnd();
+  });
+  if (outcome === "notScrollable") {
+    return "notScrollable";
+  }
+  try {
+    if (!isCurrent(token)) {
+      return "stale";
+    }
+    return await awaitOffsetStability(
+      token,
+      maximumFrames,
+      signal,
+      deadlineAt,
+      belt
+    );
+  } finally {
+    if (belt) {
+      belt.dispose();
+    }
+  }
 }
 
 // `deadlineAt` is an absolute `performance.now()` instant derived ONCE per
@@ -1445,7 +1529,17 @@ async function awaitUsableViewport(token, signal, deadlineAt) {
   return "notReady";
 }
 
-async function awaitOffsetStability(token, maximumFrames, signal, deadlineAt) {
+// `belt`, when present, is a `scrollend` observer for the scroll this poll is waiting
+// on. It can only ever conclude EARLIER and more truthfully than two equal frames; the
+// frame loop still owns the bound, so a belt that never fires — an unsupported
+// platform, a clamped no-op write, an interrupted scroll — changes nothing.
+async function awaitOffsetStability(
+  token,
+  maximumFrames,
+  signal,
+  deadlineAt,
+  belt
+) {
   let previousX = globalThis.scrollX;
   let previousY = globalThis.scrollY;
   let stableFrames = 0;
@@ -1456,6 +1550,9 @@ async function awaitOffsetStability(token, maximumFrames, signal, deadlineAt) {
     const frameStatus = await nextFrame(token, signal, deadlineAt);
     if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
       return frameStatus === "timeout" ? "timeout" : "stale";
+    }
+    if (belt && belt.fired()) {
+      return "stable";
     }
     const currentX = globalThis.scrollX;
     const currentY = globalThis.scrollY;
@@ -1577,19 +1674,17 @@ async function landAndVerify(
   if (rangeSpanExceedsBudget(initialRange)) {
     return { status: "miss", reason: "rangeTooComplex" };
   }
-  if (!scrollToRange(initialRange, animated)) {
-    return { status: "miss", reason: "notScrollable" };
-  }
-  if (!isCurrent(token)) {
-    return { status: "cancelled" };
-  }
-
-  let settleOutcome = await awaitOffsetStability(
+  let settleOutcome = await scrollAndSettle(
+    initialRange,
+    animated,
     token,
     animated ? 120 : 2,
     signal,
     deadlineAt
   );
+  if (settleOutcome === "notScrollable") {
+    return { status: "miss", reason: "notScrollable" };
+  }
   for (
     let correction = 0;
     correction <= MAX_VISIBILITY_CORRECTIONS;
@@ -1616,18 +1711,17 @@ async function landAndVerify(
       return { status: "miss", reason: "rangeNotVisible" };
     }
 
-    if (!scrollToRange(verification.range, false)) {
-      return { status: "miss", reason: "notScrollable" };
-    }
-    if (!isCurrent(token)) {
-      return { status: "cancelled" };
-    }
-    settleOutcome = await awaitOffsetStability(
+    settleOutcome = await scrollAndSettle(
+      verification.range,
+      false,
       token,
       CORRECTION_SETTLE_FRAMES,
       signal,
       deadlineAt
     );
+    if (settleOutcome === "notScrollable") {
+      return { status: "miss", reason: "notScrollable" };
+    }
   }
   return { status: "miss", reason: "rangeNotVisible" };
 }
