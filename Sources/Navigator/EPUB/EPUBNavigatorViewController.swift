@@ -1277,14 +1277,31 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // number of preloaded resources it touched, doubled again by rollback, with
             // no relationship to the frozen total.
             let deadline = self.makeDecorationOperationDeadline()
+            // One readiness resolution per spread, shared by every HREF the
+            // transaction touches on it and by rollback. Several HREFs can be backed
+            // by ONE spread (a two-page fixed-layout spread is two), and re-deriving
+            // per HREF accepted whatever document occupied the spread at that moment
+            // — so a replacement mid-transaction let a later write land on a document
+            // the transaction never checked while the earlier writes were lost with
+            // the old one, and the transaction still committed as applied.
+            let writeGate = EPUBDecorationWriteGate()
             let resourceTransaction = DecorationApplyResourceTransaction(resources: affectedHREFs)
             let didApply = await resourceTransaction.run(
                 apply: { href in
-                    guard
-                        let spreadView = self.loadedSpreadViewForHREF(href),
-                        spreadView.isCommandReady
-                    else {
+                    guard let spreadView = self.loadedSpreadViewForHREF(href) else {
                         return true
+                    }
+                    switch writeGate.resolve(
+                        spread: ObjectIdentifier(spreadView),
+                        isCommandReady: spreadView.isCommandReady,
+                        currentCapability: spreadView.readiness.currentFrameCapability
+                    ) {
+                    case .skip:
+                        return true
+                    case .documentReplaced:
+                        return false
+                    case .write:
+                        break
                     }
                     guard let items = values(from: transaction.target, for: href) else {
                         self.log(.error, "Decoration command encoding failed")
@@ -1309,11 +1326,20 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                     return true
                 },
                 rollback: { href in
-                    guard
-                        let spreadView = self.loadedSpreadViewForHREF(href),
-                        spreadView.isCommandReady
-                    else {
+                    guard let spreadView = self.loadedSpreadViewForHREF(href) else {
                         return true
+                    }
+                    switch writeGate.resolve(
+                        spread: ObjectIdentifier(spreadView),
+                        isCommandReady: spreadView.isCommandReady,
+                        currentCapability: spreadView.readiness.currentFrameCapability
+                    ) {
+                    case .skip:
+                        return true
+                    case .documentReplaced:
+                        return false
+                    case .write:
+                        break
                     }
                     guard let items = values(from: source, for: href) else {
                         self.log(.error, "Decoration rollback encoding failed")
