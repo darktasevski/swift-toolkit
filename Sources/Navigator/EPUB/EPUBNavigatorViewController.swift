@@ -948,6 +948,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             // perceived landing — no chapter-top paint, no post-reveal slide).
             // The bridge run below stays the truthful landing authority.
             didHopToResource = true
+            // Publish the hop so the TARGET spread's stylesheet/font/geometry
+            // stabilization spends what is LEFT of this deadline rather than minting a
+            // fresh allowance of its own. The spread initializes on its own load event,
+            // so it pulls this back through the delegate instead of receiving it down
+            // the call stack. Scoped to the hop and identity-guarded on withdrawal: a
+            // preloaded neighbour loading in this window is not part of the operation,
+            // and a superseded predecessor unwinding here must not clear a successor's
+            // entry.
+            let hop = EPUBActiveLocatorOperation(
+                readingOrderIndex: readingOrderIndex,
+                deadline: deadline
+            )
+            activeLocatorOperationSlot.publish(hop)
+            defer { activeLocatorOperationSlot.clear(hop) }
+
             let resourceOutcome = await goToLocator(
                 locator,
                 options: NavigatorGoOptions(animated: animated)
@@ -1179,6 +1194,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Serializes rapid locator requests with latest-request-wins semantics.
     private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
+    /// The locator operation whose cross-resource hop is in flight, published for the
+    /// target spread to read back when it initializes. The hop's spread loads on its own
+    /// load event rather than from this call stack, so the deadline reaches it by pull.
+    private let activeLocatorOperationSlot = EPUBActiveLocatorOperationSlot()
 
     /// The single monotonic source this authority mints deadlines from, measures
     /// remaining budget against, and sleeps on. One seam rather than a
@@ -1629,6 +1649,12 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         }
 
         return insets
+    }
+
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline? {
+        activeLocatorOperationSlot.operationDeadline(for: spreadView.spread)
     }
 
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {

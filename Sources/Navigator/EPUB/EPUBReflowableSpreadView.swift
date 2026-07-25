@@ -282,7 +282,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
-        let stabilityDeadline = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let stabilityDeadline = resolveInitializationStabilityDeadline()
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
             guard case .success = await evaluateDocumentScript("readium.link = \(linkJSON);") else {
@@ -343,7 +343,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     /// Waits for every external stylesheet, fonts and a bounded run of stable
     /// animation frames. A caller-provided deadline lets all initialization
-    /// stages share one non-resetting budget.
+    /// stages share one non-resetting budget; callers with no deadline of their
+    /// own (a CSS settings change, a content-inset re-layout) fall back to a
+    /// budget that still inherits the operation's remainder when this spread is
+    /// a locator hop's target.
     private func waitForLayoutStability(
         until deadline: ContinuousClock.Instant? = nil
     ) async -> Bool {
@@ -352,7 +355,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return false
         }
 
-        let deadline = deadline ?? EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let deadline = deadline ?? resolveInitializationStabilityDeadline()
         let remainingMilliseconds = EPUBSpreadReadiness
             .remainingInitializationStabilityMilliseconds(until: deadline)
         guard remainingMilliseconds > 0 else { return false }

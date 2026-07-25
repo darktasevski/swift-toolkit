@@ -51,10 +51,28 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the IntersectionObserver in the spread reports a new anchor
     /// crossing the viewport top.
     func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String)
+
+    /// The deadline of the locator operation whose cross-resource hop this spread is
+    /// the target of, or nil for every other load.
+    ///
+    /// A pull rather than a push: a spread initializes on its own load event, not from
+    /// the call stack of the navigation that asked for it, so the operation's deadline
+    /// cannot be handed down to it. Asking at the point stabilization starts is what
+    /// lets a hop spend the operation's REMAINDER instead of minting a fresh allowance
+    /// on top of it.
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline?
 }
 
 extension EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String) {}
+
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline? {
+        nil
+    }
 }
 
 class EPUBSpreadView: UIView, Loggable, PageView {
@@ -605,6 +623,22 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// To be overriden to customize the behavior after the spread is loaded.
     func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
         .succeeded
+    }
+
+    /// The single instant this spread's stylesheet, font and geometry stabilization
+    /// must be finished by.
+    ///
+    /// When the load is a locator operation's cross-resource hop, this is the earlier
+    /// of the operation's remaining budget and the stage's own cap, so a landing costs
+    /// the operation's budget rather than that budget once per resource it passes
+    /// through. Every other load — an ordinary page turn, a settings re-layout, a
+    /// PRELOADED NEIGHBOUR initializing during someone else's operation — keeps its own
+    /// full allowance.
+    func resolveInitializationStabilityDeadline() -> ContinuousClock.Instant {
+        EPUBInitializationStabilityInheritance.resolve(
+            ownCap: EPUBSpreadReadiness.makeInitializationStabilityDeadline(),
+            inheritedFrom: delegate?.spreadViewLocatorOperationDeadline(self)
+        )
     }
 
     func showSpread() {

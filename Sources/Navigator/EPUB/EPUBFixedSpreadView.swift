@@ -202,7 +202,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             return false
         }
 
-        let deadline = deadline ?? EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let deadline = deadline ?? resolveInitializationStabilityDeadline()
         let remainingMilliseconds = EPUBSpreadReadiness
             .remainingInitializationStabilityMilliseconds(until: deadline)
         guard remainingMilliseconds > 0 else { return false }
@@ -299,7 +299,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         guard let layoutLease = readiness.acquireWriterLease(for: generation) else {
             return .failed
         }
-        let stabilityDeadline = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+        let stabilityDeadline = resolveInitializationStabilityDeadline()
         let succeeded = await applyLatestLayout(stabilityDeadline: stabilityDeadline)
         readiness.finishInitialization(
             layoutLease,
