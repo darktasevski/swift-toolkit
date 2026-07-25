@@ -387,6 +387,95 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertEqual(neighbor.landingCount, 1)
     }
 
+    func testSupersededTargetReportsCancellationRatherThanFailure() async {
+        let initial = TestPageView(blocksGo: true)
+        let replacement = TestPageView(blocksGo: true)
+        let delegate = TestPaginationDelegate(pages: [0: initial, 2: replacement])
+        let pagination = makePaginationView(preloadPositionCount: 0)
+        pagination.delegate = delegate
+        pagination.reloadAtIndex(0, location: .start, pageCount: 3, readingProgression: .ltr)
+        await waitUntil { initial.goCallCount == 1 }
+
+        // The replacement loader cannot install page 1 until the blocked
+        // predecessor acknowledges, so the navigation parks on the identity
+        // stage rather than on its page command.
+        let navigation = Task { @MainActor in
+            await pagination.goToIndex(
+                1,
+                location: .start,
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        await waitUntil { pagination.currentIndex == 1 }
+        for _ in 0 ..< 10 {
+            await Task.yield()
+        }
+        XCTAssertNil(pagination.loadedViews[1])
+
+        // A reload to another index supersedes the in-flight navigation
+        // without cancelling the caller's task: the identity waiter drains and
+        // the current index moves on before the caller reaches its command
+        // wait.
+        pagination.reloadAtIndex(2, location: .start, pageCount: 3, readingProgression: .ltr)
+        initial.finishGo()
+
+        let outcome = await navigation.value
+        XCTAssertEqual(outcome, .cancelled)
+        replacement.finishGo()
+    }
+
+    func testNonSucceedingCurrentPageCommandStillPreloadsNeighbor() async {
+        let failing = TestPageView(commandOutcome: .failed)
+        let neighbor = TestPageView()
+        let delegate = TestPaginationDelegate(pages: [0: failing, 1: neighbor])
+        let pagination = makePaginationView(preloadPositionCount: 1)
+        pagination.delegate = delegate
+
+        pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
+
+        await waitUntil { neighbor.goCallCount == 1 }
+        XCTAssertEqual(delegate.requestedIndices, [0, 1])
+        XCTAssertEqual(failing.goCallCount, 1)
+    }
+
+    func testCurrentPageCommandEntryOutcomeProceedsForTheCurrentInBoundsPage() {
+        XCTAssertNil(PaginationView.currentPageCommandEntryOutcome(
+            index: 1,
+            currentIndex: 1,
+            pageCount: 3
+        ))
+    }
+
+    func testCurrentPageCommandEntryOutcomeCancelsAStaleIndex() {
+        XCTAssertEqual(
+            PaginationView.currentPageCommandEntryOutcome(
+                index: 1,
+                currentIndex: 2,
+                pageCount: 3
+            ),
+            .cancelled
+        )
+    }
+
+    func testCurrentPageCommandEntryOutcomeCancelsAnIndexAReloadPushedOutOfBounds() {
+        XCTAssertEqual(
+            PaginationView.currentPageCommandEntryOutcome(
+                index: 3,
+                currentIndex: 3,
+                pageCount: 3
+            ),
+            .cancelled
+        )
+        XCTAssertEqual(
+            PaginationView.currentPageCommandEntryOutcome(
+                index: -1,
+                currentIndex: -1,
+                pageCount: 3
+            ),
+            .cancelled
+        )
+    }
+
     private func makePaginationView(preloadPositionCount: Int = 1) -> PaginationView {
         PaginationView(
             frame: CGRect(x: 0, y: 0, width: 320, height: 480),

@@ -418,9 +418,13 @@ final class PaginationView: UIView, Loggable {
         scheduledPageLoads.remove(request.key)
         pageCommandOutcomes[request.key] = outcome
         resumePageCommandWaiters(with: outcome, for: request.key)
-        guard outcome == .succeeded else {
-            return
-        }
+        // Neighbor preloading is deliberately independent of this page's own
+        // outcome. A page that could not position itself (a broken resource)
+        // or whose command the user interrupted mid-drag says nothing about
+        // the other resources queued behind it, and stopping here would strand
+        // them until something else starts a new generation. Staleness — the
+        // only reason to abandon the queue — is re-checked on entry to every
+        // recursion.
         await loadNextPage(for: generation)
     }
 
@@ -533,12 +537,38 @@ final class PaginationView: UIView, Loggable {
         }
     }
 
+    /// Terminal outcome for a page-command wait whose target is no longer the
+    /// pagination's current page, or `nil` to proceed with the wait.
+    ///
+    /// Callers bounds-validate their index at `goToIndex`, so both stale forms
+    /// observable here — the current index moved on, or a concurrent reload
+    /// shrank the page count — are supersession by the reader's own newer
+    /// work, not a resolution failure inside the still-current generation.
+    /// Reporting `.failed` would map to `.miss` at the consumer seam and send
+    /// a fallback ladder chasing a navigation the reader already replaced.
+    /// The in-continuation staleness arm below classifies the same conditions
+    /// as `.cancelled`; this keeps the entry check symmetric with it.
+    static func currentPageCommandEntryOutcome(
+        index: Int,
+        currentIndex: Int,
+        pageCount: Int
+    ) -> PageCommandOutcome? {
+        guard index == currentIndex, 0 ..< pageCount ~= index else {
+            return .cancelled
+        }
+        return nil
+    }
+
     /// Suspends until the exact current page's positioning command completes
     /// for the active pagination generation. Neighbor preloading is not part
     /// of this completion stage.
     private func waitForCurrentPageCommand(at index: Int) async -> PageCommandOutcome {
-        guard index == currentIndex, 0 ..< pageCount ~= index else {
-            return .failed
+        if let outcome = Self.currentPageCommandEntryOutcome(
+            index: index,
+            currentIndex: currentIndex,
+            pageCount: pageCount
+        ) {
+            return outcome
         }
 
         let key = PageLoadKey(generation: loadGeneration, index: index)
