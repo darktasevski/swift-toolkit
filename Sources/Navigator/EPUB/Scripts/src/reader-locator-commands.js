@@ -1001,6 +1001,14 @@ function supportsScrollEnd() {
 // Registers the belt for exactly one scroll. Returns null where the platform has no
 // `scrollend`, so the caller takes the pure rAF path with no listener to tear down.
 //
+// Registered against the COMMAND's abort signal as well as disposed by its caller's
+// `finally`. The two are not redundant in the way they look: the caller's `finally`
+// is what releases the belt on the ordinary exits, while the signal makes `execute`'s
+// terminal `controller.abort()` the teardown point it documents itself to be — so a
+// later refactor that moves the belt out from under `scrollAndSettle`, or a document
+// invalidation that aborts mid-scroll, cannot leave the listener holding this
+// command's token through its closure.
+//
 // A `scrollend` reaching this window is NOT by itself proof that the scroll this belt
 // was armed for has finished. Two ways it can be someone else's: an event queued by the
 // PREVIOUS rung's scroll can be dispatched after that rung's belt was disposed and land
@@ -1010,7 +1018,7 @@ function supportsScrollEnd() {
 // of the two visibility corrections. So the belt latches only for an event observed at
 // an offset that has actually MOVED from where it was armed; the listener is not `once`,
 // so an early foreign event does not consume it and a later genuine one still lands.
-function observeScrollEnd() {
+function observeScrollEnd(signal) {
   if (!supportsScrollEnd()) {
     return null;
   }
@@ -1022,7 +1030,10 @@ function observeScrollEnd() {
       movedAndEnded = true;
     }
   };
-  globalThis.addEventListener("scrollend", onScrollEnd, { passive: true });
+  globalThis.addEventListener("scrollend", onScrollEnd, {
+    passive: true,
+    signal,
+  });
   return {
     fired: () => movedAndEnded,
     dispose: () => globalThis.removeEventListener("scrollend", onScrollEnd),
@@ -1082,7 +1093,7 @@ async function scrollAndSettle(
   // `finally` never entered.
   try {
     const outcome = scrollToRange(range, animated, () => {
-      belt = observeScrollEnd();
+      belt = observeScrollEnd(signal);
     });
     if (outcome === "notScrollable") {
       return "notScrollable";
@@ -1903,9 +1914,13 @@ async function execute(commandValue, tokenValue) {
     // Teardown on every terminal path (success, miss, cancellation, timeout,
     // document invalidation): abort the controller so any listener registered
     // with its signal is released, and clear our own registry entry. Per-await
-    // timers/rAF ids self-clean in their own `finish`; aborting here is the
-    // single teardown point future stylesheet/font/scrollend/visibility/pagehide
-    // listeners must register against.
+    // timers/rAF ids self-clean in their own `finish`, and the `scrollend` belt is
+    // both signal-registered and disposed by `scrollAndSettle`; this abort is the
+    // single teardown point any further listener must register against. Stylesheet
+    // and font readiness are deliberately NOT listeners — they are bounded polls in
+    // the spread view's own stability script — so there is nothing of theirs to
+    // release here, and the document-lifetime `pagehide`/`message` handlers below
+    // outlive every command by design.
     if (controller) {
       controller.abort();
     }
@@ -2099,8 +2114,24 @@ globalThis.addEventListener("message", (event) => {
 // currentFrameCapability on teardown (EPUBSpreadView.clear()); this is the
 // document-side half, covering a child self-navigation or reload the native
 // spread load never observes.
+//
+// It is also the DOCUMENT-INVALIDATION teardown trigger for in-flight commands,
+// alongside success, miss, cancellation and timeout. Such a command can never
+// complete: the layout it is landing on is about to stop existing, and a frozen
+// (bfcache) document runs neither the animation frames nor the timers every wait
+// is bounded by. Aborting here — synchronously, while the document is still
+// running script — unwinds each command through its own `finally`, releasing its
+// `scrollend` belt, timers and frame ids, and returns `cancelled` rather than
+// leaving the call abandoned until the native watchdog gives up at the far end of
+// the operation deadline. `cancelled`, not `miss`: this is a lifecycle
+// interruption, and a miss would send the consumer down its fallback rungs
+// fighting a navigation that no longer exists. Each command clears its own
+// registry entry as it unwinds, so this only fires the signal.
 globalThis.addEventListener("pagehide", () => {
   frameCapability = null;
+  for (const entry of inFlightCommands.values()) {
+    entry.controller.abort();
+  }
 });
 
 Object.defineProperty(globalThis, "readerLocatorCommands", {
