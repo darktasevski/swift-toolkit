@@ -355,29 +355,22 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     /// Called from the JS code when logging a message.
+    ///
+    /// The message itself is page-world text and is withheld; only the fact that
+    /// the bridge fired is reported.
     private func didLog(_ body: Any) {
-        guard let body = body as? String else {
-            return
-        }
-        log(.debug, "JavaScript: \(body)")
+        EPUBPageWorldLog.report(.javaScriptConsoleMessage, withholding: body)
     }
 
     /// Called from the JS code when logging an error.
+    ///
+    /// The script's own message, source filename and line are all page-world
+    /// values — the filename is a resource href — so none of them are reported.
+    /// Unlike the message it replaces, this fires for every delivered body: with
+    /// nothing extracted there is no shape left to reject, and an uncaught
+    /// script error should always leave a breadcrumb.
     private func didLogError(_ body: Any) {
-        guard let error = body as? [String: Any],
-              var message = error["message"] as? String
-        else {
-            return
-        }
-        message = "JavaScript: \(message)"
-
-        if let file = error["filename"] as? String, file != "/",
-           let line = error["line"] as? Int, line != 0
-        {
-            log(.error, message, file: file, line: line)
-        } else {
-            log(.error, message)
-        }
+        EPUBPageWorldLog.report(.javaScriptUncaughtError, withholding: body)
     }
 
     /// Called from the JS code when a tap is detected.
@@ -668,7 +661,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         else {
             focusedResource = nil
             delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
-            log(.warning, "Invalid body for selectionDidChange: \(body)")
+            EPUBPageWorldLog.report(.malformedSelectionBody, withholding: body)
             return
         }
 
@@ -677,7 +670,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         do {
             domRange = try DOMRange(json: JSONValue(selection["domRange"]))
         } catch {
-            log(.debug, "Failed to parse domRange: \(error)")
+            EPUBPageWorldLog.report(.malformedDOMRange, withholding: selection, error: error)
             domRange = nil
         }
 
@@ -947,7 +940,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let groupName = decoration["group"] as? String,
             var frame = CGRect(json: decoration["rect"])
         else {
-            log(.warning, "Invalid decoration activation body")
+            EPUBPageWorldLog.report(.malformedDecorationActivationBody, withholding: body)
             return
         }
 
@@ -966,7 +959,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let srcString = data["src"] as? String,
             let url = URL(string: srcString)
         else {
-            log(.warning, "Invalid body for didActivateImage: \(body)")
+            EPUBPageWorldLog.report(.malformedImageActivationBody, withholding: body)
             return
         }
 

@@ -793,7 +793,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     @discardableResult
     private func scroll(toProgression progression: Double, animated: Bool) async -> Bool {
         guard progression >= 0, progression <= 1 else {
-            log(.warning, "Scrolling to invalid progression \(progression)")
+            EPUBPageWorldLog.report(.invalidScrollProgression, withholding: progression)
             return false
         }
 
