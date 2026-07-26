@@ -5,18 +5,20 @@
 //
 
 @testable import ReadiumNavigator
-import ReadiumShared
+@testable import ReadiumShared
 import XCTest
 
 /// Captures everything the framework logs so a test can assert on it.
 private final class CapturingLogger: LoggerType {
     private let lock = NSLock()
     private var lines: [String] = []
+    private var levels: [SeverityLevel] = []
 
     func log(level: SeverityLevel, value: Any?, file: String, line: Int) {
         let rendered = "\(level.rawValue) \(file):\(line): \(String(describing: value))"
         lock.lock()
         lines.append(rendered)
+        levels.append(level)
         lock.unlock()
     }
 
@@ -24,6 +26,12 @@ private final class CapturingLogger: LoggerType {
         lock.lock()
         defer { lock.unlock() }
         return lines
+    }
+
+    var capturedLevels: [SeverityLevel] {
+        lock.lock()
+        defer { lock.unlock() }
+        return levels
     }
 }
 
@@ -94,21 +102,52 @@ final class EPUBPageWorldLogTests: XCTestCase {
         )
     }
 
+    /// A native Swift error, not an `NSError`. This is the shape `DOMRange(json:)`
+    /// actually throws, and it bridges differently: `localizedDescription` comes
+    /// from the `LocalizedError` conformance, and the domain becomes the mangled
+    /// Swift type name. Reading only domain and code is safe by construction —
+    /// this is what proves it.
+    private enum SentinelError: Error, LocalizedError {
+        case leaked(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .leaked(text): return text
+            }
+        }
+    }
+
     private var logger: CapturingLogger!
+    private var priorLogger: LoggerType?
+    private var priorMinimumSeverityLevel: SeverityLevel?
 
     override func setUp() {
         super.setUp()
+        // The framework default is NO logger at all, not a `LoggerStub`. Calling
+        // `ReadiumEnableLog` to "reset" would install one, leaving every later
+        // test in this process printing at `.warning`+ where nothing printed
+        // before — so snapshot the real prior state and put it back instead.
+        priorLogger = Logger.sharedInstance.activeLogger
+        priorMinimumSeverityLevel = Logger.sharedInstance.minimumSeverityLevel
+
         logger = CapturingLogger()
         // `.trace` so no reason's own level can be filtered out, which would
         // make an absent sentinel prove nothing.
-        ReadiumEnableLog(withMinimumSeverityLevel: .trace, customLogger: logger)
+        install(logger, at: .trace)
     }
 
     override func tearDown() {
-        // Restores the framework default: a `LoggerStub` at `.warning`.
-        ReadiumEnableLog(withMinimumSeverityLevel: .warning)
+        Logger.sharedInstance.activeLogger = priorLogger
+        Logger.sharedInstance.minimumSeverityLevel = priorMinimumSeverityLevel
         logger = nil
         super.tearDown()
+    }
+
+    /// Installs `sink` at `level`, bypassing `ReadiumEnableLog` — which prints a
+    /// banner on every call and cannot express "no logger".
+    private func install(_ sink: LoggerType?, at level: SeverityLevel?) {
+        Logger.sharedInstance.activeLogger = sink
+        Logger.sharedInstance.minimumSeverityLevel = level
     }
 
     // MARK: - Plumbing ran
@@ -175,6 +214,13 @@ final class EPUBPageWorldLogTests: XCTestCase {
                 withholding: adversarialPayload,
                 error: adversarialError
             )
+            // The native-Swift shape as well as the `NSError` one: they bridge
+            // differently, and only one of them was covered.
+            EPUBPageWorldLog.report(
+                reason,
+                withholding: adversarialPayload,
+                error: SentinelError.leaked(Sentinel.rawError)
+            )
         }
 
         let captured = logger.captured
@@ -188,6 +234,59 @@ final class EPUBPageWorldLogTests: XCTestCase {
                 )
             }
         }
+    }
+
+    // MARK: - Severity
+
+    /// The reason→level table, asserted directly. Every other test installs the
+    /// logger at `.trace` so no level can be filtered, which means none of them
+    /// would notice a reason's severity changing.
+    func testEveryReasonReportsAtItsDeclaredLevel() {
+        let expected: [EPUBPageWorldLog.Reason: SeverityLevel] = [
+            .javaScriptConsoleMessage: .debug,
+            .malformedDOMRange: .debug,
+            .javaScriptUncaughtError: .error,
+            .malformedSelectionBody: .warning,
+            .malformedDecorationActivationBody: .warning,
+            .malformedImageActivationBody: .warning,
+            .invalidScrollProgression: .warning,
+        ]
+        // Driven off `allCases` so a new reason forces a decision here rather
+        // than inheriting a neighbour's severity silently.
+        XCTAssertEqual(
+            Set(expected.keys),
+            Set(EPUBPageWorldLog.Reason.allCases),
+            "the level table has drifted from the reason inventory"
+        )
+
+        for reason in EPUBPageWorldLog.Reason.allCases {
+            EPUBPageWorldLog.report(reason, withholding: adversarialPayload)
+            XCTAssertEqual(
+                logger.capturedLevels.last,
+                expected[reason],
+                "\(reason) reported at the wrong severity"
+            )
+        }
+    }
+
+    /// The real-world consequence of the table: a consumer filtering at
+    /// `.warning` must still see an uncaught script error, and must not be
+    /// spammed by routine console traffic.
+    func testTheTwoDebugReasonsAreSuppressedAtAWarningFloor() {
+        install(logger, at: .warning)
+
+        for reason in EPUBPageWorldLog.Reason.allCases {
+            EPUBPageWorldLog.report(reason, withholding: adversarialPayload)
+        }
+
+        let captured = logger.captured
+        XCTAssertEqual(captured.count, 5, "expected the five non-debug reasons only")
+        XCTAssertFalse(captured.contains { $0.contains("reason=js_console_message") })
+        XCTAssertFalse(captured.contains { $0.contains("reason=malformed_dom_range") })
+        XCTAssertTrue(
+            captured.contains { $0.contains("reason=js_uncaught_error") },
+            "an uncaught script error must survive a warning floor"
+        )
     }
 
     /// Guards the inventory: a reason whose token stops being a fixed snake-case
@@ -266,10 +365,18 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
 
     /// Lines that emit a log, whether directly through `Loggable` or through the
     /// choke point.
+    ///
+    /// Matches bare `log(`, not `log(.`, deliberately. A call split as
+    /// `log(\n    .warning,\n    "…\(body)"\n)` puts no `log(.` on any line, so
+    /// the narrower filter would miss both the message line AND the `log(` line —
+    /// meaning the one-line guard below could be bypassed by exactly the split it
+    /// exists to catch. With this filter, line one still matches and is
+    /// paren-unbalanced, so the split fails loudly. Verified to match nothing in
+    /// these files beyond real log calls.
     private func logEmittingLines(in source: String) -> [String] {
         source
             .components(separatedBy: .newlines)
-            .filter { $0.contains("log(.") || $0.contains("PageWorldLog.report(") }
+            .filter { $0.contains("log(") || $0.contains("PageWorldLog.report(") }
     }
 
     // MARK: - The inventory
