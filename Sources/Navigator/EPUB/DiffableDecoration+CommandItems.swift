@@ -7,6 +7,16 @@
 import Foundation
 import ReadiumShared
 
+// This file replaces upstream's `DiffableDecoration+HTML.swift`, whose two extensions —
+// `Array<DecorationChange>.javascript(forGroup:styles:)` and `DecorationChange.javascript(styles:)`
+// — cannot be kept. Both are forbidden by `scripts/check-webview-bridge.sh`: the first reaches the
+// publisher page's own decoration-group API, which the isolated command world exists to replace,
+// and the second logs publisher-derived decoration JSON. Restoring them, even unused, reintroduces
+// a content-leak path into the binary and fails the gate.
+//
+// It carries its own name rather than shadowing the upstream one so the divergence reads as a
+// deliberate replacement instead of a file that happens to share a path and nothing else.
+
 extension Array where Element == DiffableDecoration {
     /// Converts a complete native decoration group into bounded, typed values
     /// for the isolated command world. A single invalid item rejects the whole
