@@ -5,7 +5,31 @@
 //  available in the top-level LICENSE file of the project.
 //
 
+import Foundation
 import PackageDescription
+
+/// Compilation gate for the render-faithful navigation test hooks (#1525).
+///
+/// The host app's live-renderer journey needs a few phase-only probes into the
+/// navigator's readiness and frame-capability state. `@_spi` alone cannot keep them
+/// out of a shipping binary — it restricts who may *import* a symbol, not whether the
+/// symbol is *compiled* — so the hooks are gated on this define and simply do not
+/// exist without it.
+///
+/// `.debug` covers every ordinary test run, including from the Xcode UI. The
+/// environment override exists so a Release test product can compile the same hooks.
+/// A production archive sets neither, so the symbols are absent from it by
+/// construction rather than by visibility. `scripts/check-render-faithful-testing-symbols-absent.sh`
+/// in the host repo is the standing proof, and enumerates the exact symbol list.
+let renderFaithfulNavTestingSettings: [SwiftSetting] = {
+    var settings: [SwiftSetting] = [
+        .define("RENDER_FAITHFUL_NAV_TESTING", .when(configuration: .debug)),
+    ]
+    if ProcessInfo.processInfo.environment["RENDER_FAITHFUL_NAV_TESTING"] != nil {
+        settings.append(.define("RENDER_FAITHFUL_NAV_TESTING"))
+    }
+    return settings
+}()
 
 let package = Package(
     name: "Readium",
@@ -100,7 +124,8 @@ let package = Package(
             resources: [
                 .copy("EPUB/Assets"),
                 .process("Resources"),
-            ]
+            ],
+            swiftSettings: renderFaithfulNavTestingSettings
         ),
         .testTarget(
             name: "ReadiumNavigatorTests",

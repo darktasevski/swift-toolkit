@@ -1994,85 +1994,92 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
     }
 }
 
-@_spi(Testing)
-public extension EPUBNavigatorViewController {
-    /// Test-only: the frame-capability UUIDs the current spread's readiness
-    /// authority and locator command bridge each hold. Proves `spreadDidLoad`
-    /// hands ONE capability to both authorities — a mismatch would mean a frame
-    /// that echoes the injected capability could never be selected by the bridge
-    /// registry, so a landed command would be impossible. Returns `nil` when no
-    /// spread is current. Content-free: only opaque UUIDs cross the seam.
-    var currentSpreadFrameCapabilityIDsForTesting: (readiness: UUID?, bridge: UUID?)? {
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
-            return nil
-        }
-        return (
-            spreadView.readiness.currentFrameCapability?.id,
-            spreadView.locatorCommandBridge.currentFrameCapability?.id
-        )
-    }
-
-    /// Test-only: whether the current spread is a fixed-layout (pre-paginated)
-    /// spread, which loads its resource inside a child iframe of a wrapper main
-    /// frame. Lets a test prove it is exercising the wrapper→child capability
-    /// forwarding path rather than a silently reflowable resource. `nil` when no
-    /// spread is current.
-    var currentSpreadIsFixedLayoutForTesting: Bool? {
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
-            return nil
-        }
-        return spreadView is EPUBFixedSpreadView
-    }
-
-    /// Test-only: awaits the point at which the current spread's initialization
-    /// becomes idle — command readiness published for the LATEST generation of
-    /// the same frame document, with every generation-bound position/layout
-    /// writer released.
-    ///
-    /// A precise landing is only trustworthy if it survives the writers that
-    /// were still in flight when it returned. Because a same-document mutation
-    /// (a font/stylesheet settle, a pending progression apply, a relayout offset
-    /// correction) advances the generation while retaining the frame capability,
-    /// this follows the DOCUMENT rather than a fixed generation and resolves on
-    /// the last one to publish. That lets a test re-verify a landing's visibility
-    /// against a deterministic lifecycle gate instead of a sleep.
-    ///
-    /// Returns `false` when no spread is current, when the document holds no
-    /// capability, or when the document was replaced/invalidated before readiness
-    /// republished. Content-free: only a Boolean crosses the seam.
-    func awaitCurrentSpreadDocumentIdleForTesting() async -> Bool {
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView,
-              let capability = spreadView.readiness.currentFrameCapability
-        else {
-            return false
-        }
-        // Bounded deliberately. `waitForCommandReadiness(forDocument:)` loops while the
-        // capability survives, re-waiting on each successor generation — so a document
-        // whose generation keeps advancing (exactly the font/stylesheet/progression churn
-        // this probe exists to wait out) would never return. Unbounded, that is a suite
-        // HANG rather than a failure: no assertion message, no diagnostic, the whole run
-        // dies. Racing a deadline converts that into an ordinary `false`.
-        let deadline = EPUBLocatorOperationDeadline(
-            startingAt: locatorClock.now(),
-            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
-        )
-        let clock = locatorClock
-        return await withTaskGroup(of: Bool.self) { group in
-            group.addTask { @MainActor in
-                guard case .ready = await spreadView.readiness.waitForCommandReadiness(
-                    forDocument: capability
-                ) else {
-                    return false
-                }
-                return true
+// Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`). The
+// `@_spi(Testing)` annotation below governs who may import these; it does NOT keep
+// them out of a shipping binary, which is what this condition is for. Every hook here
+// is phase-only — opaque UUIDs and Booleans — so nothing derived from book content,
+// hrefs, selectors, or geometry can cross the seam even where it IS compiled.
+#if RENDER_FAITHFUL_NAV_TESTING
+    @_spi(Testing)
+    public extension EPUBNavigatorViewController {
+        /// Test-only: the frame-capability UUIDs the current spread's readiness
+        /// authority and locator command bridge each hold. Proves `spreadDidLoad`
+        /// hands ONE capability to both authorities — a mismatch would mean a frame
+        /// that echoes the injected capability could never be selected by the bridge
+        /// registry, so a landed command would be impossible. Returns `nil` when no
+        /// spread is current. Content-free: only opaque UUIDs cross the seam.
+        var currentSpreadFrameCapabilityIDsForTesting: (readiness: UUID?, bridge: UUID?)? {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+                return nil
             }
-            group.addTask {
-                try? await clock.sleep(deadline.expiresAt)
+            return (
+                spreadView.readiness.currentFrameCapability?.id,
+                spreadView.locatorCommandBridge.currentFrameCapability?.id
+            )
+        }
+
+        /// Test-only: whether the current spread is a fixed-layout (pre-paginated)
+        /// spread, which loads its resource inside a child iframe of a wrapper main
+        /// frame. Lets a test prove it is exercising the wrapper→child capability
+        /// forwarding path rather than a silently reflowable resource. `nil` when no
+        /// spread is current.
+        var currentSpreadIsFixedLayoutForTesting: Bool? {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+                return nil
+            }
+            return spreadView is EPUBFixedSpreadView
+        }
+
+        /// Test-only: awaits the point at which the current spread's initialization
+        /// becomes idle — command readiness published for the LATEST generation of
+        /// the same frame document, with every generation-bound position/layout
+        /// writer released.
+        ///
+        /// A precise landing is only trustworthy if it survives the writers that
+        /// were still in flight when it returned. Because a same-document mutation
+        /// (a font/stylesheet settle, a pending progression apply, a relayout offset
+        /// correction) advances the generation while retaining the frame capability,
+        /// this follows the DOCUMENT rather than a fixed generation and resolves on
+        /// the last one to publish. That lets a test re-verify a landing's visibility
+        /// against a deterministic lifecycle gate instead of a sleep.
+        ///
+        /// Returns `false` when no spread is current, when the document holds no
+        /// capability, or when the document was replaced/invalidated before readiness
+        /// republished. Content-free: only a Boolean crosses the seam.
+        func awaitCurrentSpreadDocumentIdleForTesting() async -> Bool {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView,
+                  let capability = spreadView.readiness.currentFrameCapability
+            else {
                 return false
             }
-            let result = await group.next() ?? false
-            group.cancelAll()
-            return result
+            // Bounded deliberately. `waitForCommandReadiness(forDocument:)` loops while the
+            // capability survives, re-waiting on each successor generation — so a document
+            // whose generation keeps advancing (exactly the font/stylesheet/progression churn
+            // this probe exists to wait out) would never return. Unbounded, that is a suite
+            // HANG rather than a failure: no assertion message, no diagnostic, the whole run
+            // dies. Racing a deadline converts that into an ordinary `false`.
+            let deadline = EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            )
+            let clock = locatorClock
+            return await withTaskGroup(of: Bool.self) { group in
+                group.addTask { @MainActor in
+                    guard case .ready = await spreadView.readiness.waitForCommandReadiness(
+                        forDocument: capability
+                    ) else {
+                        return false
+                    }
+                    return true
+                }
+                group.addTask {
+                    try? await clock.sleep(deadline.expiresAt)
+                    return false
+                }
+                let result = await group.next() ?? false
+                group.cancelAll()
+                return result
+            }
         }
     }
-}
+#endif

@@ -463,13 +463,20 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
     }
 
-    /// Test-only: the number of frames currently registered as eligible command
-    /// targets. Lets an integration test await the capability-handshake round-trip
-    /// (`setFrameCapability` → JS echo → `didReceive` registration) before issuing
-    /// a command — the deterministic stand-in for a live spread's readiness gate.
-    var registeredFrameCountForTesting: Int {
-        framesByID.count
-    }
+    // Test-only: the number of frames currently registered as eligible command
+    // targets. Lets an integration test await the capability-handshake round-trip
+    // (`setFrameCapability` → JS echo → `didReceive` registration) before issuing
+    // a command — the deterministic stand-in for a live spread's readiness gate.
+    //
+    // Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`).
+    // `internal` is not a shipping-binary guarantee either — an internal symbol is
+    // still compiled into the framework — so this hook is gated exactly like the
+    // `@_spi(Testing)` ones. Phase-only: a count, never a frame or its contents.
+    #if RENDER_FAITHFUL_NAV_TESTING
+        var registeredFrameCountForTesting: Int {
+            framesByID.count
+        }
+    #endif
 
     /// - Parameter deadline: the operation-wide deadline minted by the caller at
     ///   operation start. The command spends what remains of it; it never mints its
