@@ -889,26 +889,49 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     /// Navigates with the bounded, fixed-source locator command bridge and
-    /// reports the command's actual landing result.
+    /// reports the command's actual landing result, together with the receipt
+    /// binding the world it landed in.
+    ///
+    /// The receipt is what lets the caller's later steps — uniqueness
+    /// validation, a transient decoration, a fallback rung — prove they are
+    /// still acting on the world this command landed in rather than on whatever
+    /// replaced it while they were suspended. It is present only for `.landed`.
     public func navigateToLocatorJSON(
         _ locatorJSON: String,
         animated: Bool
-    ) async -> LocatorNavigationOutcome {
-        await locatorNavigationTaskQueue.run { [weak self] in
+    ) async -> EPUBLocatorNavigationResult {
+        let receiptSlot = EPUBLocatorCommandReceiptSlot()
+        let outcome = await locatorNavigationTaskQueue.run { [weak self] in
             guard let self else { return .cancelled }
-            return await self.performLocatorNavigation(locatorJSON, animated: animated)
+            return await self.performLocatorNavigation(
+                locatorJSON,
+                animated: animated,
+                receiptSlot: receiptSlot
+            )
         } cancellationRelay: { [weak self] in
             await self?.cancelInFlightLocatorNavigation()
         }
+        // A landing is the only outcome that bound a world. The queue also
+        // downgrades a completed operation to `.cancelled` when the request was
+        // superseded on the way out, and that downgrade must drop the receipt
+        // with it.
+        guard outcome == .landed else {
+            return .unreceipted(outcome)
+        }
+        return EPUBLocatorNavigationResult(outcome: outcome, receipt: receiptSlot.receipt)
     }
 
     private func performLocatorNavigation(
         _ locatorJSON: String,
-        animated: Bool
+        animated: Bool,
+        receiptSlot: EPUBLocatorCommandReceiptSlot
     ) async -> LocatorNavigationOutcome {
         guard !Task.isCancelled else {
             return .cancelled
         }
+        // Every locator navigation takes the next sequence number, so a later
+        // one starting is exactly what makes an earlier one's receipt stale.
+        locatorOperationSequence &+= 1
         // Operation start: the ONE deadline every rung below spends from — the
         // cross-resource hop, page identity, command readiness, and the bridge
         // command's own viewport/settle/correction waits. No rung re-mints it, so
@@ -1012,6 +1035,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
         switch result.outcome {
         case .applied:
+            // Mint the receipt from the SAME snapshot every later revalidation
+            // rebuilds, so the two can never drift apart. If the world has
+            // already moved off this spread by the time the command reports,
+            // there is nothing truthful to bind and the landing carries no
+            // receipt — the caller then treats every later step as stale, which
+            // is the fail-closed direction.
+            if
+                let world = currentLocatorWorld(),
+                world.spreadIndex == spreadIndex,
+                world.spreadIdentity == ObjectIdentifier(spreadView)
+            {
+                receiptSlot.record(EPUBLocatorCommandReceipt(world: world))
+            }
             return .landed
         case .miss:
             return .miss
@@ -1020,14 +1056,55 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    /// Snapshots the render world of the spread currently on screen.
+    ///
+    /// One builder serves both minting and revalidation: a receipt is this
+    /// snapshot taken at landing, and currency is the comparison against a later
+    /// one. Sharing the builder is what makes "the same world" mean the same
+    /// thing at both ends.
+    private func currentLocatorWorld() -> EPUBLocatorCommandReceipt.World? {
+        guard let paginationView else { return nil }
+        let index = paginationView.currentIndex
+        guard let spreadView = paginationView.loadedViews[index] as? EPUBSpreadView else {
+            return nil
+        }
+        return EPUBLocatorCommandReceipt.World(
+            spreadIndex: index,
+            spreadIdentity: ObjectIdentifier(spreadView),
+            generation: spreadView.readiness.generation,
+            frameCapability: spreadView.readiness.currentFrameCapability,
+            isCommandReady: spreadView.isCommandReady,
+            operationSequence: locatorOperationSequence
+        )
+    }
+
+    /// Whether a landing receipt still describes the live world.
+    ///
+    /// Callers revalidate after every suspension between the landing and the
+    /// act it authorizes — uniqueness validation, a transient decoration apply
+    /// or clear — so a command superseded mid-flight cannot paint into, or wipe,
+    /// the world its successor established.
+    public func isReceiptCurrent(_ receipt: EPUBLocatorCommandReceipt) -> Bool {
+        guard let world = currentLocatorWorld() else { return false }
+        return receipt.isCurrent(in: world)
+    }
+
     /// Checks the transient-highlight uniqueness rule inside the isolated
     /// command world. Only a closed command outcome crosses back to native.
+    ///
+    /// Requires the landing's receipt, and revalidates it on both sides of the
+    /// bridge round-trip: a uniqueness answer is only meaningful for the
+    /// document the command landed in, and a stale `true` is precisely what
+    /// would let a superseded command paint a look-alike occurrence in whatever
+    /// replaced it.
     public func isLocatorTextUnique(
         _ locatorJSON: String,
-        cssSelector: String?
+        cssSelector: String?,
+        receipt: EPUBLocatorCommandReceipt
     ) async -> Bool {
         guard
             !Task.isCancelled,
+            isReceiptCurrent(receipt),
             let payload = try? EPUBLocatorCommandDecoder.decode(locatorJSON),
             let decoded = try? Locator(json: payload.locator)
         else {
@@ -1053,6 +1130,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
             )
         )
+        guard !Task.isCancelled, isReceiptCurrent(receipt) else { return false }
         return result.outcome == .applied
     }
 
@@ -1194,6 +1272,13 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Serializes rapid locator requests with latest-request-wins semantics.
     private let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
+    /// Monotonic count of locator navigations started on this navigator. A
+    /// receipt captures the value current when its command landed, so a newer
+    /// navigation starting is what makes every older receipt stale — which is
+    /// how a predecessor paused between its landing and its decoration is
+    /// stopped from acting after its successor has landed.
+    private var locatorOperationSequence: UInt64 = 0
 
     /// The locator operation whose cross-resource hop is in flight, published for the
     /// target spread to read back when it initializes. The hop's spread loads on its own
