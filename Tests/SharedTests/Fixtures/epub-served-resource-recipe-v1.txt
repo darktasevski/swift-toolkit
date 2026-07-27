@@ -1,1 +1,1 @@
-epub-served-resource-recipe/v1;mime=manifest>resource>href>binary;repair=xhtml-well-formedness/v1;parser=xhtml-xml+html-html5ever-scripting;projection=rendered-text/v1;normalization=unicode-scalar-nfc-whitespace/v1;selector=raw-quote+full-dom-range/v1;chunk=unicode-scalar-4chars-overlap/v1
+epub-served-resource-recipe/v1;mime=manifest>resource>href>binary;repair=xhtml-well-formedness/v1;parser=xhtml-xml+html-html5ever-scripting;projection=rendered-text/v1;normalization=unicode-scalar-nfc-whitespace/v2;selector=raw-quote+full-dom-range/v1;chunk=unicode-scalar-4chars-overlap/v1
