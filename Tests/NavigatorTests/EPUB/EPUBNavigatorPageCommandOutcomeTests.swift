@@ -97,6 +97,72 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
         )
     }
 
+    func testDocumentCurrencyToleratesAGenerationThatAdvancedAfterReadinessPublished() {
+        // The `>=` rather than `==`. The bounded wait resumes through a task group, so several
+        // main-actor suspensions separate the `.ready` publish from the currency read, and a
+        // same-document mutation can land in any of them. An equality gate turns that into a
+        // silent `.cancelled` — the exact bug this path exists to fix, one line further down.
+        let capability = EPUBSpreadFrameCapability()
+
+        XCTAssertTrue(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: .ready(generation: 7, frameCapability: capability),
+                currentCapability: capability,
+                currentGeneration: 9
+            )
+        )
+        XCTAssertTrue(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: .ready(generation: 7, frameCapability: capability),
+                currentCapability: capability,
+                currentGeneration: 7
+            )
+        )
+    }
+
+    func testDocumentCurrencyRejectsAReplacedOrAbsentDocument() {
+        let capability = EPUBSpreadFrameCapability()
+
+        XCTAssertFalse(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: .ready(generation: 7, frameCapability: capability),
+                currentCapability: EPUBSpreadFrameCapability(),
+                currentGeneration: 7
+            )
+        )
+        // Nil is the document being gone outright — a replacement load, invalidation or
+        // `pagehide`. Distinct from a different capability only in cause, not in verdict.
+        XCTAssertFalse(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: .ready(generation: 7, frameCapability: capability),
+                currentCapability: nil,
+                currentGeneration: 7
+            )
+        )
+    }
+
+    func testDocumentCurrencyIsFalseForEveryOutcomeThatBoundNoDocument() {
+        let capability = EPUBSpreadFrameCapability()
+        let outcomes: [EPUBSpreadReadiness.WaitOutcome] = [
+            .timedOut,
+            .cancelled,
+            .invalidated,
+            .failed(generation: 7),
+            .documentAvailable(generation: 7),
+        ]
+
+        for outcome in outcomes {
+            XCTAssertFalse(
+                EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                    for: outcome,
+                    currentCapability: capability,
+                    currentGeneration: 7
+                ),
+                "\(outcome) bound no document, so no world of its can be current"
+            )
+        }
+    }
+
     func testReadinessPublishedForAReplacedDocumentIsReportedAsCancelled() {
         // The document the wait resolved against is gone by the time the caller
         // resumes — a replacement load, invalidation or `pagehide`. The landing

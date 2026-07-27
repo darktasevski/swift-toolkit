@@ -564,6 +564,116 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         )
     }
 
+    // MARK: - The document-following law
+
+    // The `.invalidated` re-wait arm is the whole reason a document-scoped wait exists, and it is
+    // unreachable from outside: its only production trigger is `beginMutation` draining an
+    // already-registered waiter, which needs the main-actor race between reading `generation` and
+    // registering on it. Every other test in this file acquires its writer BEFORE starting the
+    // waiter, so the loop registers on the mutation generation directly and returns on iteration
+    // one — an implementation that replaced `continue` with `return .invalidated` would pass all
+    // of them. These drive the loop with an injected per-generation wait instead.
+
+    func testDocumentFollowingReWaitsOnTheSuccessorGenerationAfterASameDocumentMutation() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+
+        var awaitedGenerations: [EPUBSpreadReadiness.Generation] = []
+        let outcome = await readiness.waitForCommandReadiness(
+            forDocument: capability
+        ) { awaited in
+            awaitedGenerations.append(awaited)
+            guard awaitedGenerations.count > 1 else {
+                // The first wait is drained by a same-document mutation. Advance the generation
+                // for real so the loop's re-read observes a successor rather than a replay.
+                _ = readiness.acquirePositionWriter()
+                return .invalidated
+            }
+            return .ready(generation: awaited, frameCapability: capability)
+        }
+
+        XCTAssertEqual(
+            outcome,
+            .ready(generation: readiness.generation, frameCapability: capability)
+        )
+        XCTAssertEqual(awaitedGenerations.count, 2)
+        XCTAssertEqual(awaitedGenerations.first, generation)
+        // The re-wait must read the CURRENT generation, not replay the drained one.
+        XCTAssertEqual(awaitedGenerations.last, readiness.generation)
+        XCTAssertNotEqual(awaitedGenerations.first, awaitedGenerations.last)
+    }
+
+    func testDocumentFollowingStopsWhenTheCapabilityDiesUnderTheReWait() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+
+        var waitCount = 0
+        let outcome = await readiness.waitForCommandReadiness(
+            forDocument: capability
+        ) { _ in
+            waitCount += 1
+            // A replacement load, not a same-document mutation: the document is gone.
+            readiness.beginLoading()
+            return .invalidated
+        }
+
+        XCTAssertEqual(outcome, .invalidated)
+        // The capability guard runs BEFORE the re-wait, so the loop must not wait a second time.
+        XCTAssertEqual(waitCount, 1)
+    }
+
+    func testDocumentFollowingRejectsReadinessPublishedForADifferentDocument() async throws {
+        let readiness = try makeReadyReadiness()
+        let capability = try XCTUnwrap(readiness.currentFrameCapability)
+
+        let outcome = await readiness.waitForCommandReadiness(
+            forDocument: capability
+        ) { awaited in
+            .ready(generation: awaited, frameCapability: EPUBSpreadFrameCapability(id: UUID()))
+        }
+
+        XCTAssertEqual(outcome, .invalidated)
+    }
+
+    func testDeadlineBoundedDocumentReadinessReportsCancellationDistinctlyFromTimeout() async throws {
+        // Cancellation and timeout diverge at the consumer — `.cancelled` stops silently while
+        // `.timedOut` advances a fallback rung — and the only thing separating them is one `catch`
+        // arm in the deadline racer. The far deadline makes a `.timedOut` result unambiguously a
+        // misclassification rather than a race.
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        _ = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+
+        let waiter = Task { @MainActor in
+            await readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: ContinuousClock.now.advanced(by: .seconds(30))
+            )
+        }
+        await Task.yield()
+
+        waiter.cancel()
+
+        let outcome = await waiter.value
+        XCTAssertEqual(outcome, .cancelled)
+    }
+
     func testDeadlineBoundedDocumentReadinessIsInvalidatedByReplacementLoad() async throws {
         let readiness = EPUBSpreadReadiness()
         let generation = readiness.beginLoading()

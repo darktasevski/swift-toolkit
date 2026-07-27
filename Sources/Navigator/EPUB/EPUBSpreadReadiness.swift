@@ -435,7 +435,13 @@ final class EPUBSpreadReadiness {
     /// awaited. Both overloads above are this loop; keeping a single body is
     /// what stops the bounded and unbounded forms from drifting on the question
     /// that matters — which advances count as the same document.
-    private func waitForCommandReadiness(
+    ///
+    /// Not `private`: the `.invalidated` re-wait arm — the entire reason this
+    /// type has a document-scoped wait at all — is only reachable in production
+    /// through a main-actor race between reading `generation` and registering on
+    /// it, which no test can drive deterministically. Injecting the per-generation
+    /// wait is the only way to assert the law rather than the race.
+    func waitForCommandReadiness(
         forDocument capability: EPUBSpreadFrameCapability,
         awaitingEachGenerationWith generationWait: (Generation) async -> WaitOutcome
     ) async -> WaitOutcome {

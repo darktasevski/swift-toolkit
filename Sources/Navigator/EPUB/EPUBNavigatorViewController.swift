@@ -73,6 +73,37 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     ///   position or decoration writer acquired the instant readiness publishes
     ///   advances the generation while keeping the same document — the benign
     ///   same-document mutation that an equality gate reports as supersession.
+    /// Whether the world `outcome` bound is still the one the spread owns.
+    ///
+    /// Both terms are load-bearing and neither is obvious:
+    ///
+    /// - The capability is read through `currentFrameCapability`, which answers during
+    ///   `.initializing` as well as `.ready`. A `.ready`-only destructure would read nil while
+    ///   a same-document mutation is in flight and report the landing superseded — the bug this
+    ///   whole path exists to fix, one line further down.
+    /// - Generation is compared with `>=`, not `==`. The bounded wait resumes through a task
+    ///   group, so several main-actor suspensions separate the `.ready` publish from this read,
+    ///   and a same-document mutation can land in any of them. An equality gate turns that into
+    ///   a silent `.cancelled`: a tap that does nothing, with no fallback rung.
+    ///
+    /// A LOWER generation is not reachable while `targetIsCurrent` holds — that pins the same
+    /// spread object, whose readiness is a `let` — so the comparison is really "has not gone
+    /// backwards" stated for a case the caller has already excluded. Kept because the term costs
+    /// nothing and the exclusion lives in a different function.
+    static func readySpreadDocumentIsCurrent(
+        for outcome: EPUBSpreadReadiness.WaitOutcome,
+        currentCapability: EPUBSpreadFrameCapability?,
+        currentGeneration: EPUBSpreadReadiness.Generation
+    ) -> Bool {
+        // A non-`.ready` outcome bound no document; `readySpreadNavigationDisposition` ignores
+        // this value for those, and returning `false` keeps a non-landing from ever reading as
+        // a current world if a future caller forgets that.
+        guard case let .ready(readyGeneration, readyCapability) = outcome else {
+            return false
+        }
+        return currentCapability == readyCapability && currentGeneration >= readyGeneration
+    }
+
     static func readySpreadNavigationDisposition(
         for outcome: EPUBSpreadReadiness.WaitOutcome,
         targetIsCurrent: Bool,
@@ -1223,16 +1254,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             && paginationView.currentIndex == index
             && paginationView.loadedViews[index] === spreadView
         // Currency is asked of the world the OUTCOME bound, matching
-        // `EPUBLocatorCommandReceipt.isCurrent`: same document, and a generation
-        // that has not walked backwards (which it cannot within one readiness
-        // instance, so a lower value means readiness was replaced wholesale).
-        let documentIsCurrent: Bool
-        if case let .ready(readyGeneration, readyCapability) = outcome {
-            documentIsCurrent = spreadView.readiness.currentFrameCapability == readyCapability
-                && spreadView.readiness.generation >= readyGeneration
-        } else {
-            documentIsCurrent = false
-        }
+        // `EPUBLocatorCommandReceipt.isCurrent`.
+        let documentIsCurrent = Self.readySpreadDocumentIsCurrent(
+            for: outcome,
+            currentCapability: spreadView.readiness.currentFrameCapability,
+            currentGeneration: spreadView.readiness.generation
+        )
 
         switch Self.readySpreadNavigationDisposition(
             for: outcome,
