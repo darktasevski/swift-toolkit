@@ -13,6 +13,10 @@
 #                             pass a UDID-targeted destination: concurrent runs
 #                             that share a simulator BY NAME clobber each
 #                             other's installed test host.
+#   READIUM_SKIP_TESTING      Space-separated -skip-testing identifiers, e.g.
+#                             "ReadiumNavigatorTests/SomeFlakyTests". A caller
+#                             that quarantines a class is responsible for saying
+#                             so in its own output; this script does not.
 # =============================================================================
 
 set -euo pipefail
@@ -30,6 +34,13 @@ ARGS=(
     -destination "$DESTINATION"
 )
 [ -n "$FILTER" ] && ARGS+=(-only-testing:"$FILTER")
+
+# Word-split deliberately: the variable carries a list of identifiers.
+# shellcheck disable=SC2206
+skip_testing=(${READIUM_SKIP_TESTING:-})
+for skip in ${skip_testing+"${skip_testing[@]}"}; do
+    ARGS+=(-skip-testing:"$skip")
+done
 
 # The trailing filters must not decide the exit status. `grep -Ev` reports 1 when it filters
 # every line away, and under `pipefail` that alone would fail a passing run — which is why this
