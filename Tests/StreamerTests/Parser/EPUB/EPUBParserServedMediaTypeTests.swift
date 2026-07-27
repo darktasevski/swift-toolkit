@@ -31,11 +31,15 @@ final class EPUBParserServedMediaTypeTests: XCTestCase {
         XCTAssertEqual(publication.readingOrder.first?.mediaType, .xhtml)
     }
 
+    /// Uses `minimal-with-stylesheet.opf` rather than adding the stylesheet item to
+    /// `minimal.opf`: that fixture is upstream's and is shared with `OPFParserTests` +
+    /// `EPUBMetadataParserTests`, which assert against a manifest with no auxiliary
+    /// resources. A local copy keeps the shared fixture byte-identical to upstream.
     func testAuxiliaryResourceContainsEffectiveHrefSniffedMediaType() async throws {
         let fixtures = Fixtures()
         let container = FileContainer(files: [
             RelativeURL(path: "META-INF/container.xml")!: fixtures.url(for: "Container/container.xml"),
-            RelativeURL(path: "EPUB/content.opf")!: fixtures.url(for: "OPF/minimal.opf"),
+            RelativeURL(path: "EPUB/content.opf")!: fixtures.url(for: "OPF/minimal-with-stylesheet.opf"),
             RelativeURL(path: "EPUB/titlepage.xhtml")!: fixtures.url(for: "Navigation Documents/nav.xhtml"),
             RelativeURL(path: "EPUB/styles/book.css")!: fixtures.url(for: "OPF/book.css"),
         ])
