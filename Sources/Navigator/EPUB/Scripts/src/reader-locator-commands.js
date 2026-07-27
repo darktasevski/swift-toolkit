@@ -506,17 +506,44 @@ function quoteRoot(locator) {
   return (selector && uniqueElement(selector)) || document.body;
 }
 
-function rangeMatchesQuote(range, root, text) {
+/** Mirrors `PROJECTION_EXCLUDED_SELECTOR` in `utils.js` — kept local because this bundle runs in an
+ * isolated content world and must not import the page-world module. */
+const PROJECTION_EXCLUDED_SELECTOR = "script, style, noscript, template";
+
+/** Twin of `projectedTextFromRange` in `utils.js`: the range's text as the indexer's projection
+ * would have recorded it. Both copies implement one comparison law. */
+function projectedTextFromRange(range) {
+  const container = document.createElement("div");
+  container.appendChild(range.cloneContents());
+  for (const excluded of Array.from(
+    container.querySelectorAll(PROJECTION_EXCLUDED_SELECTOR)
+  )) {
+    excluded.remove();
+  }
+  for (const lineBreak of Array.from(container.querySelectorAll("br"))) {
+    lineBreak.replaceWith(document.createTextNode(" "));
+  }
+  return container.textContent ?? "";
+}
+
+/**
+ * Whether a resolved range covers the passage the locator names.
+ *
+ * Two things this deliberately does NOT do, both of which reject *correct* landings:
+ *
+ * - It does not compare the stored `before` / `after` context. That context is produced with the
+ *   indexer's own width, which need not equal any width reconstructed here, so comparing it costs
+ *   precision-anchoring yield for no gain — the covered text is what the reader lands on.
+ * - It does not use `TextQuoteAnchor.fromRange(root, range).exact`, which reconstructs the text as
+ *   plain `textContent` and therefore includes `script` / `style` / `noscript` / `template` content
+ *   the indexer's projection excludes. Any chunk spanning one of those compared unequal.
+ */
+function rangeMatchesQuote(range, text) {
   if (!text?.highlight) {
     return true;
   }
   try {
-    const actual = TextQuoteAnchor.fromRange(root, range);
-    return (
-      actual.exact === text.highlight &&
-      (text.before === undefined || actual.context.prefix === text.before) &&
-      (text.after === undefined || actual.context.suffix === text.after)
-    );
+    return projectedTextFromRange(range) === text.highlight;
   } catch (_) {
     return false;
   }
@@ -547,10 +574,7 @@ function rangeFromDOMRange(locator) {
     const range = document.createRange();
     range.setStart(startNode, startOffset);
     range.setEnd(endNode, endOffset);
-    if (
-      range.collapsed ||
-      !rangeMatchesQuote(range, quoteRoot(locator), locator.text)
-    ) {
+    if (range.collapsed || !rangeMatchesQuote(range, locator.text)) {
       return null;
     }
     return range;

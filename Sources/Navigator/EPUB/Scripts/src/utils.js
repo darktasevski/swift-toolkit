@@ -465,10 +465,17 @@ function rangeFromDomRange(domRange) {
  * locator carrying no quote (a plain position, or a selection-derived range) has nothing to verify
  * against and is accepted as before.
  *
- * Only `exact` is compared. The stored `before`/`after` context is produced with the indexer's own
- * context width, which need not equal the width `TextQuoteAnchor.fromRange` reconstructs; requiring
- * those to match would reject correct landings and silently cost precision-anchoring yield, while
- * adding nothing — the covered text is what gets painted.
+ * Only the covered text is compared, never the stored `before`/`after` context: that context is
+ * produced with the indexer's own width, which need not equal any width reconstructed here, so
+ * requiring it to match would reject correct landings and silently cost precision-anchoring yield.
+ * The covered text is what gets painted, so it is the whole question.
+ *
+ * `TextQuoteAnchor.fromRange(root, range).exact` is deliberately NOT used for the comparison, even
+ * though it is the obvious candidate. It reconstructs the text as plain `textContent`, which
+ * includes `script` / `style` / `noscript` / `template` content that the indexer's projection
+ * excludes — so a correct landing on any chunk spanning one of those would compare unequal and be
+ * rejected. It also resolves the range relative to a root before computing `exact`, which can throw
+ * for a value that does not depend on the root at all.
  */
 function domRangeCoversQuote(range, locator) {
   const highlight = locator.text && locator.text.highlight;
@@ -476,14 +483,34 @@ function domRangeCoversQuote(range, locator) {
     return true;
   }
   try {
-    const selector = locator.locations && locator.locations.cssSelector;
-    const root =
-      (selector && document.querySelector(selector)) || document.body;
-    return TextQuoteAnchor.fromRange(root, range).exact === highlight;
+    return projectedTextFromRange(range) === highlight;
   } catch (e) {
-    log("rangeFromLocator: could not verify domRange against the stored quote");
+    log("rangeFromLocator: could not read the resolved range's text");
     return false;
   }
+}
+
+/** Elements whose text the indexer's projection excludes, and which must therefore be dropped
+ * before comparing a resolved range against a stored quote. Mirrors the Rust projection's
+ * exclusion set; `head` is omitted because it cannot occur inside a `<body>`-scoped range. */
+const PROJECTION_EXCLUDED_SELECTOR = "script, style, noscript, template";
+
+/**
+ * The range's text as the indexer's projection would have recorded it: excluded subtrees dropped,
+ * each `<br>` contributing one space.
+ */
+function projectedTextFromRange(range) {
+  const container = document.createElement("div");
+  container.appendChild(range.cloneContents());
+  for (const excluded of Array.from(
+    container.querySelectorAll(PROJECTION_EXCLUDED_SELECTOR)
+  )) {
+    excluded.remove();
+  }
+  for (const lineBreak of Array.from(container.querySelectorAll("br"))) {
+    lineBreak.replaceWith(document.createTextNode(" "));
+  }
+  return container.textContent ?? "";
 }
 
 /**

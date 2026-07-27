@@ -311,12 +311,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return rawAnchorIds
         }()
         do {
-            // Watchdogged for the same reason the bridge's calls are: this runs while the
-            // caller holds a writer lease, and a `callAsyncJavaScript` WebKit never resumes
-            // would strand that lease, so readiness would never publish `.ready` and the
-            // spread would stay hidden behind its spinner forever.
+            // Watchdogged because a `callAsyncJavaScript` WebKit never resumes would suspend
+            // `initializeSpread()` itself, so `spreadDidLoad` never completes and the spread never
+            // shows — the same terminal symptom as a stranded writer lease, reached differently.
+            //
+            // Bounded by its OWN cap, deliberately NOT the shared `stabilityDeadline`. The comment
+            // above is the reason: this call MUST dispatch, or a stale observer from the previous
+            // page survives. `waitForLayoutStability` may legitimately have spent the whole shared
+            // budget, and `EPUBLocatorCommandWatchdog.run` refuses to start an operation against an
+            // already-expired deadline — so sharing it would convert "bound a hang" into "skip
+            // whenever layout was slow", silently leaving the prior page's observer installed.
             _ = try await EPUBLocatorCommandWatchdog.run(
-                until: EPUBLocatorOperationDeadline(expiringAt: stabilityDeadline),
+                until: EPUBLocatorOperationDeadline(
+                    expiringAt: EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+                ),
                 clock: .continuous
             ) { [webView] in
                 try await webView.callAsyncJavaScript(
