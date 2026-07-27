@@ -311,12 +311,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return rawAnchorIds
         }()
         do {
-            _ = try await webView.callAsyncJavaScript(
-                "readium.initAnchorTracking(anchorIds);",
-                arguments: ["anchorIds": anchorIds],
-                in: nil,
-                contentWorld: .page
-            )
+            // Watchdogged for the same reason the bridge's calls are: this runs while the
+            // caller holds a writer lease, and a `callAsyncJavaScript` WebKit never resumes
+            // would strand that lease, so readiness would never publish `.ready` and the
+            // spread would stay hidden behind its spinner forever.
+            _ = try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: stabilityDeadline),
+                clock: .continuous
+            ) { [webView] in
+                try await webView.callAsyncJavaScript(
+                    "readium.initAnchorTracking(anchorIds);",
+                    arguments: ["anchorIds": anchorIds],
+                    in: nil,
+                    contentWorld: .page
+                )
+            }
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            // Anchor tracking is not load-bearing for showing the spread; the initialization
+            // continues, exactly as it does for a WebKit-reported failure below.
+            log(.warning, "anchor tracking init abandoned: deadline elapsed with the call suspended")
         } catch is CancellationError {
             // Spread teardown — not a failure.
             return .failed
@@ -361,61 +374,72 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard remainingMilliseconds > 0 else { return false }
 
         do {
-            let result = try await webView.callAsyncJavaScript(
-                """
-                const absoluteDeadline = performance.now() + deadlineMilliseconds;
-                const beforeDeadline = () => performance.now() < absoluteDeadline;
-                const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
-                const cappedWait = new Promise(resolve => {
-                    setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
-                });
-                const stabilityWork = async () => {
-                    while (beforeDeadline()) {
-                        const stylesheetLinks = Array.from(
-                            document.querySelectorAll('link[rel~="stylesheet"]')
-                        );
-                        if (stylesheetLinks.every(link => link.sheet !== null)) {
-                            break;
+            // The script's own `performance.now()` budget below cannot expire a script that is
+            // not running, so a wedged page main thread suspends this call indefinitely. Every
+            // caller of this method holds a writer lease across it, and a stranded lease means
+            // readiness never publishes `.ready` and `showSpread()` never runs — the spread stays
+            // at `alpha == 0` until a reload invalidates readiness. The watchdog bounds the await
+            // by the same instant the script is told about, so the two budgets cannot disagree.
+            let result = try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: .continuous
+            ) { [webView] in
+                try await webView.callAsyncJavaScript(
+                    """
+                    const absoluteDeadline = performance.now() + deadlineMilliseconds;
+                    const beforeDeadline = () => performance.now() < absoluteDeadline;
+                    const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+                    const cappedWait = new Promise(resolve => {
+                        setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
+                    });
+                    const stabilityWork = async () => {
+                        while (beforeDeadline()) {
+                            const stylesheetLinks = Array.from(
+                                document.querySelectorAll('link[rel~="stylesheet"]')
+                            );
+                            if (stylesheetLinks.every(link => link.sheet !== null)) {
+                                break;
+                            }
+                            await nextFrame();
                         }
-                        await nextFrame();
-                    }
-                    if (!beforeDeadline()) {
-                        return false;
-                    }
-                    if (document.fonts) {
-                        await document.fonts.ready;
-                    }
-                    if (!beforeDeadline()) {
-                        return false;
-                    }
+                        if (!beforeDeadline()) {
+                            return false;
+                        }
+                        if (document.fonts) {
+                            await document.fonts.ready;
+                        }
+                        if (!beforeDeadline()) {
+                            return false;
+                        }
 
-                    var previous = null;
-                    var stableFrames = 0;
-                    for (let frame = 0; frame < 12 && stableFrames < 2 && beforeDeadline(); frame += 1) {
-                        await nextFrame();
-                        const current = [
-                            document.documentElement.scrollWidth,
-                            document.documentElement.scrollHeight,
-                            document.body?.scrollWidth ?? 0,
-                            document.body?.scrollHeight ?? 0,
-                        ];
-                        if (previous !== null && current.every((value, index) => value === previous[index])) {
-                            stableFrames += 1;
-                        } else {
-                            stableFrames = 0;
+                        var previous = null;
+                        var stableFrames = 0;
+                        for (let frame = 0; frame < 12 && stableFrames < 2 && beforeDeadline(); frame += 1) {
+                            await nextFrame();
+                            const current = [
+                                document.documentElement.scrollWidth,
+                                document.documentElement.scrollHeight,
+                                document.body?.scrollWidth ?? 0,
+                                document.body?.scrollHeight ?? 0,
+                            ];
+                            if (previous !== null && current.every((value, index) => value === previous[index])) {
+                                stableFrames += 1;
+                            } else {
+                                stableFrames = 0;
+                            }
+                            previous = current;
                         }
-                        previous = current;
-                    }
-                    return stableFrames >= 2;
-                };
-                return await Promise.race([stabilityWork(), cappedWait]);
-                """,
-                arguments: [
-                    "deadlineMilliseconds": remainingMilliseconds,
-                ],
-                in: nil,
-                contentWorld: .page
-            )
+                        return stableFrames >= 2;
+                    };
+                    return await Promise.race([stabilityWork(), cappedWait]);
+                    """,
+                    arguments: [
+                        "deadlineMilliseconds": remainingMilliseconds,
+                    ],
+                    in: nil,
+                    contentWorld: .page
+                )
+            }
             guard
                 !Task.isCancelled,
                 generation == readiness.generation
@@ -423,6 +447,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 return false
             }
             return result as? Bool == true
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            // Not stable, and specifically: the call never came back. Reported apart from a
+            // WebKit-signalled failure because the two are different truths — one is a page that
+            // answered, one is a page that stopped answering.
+            log(.warning, "Layout stability abandoned: deadline elapsed with the call suspended")
+            return false
         } catch is CancellationError {
             return false
         } catch {

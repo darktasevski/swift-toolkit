@@ -173,24 +173,57 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         stabilityDeadline: ContinuousClock.Instant? = nil
     ) async -> Bool {
         guard let layoutMutation else { return false }
+        // Resolved once and shared by both stages. Letting each stage fall back to its own
+        // `resolveInitializationStabilityDeadline()` would hand the stability wait a fresh
+        // allowance after the viewport call had already spent time — the re-arming that
+        // `EPUBLocatorOperationDeadline` exists to make impossible.
+        let deadline = stabilityDeadline ?? resolveInitializationStabilityDeadline()
         return await layoutMutation.applyLatest { [weak self] configuration in
             guard let self else { return false }
-            guard await self.evaluateViewport(configuration) else { return false }
-            return await self.waitForFixedLayoutStability(until: stabilityDeadline)
+            guard await self.evaluateViewport(configuration, until: deadline) else { return false }
+            return await self.waitForFixedLayoutStability(until: deadline)
         }
     }
 
-    private func evaluateViewport(_ configuration: LayoutConfiguration) async -> Bool {
-        await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(viewportScript(for: configuration)) { [weak self] _, error in
-                if let error {
-                    let ns = error as NSError
-                    self?.log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
-                    continuation.resume(returning: false)
-                } else {
-                    continuation.resume(returning: true)
+    private func evaluateViewport(
+        _ configuration: LayoutConfiguration,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        do {
+            // Watchdogged for the same reason the stability waits are: this runs under a writer
+            // lease, and `evaluateJavaScript`'s completion handler is called by WebKit — a wedged
+            // content process simply never calls it, stranding the lease so readiness never
+            // publishes `.ready` and the spread stays hidden.
+            return try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: .continuous
+            ) { [weak self] in
+                guard let self else { return false }
+                return await withCheckedContinuation { continuation in
+                    self.webView.evaluateJavaScript(self.viewportScript(for: configuration)) { [weak self] _, error in
+                        if let error {
+                            let ns = error as NSError
+                            self?.log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+                            continuation.resume(returning: false)
+                        } else {
+                            continuation.resume(returning: true)
+                        }
+                    }
                 }
             }
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            // Reported apart from a WebKit-signalled failure: one is a page that answered, one is
+            // a page that stopped answering. The completion-handler arm above already returned
+            // `false` for the former, so only this arm is new information.
+            log(.warning, "Fixed viewport abandoned: deadline elapsed with the call suspended")
+            return false
+        } catch {
+            // Unreachable today — the operation resolves its continuation with a `Bool` and never
+            // throws, so `Expired` is the only verdict `run` can rethrow. Named rather than
+            // collapsed into the arm above so a future throwing operation is not silently
+            // misreported as a deadline expiry.
+            log(.warning, "Fixed viewport failed type=\(type(of: error)) [\((error as NSError).domain)#\((error as NSError).code)]")
+            return false
         }
     }
 
@@ -208,83 +241,94 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         guard remainingMilliseconds > 0 else { return false }
 
         do {
-            let result = try await webView.callAsyncJavaScript(
-                """
-                const absoluteDeadline = performance.now() + deadlineMilliseconds;
-                const beforeDeadline = () => performance.now() < absoluteDeadline;
-                const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
-                const cappedWait = new Promise(resolve => {
-                    setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
-                });
-                const currentFramesAndDocuments = () => {
-                    const frames = Array.from(document.querySelectorAll('iframe'));
-                    const documents = frames.map(frame => frame.contentDocument);
-                    if (frames.length === 0 || documents.some(child => child === null)) {
-                        return null;
-                    }
-                    return {frames, documents};
-                };
-                const stabilityWork = async () => {
-                    var loaded;
-                    while (beforeDeadline()) {
-                        loaded = currentFramesAndDocuments();
-                        if (loaded && loaded.documents.every(child => {
-                            const links = Array.from(child.querySelectorAll('link[rel~="stylesheet"]'));
-                            return links.every(link => link.sheet !== null);
-                        })) {
-                            break;
+            // See the reflowable twin: the script's `performance.now()` budget cannot expire a
+            // script that is not running, and this runs under a writer lease whose stranding
+            // leaves the spread permanently hidden.
+            let result = try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: .continuous
+            ) { [webView] in
+                try await webView.callAsyncJavaScript(
+                    """
+                    const absoluteDeadline = performance.now() + deadlineMilliseconds;
+                    const beforeDeadline = () => performance.now() < absoluteDeadline;
+                    const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+                    const cappedWait = new Promise(resolve => {
+                        setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
+                    });
+                    const currentFramesAndDocuments = () => {
+                        const frames = Array.from(document.querySelectorAll('iframe'));
+                        const documents = frames.map(frame => frame.contentDocument);
+                        if (frames.length === 0 || documents.some(child => child === null)) {
+                            return null;
                         }
-                        await nextFrame();
-                    }
-                    if (!loaded || !beforeDeadline()) {
-                        return false;
-                    }
-                    await Promise.all(loaded.documents.map(child => child.fonts?.ready));
-                    if (!beforeDeadline()) {
-                        return false;
-                    }
-
-                    var previous = null;
-                    var stableFrames = 0;
-                    for (let frameIndex = 0; frameIndex < 12 && stableFrames < 2 && beforeDeadline(); frameIndex += 1) {
-                        await nextFrame();
-                        loaded = currentFramesAndDocuments();
-                        if (!loaded) {
+                        return {frames, documents};
+                    };
+                    const stabilityWork = async () => {
+                        var loaded;
+                        while (beforeDeadline()) {
+                            loaded = currentFramesAndDocuments();
+                            if (loaded && loaded.documents.every(child => {
+                                const links = Array.from(child.querySelectorAll('link[rel~="stylesheet"]'));
+                                return links.every(link => link.sheet !== null);
+                            })) {
+                                break;
+                            }
+                            await nextFrame();
+                        }
+                        if (!loaded || !beforeDeadline()) {
                             return false;
                         }
-                        const current = loaded.frames.flatMap((frame, index) => {
-                            const child = loaded.documents[index];
-                            const rect = frame.getBoundingClientRect();
-                            return [
-                                rect.width,
-                                rect.height,
-                                child.documentElement.scrollWidth,
-                                child.documentElement.scrollHeight,
-                                child.body?.scrollWidth ?? 0,
-                                child.body?.scrollHeight ?? 0,
-                            ];
-                        });
-                        if (previous !== null && current.every((value, index) => value === previous[index])) {
-                            stableFrames += 1;
-                        } else {
-                            stableFrames = 0;
+                        await Promise.all(loaded.documents.map(child => child.fonts?.ready));
+                        if (!beforeDeadline()) {
+                            return false;
                         }
-                        previous = current;
-                    }
-                    return stableFrames >= 2;
-                };
-                return await Promise.race([stabilityWork(), cappedWait]);
-                """,
-                arguments: [
-                    "deadlineMilliseconds": remainingMilliseconds,
-                ],
-                in: nil,
-                contentWorld: .page
-            )
+
+                        var previous = null;
+                        var stableFrames = 0;
+                        for (let frameIndex = 0; frameIndex < 12 && stableFrames < 2 && beforeDeadline(); frameIndex += 1) {
+                            await nextFrame();
+                            loaded = currentFramesAndDocuments();
+                            if (!loaded) {
+                                return false;
+                            }
+                            const current = loaded.frames.flatMap((frame, index) => {
+                                const child = loaded.documents[index];
+                                const rect = frame.getBoundingClientRect();
+                                return [
+                                    rect.width,
+                                    rect.height,
+                                    child.documentElement.scrollWidth,
+                                    child.documentElement.scrollHeight,
+                                    child.body?.scrollWidth ?? 0,
+                                    child.body?.scrollHeight ?? 0,
+                                ];
+                            });
+                            if (previous !== null && current.every((value, index) => value === previous[index])) {
+                                stableFrames += 1;
+                            } else {
+                                stableFrames = 0;
+                            }
+                            previous = current;
+                        }
+                        return stableFrames >= 2;
+                    };
+                    return await Promise.race([stabilityWork(), cappedWait]);
+                    """,
+                    arguments: [
+                        "deadlineMilliseconds": remainingMilliseconds,
+                    ],
+                    in: nil,
+                    contentWorld: .page
+                )
+            }
             return
                 !Task.isCancelled &&
                 generation == readiness.generation &&
                 result as? Bool == true
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            log(.warning, "Fixed layout stability abandoned: deadline elapsed with the call suspended")
+            return false
         } catch is CancellationError {
             return false
         } catch {
@@ -359,9 +403,13 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         bootstrapTask?.cancel()
         bootstrapTask = Task { @MainActor [weak self] in
             guard let self, let layoutMutation else { return }
+            // The wrapper bootstrap holds no writer lease, but a hang here is just as terminal:
+            // `loadSpread()` is what follows, so a viewport call that never returns means the
+            // spread never loads at all.
+            let deadline = resolveInitializationStabilityDeadline()
             let succeeded = await layoutMutation.applyLatest { [weak self] configuration in
                 guard let self else { return false }
-                return await self.evaluateViewport(configuration)
+                return await self.evaluateViewport(configuration, until: deadline)
             }
             guard
                 succeeded,

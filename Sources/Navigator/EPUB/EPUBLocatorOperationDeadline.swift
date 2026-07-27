@@ -28,6 +28,17 @@ struct EPUBLocatorOperationDeadline: Equatable, Sendable {
         expiresAt = start.advanced(by: budget)
     }
 
+    /// Adopts an already-resolved instant as the deadline.
+    ///
+    /// The spread views resolve their stability instant through
+    /// `EPUBInitializationStabilityInheritance`, which has ALREADY taken the earlier of the
+    /// spread's own cap and any inherited operation deadline. Re-expressing that instant as a
+    /// budget to hand to the watchdog would reintroduce the "now plus a duration" shape this type
+    /// exists to eliminate; adopting the instant keeps the resolved value authoritative.
+    init(expiringAt instant: ContinuousClock.Instant) {
+        expiresAt = instant
+    }
+
     func hasExpired(at now: ContinuousClock.Instant) -> Bool {
         now >= expiresAt
     }
