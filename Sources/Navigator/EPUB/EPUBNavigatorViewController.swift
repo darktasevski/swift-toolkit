@@ -62,19 +62,30 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
+    /// - Parameter documentIsCurrent: whether the frame document `outcome`
+    ///   resolved against is still the one this spread owns. Read ONLY for a
+    ///   `.ready` outcome, because only a `.ready` outcome bound a document: a
+    ///   timeout or failure resolved against nothing, so folding currency into
+    ///   the guard below would turn it into a silent `.cancelled` and strand the
+    ///   caller with no fallback rung and no logged failure.
+    ///
+    ///   Currency here is document identity, never generation equality. A
+    ///   position or decoration writer acquired the instant readiness publishes
+    ///   advances the generation while keeping the same document — the benign
+    ///   same-document mutation that an equality gate reports as supersession.
     static func readySpreadNavigationDisposition(
         for outcome: EPUBSpreadReadiness.WaitOutcome,
         targetIsCurrent: Bool,
-        generationIsCurrent: Bool,
+        documentIsCurrent: Bool,
         taskIsCancelled: Bool
     ) -> PageCommandNavigationDisposition {
-        guard !taskIsCancelled, targetIsCurrent, generationIsCurrent else {
+        guard !taskIsCancelled, targetIsCurrent else {
             return .cancelled
         }
 
         switch outcome {
         case .ready:
-            return .landed
+            return documentIsCurrent ? .landed : .cancelled
         case .documentAvailable, .timedOut, .failed:
             return .miss
         case .invalidated, .cancelled:
@@ -1180,26 +1191,53 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return Task.isCancelled || !targetIsCurrent ? .cancelled : .miss
         }
 
-        let generation = spreadView.readiness.generation
         // Bounded by the SMALLER of this rung's own cap and what is left of the
         // operation: the per-rung cap still limits a single stuck readiness wait,
         // but it can no longer extend a landing past the operation deadline.
         let readinessCap = locatorClock.now().advanced(
             by: EPUBSpreadReadiness.commandReadinessBudget
         )
-        let outcome = await spreadView.readiness.waitForCommandReadiness(
-            for: generation,
-            until: deadline.effectiveDeadline(cappedBy: readinessCap)
-        )
+        let readinessDeadline = deadline.effectiveDeadline(cappedBy: readinessCap)
+        // Follow the DOCUMENT, not a fixed generation. Between reading readiness
+        // here and the wait registering, the host can acquire a position or
+        // decoration writer on a `.ready` spread — which advances the generation
+        // while keeping the same frame document. A generation-keyed wait sees
+        // that benign same-document mutation as `.invalidated` and reports the
+        // whole landing `.cancelled`, so the tap does nothing: no fallback rung,
+        // no logged failure. The document-keyed wait resumes on the successor
+        // generation instead. Only when no document is live is there nothing to
+        // follow, and the generation wait is the honest fallback.
+        let outcome: EPUBSpreadReadiness.WaitOutcome
+        if let capability = spreadView.readiness.currentFrameCapability {
+            outcome = await spreadView.readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: readinessDeadline
+            )
+        } else {
+            outcome = await spreadView.readiness.waitForCommandReadiness(
+                for: spreadView.readiness.generation,
+                until: readinessDeadline
+            )
+        }
         let targetIsCurrent = self.paginationView === paginationView
             && paginationView.currentIndex == index
             && paginationView.loadedViews[index] === spreadView
-        let generationIsCurrent = spreadView.readiness.generation == generation
+        // Currency is asked of the world the OUTCOME bound, matching
+        // `EPUBLocatorCommandReceipt.isCurrent`: same document, and a generation
+        // that has not walked backwards (which it cannot within one readiness
+        // instance, so a lower value means readiness was replaced wholesale).
+        let documentIsCurrent: Bool
+        if case let .ready(readyGeneration, readyCapability) = outcome {
+            documentIsCurrent = spreadView.readiness.currentFrameCapability == readyCapability
+                && spreadView.readiness.generation >= readyGeneration
+        } else {
+            documentIsCurrent = false
+        }
 
         switch Self.readySpreadNavigationDisposition(
             for: outcome,
             targetIsCurrent: targetIsCurrent,
-            generationIsCurrent: generationIsCurrent,
+            documentIsCurrent: documentIsCurrent,
             taskIsCancelled: Task.isCancelled
         ) {
         case .landed:
@@ -2052,34 +2090,23 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
             else {
                 return false
             }
-            // Bounded deliberately. `waitForCommandReadiness(forDocument:)` loops while the
-            // capability survives, re-waiting on each successor generation — so a document
-            // whose generation keeps advancing (exactly the font/stylesheet/progression churn
+            // Bounded deliberately. The document-scoped wait loops while the capability
+            // survives, re-waiting on each successor generation — so a document whose
+            // generation keeps advancing (exactly the font/stylesheet/progression churn
             // this probe exists to wait out) would never return. Unbounded, that is a suite
             // HANG rather than a failure: no assertion message, no diagnostic, the whole run
-            // dies. Racing a deadline converts that into an ordinary `false`.
+            // dies. The deadline converts that into an ordinary `false`.
             let deadline = EPUBLocatorOperationDeadline(
                 startingAt: locatorClock.now(),
                 budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
             )
-            let clock = locatorClock
-            return await withTaskGroup(of: Bool.self) { group in
-                group.addTask { @MainActor in
-                    guard case .ready = await spreadView.readiness.waitForCommandReadiness(
-                        forDocument: capability
-                    ) else {
-                        return false
-                    }
-                    return true
-                }
-                group.addTask {
-                    try? await clock.sleep(deadline.expiresAt)
-                    return false
-                }
-                let result = await group.next() ?? false
-                group.cancelAll()
-                return result
+            guard case .ready = await spreadView.readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: deadline.expiresAt
+            ) else {
+                return false
             }
+            return true
         }
     }
 #endif

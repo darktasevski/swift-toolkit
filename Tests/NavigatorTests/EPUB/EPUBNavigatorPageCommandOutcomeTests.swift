@@ -63,7 +63,7 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             EPUBNavigatorViewController.readySpreadNavigationDisposition(
                 for: .invalidated,
                 targetIsCurrent: true,
-                generationIsCurrent: false,
+                documentIsCurrent: false,
                 taskIsCancelled: false
             ),
             .cancelled
@@ -78,7 +78,7 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
                     frameCapability: EPUBSpreadFrameCapability()
                 ),
                 targetIsCurrent: false,
-                generationIsCurrent: true,
+                documentIsCurrent: true,
                 taskIsCancelled: false
             ),
             .cancelled
@@ -90,7 +90,54 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
             EPUBNavigatorViewController.readySpreadNavigationDisposition(
                 for: .timedOut,
                 targetIsCurrent: true,
-                generationIsCurrent: true,
+                documentIsCurrent: true,
+                taskIsCancelled: false
+            ),
+            .miss
+        )
+    }
+
+    func testReadinessPublishedForAReplacedDocumentIsReportedAsCancelled() {
+        // The document the wait resolved against is gone by the time the caller
+        // resumes — a replacement load, invalidation or `pagehide`. The landing
+        // bound a world that no longer exists, so the command was superseded and
+        // must stop SILENTLY rather than advance a fallback rung against the
+        // document that replaced it.
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .ready(
+                    generation: 7,
+                    frameCapability: EPUBSpreadFrameCapability()
+                ),
+                targetIsCurrent: true,
+                documentIsCurrent: false,
+                taskIsCancelled: false
+            ),
+            .cancelled
+        )
+    }
+
+    func testAStaleDocumentDoesNotDowngradeATimeoutToCancellation() {
+        // Document currency gates only a `.ready` outcome, because only a
+        // `.ready` outcome bound a document. A timeout or failure resolved
+        // against nothing, so its own disposition governs: `.miss`, which lets
+        // the caller's next fallback rung run. Folding currency into the top
+        // guard turned every such outcome into a silent `.cancelled` — a tap
+        // that does nothing, with no fallback and no logged failure.
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .timedOut,
+                targetIsCurrent: true,
+                documentIsCurrent: false,
+                taskIsCancelled: false
+            ),
+            .miss
+        )
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .failed(generation: 7),
+                targetIsCurrent: true,
+                documentIsCurrent: false,
                 taskIsCancelled: false
             ),
             .miss

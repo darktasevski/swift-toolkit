@@ -142,7 +142,7 @@ final class EPUBSpreadReadinessTests: XCTestCase {
             EPUBNavigatorViewController.readySpreadNavigationDisposition(
                 for: outcome,
                 targetIsCurrent: true,
-                generationIsCurrent: readiness.generation == generation,
+                documentIsCurrent: readiness.generation == generation,
                 taskIsCancelled: false
             ),
             .cancelled
@@ -250,7 +250,7 @@ final class EPUBSpreadReadinessTests: XCTestCase {
             EPUBNavigatorViewController.readySpreadNavigationDisposition(
                 for: laterOutcome,
                 targetIsCurrent: true,
-                generationIsCurrent: readiness.generation == generation,
+                documentIsCurrent: readiness.generation == generation,
                 taskIsCancelled: false
             ),
             .miss
@@ -501,6 +501,91 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         let outcome = await readiness.waitForCommandReadiness(
             forDocument: EPUBSpreadFrameCapability(id: UUID())
         )
+        XCTAssertEqual(outcome, .invalidated)
+    }
+
+    // MARK: - Deadline-bounded document-scoped readiness
+
+    func testDeadlineBoundedDocumentReadinessSurvivesPositionMutation() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+
+        // The landing path reads the generation, then yields before its wait
+        // registers. A decoration or position writer acquired in that window
+        // advances the generation while keeping the same frame document — the
+        // benign same-document mutation that used to surface as `.cancelled`.
+        let writer = try XCTUnwrap(readiness.acquirePositionWriter())
+
+        let waiter = Task { @MainActor in
+            await readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: ContinuousClock.now.advanced(by: .seconds(5))
+            )
+        }
+        await Task.yield()
+
+        readiness.release(writer)
+
+        let resumed = await waiter.value
+        XCTAssertEqual(
+            resumed,
+            .ready(generation: writer.generation, frameCapability: capability)
+        )
+    }
+
+    func testDeadlineBoundedDocumentReadinessTimesOutWithoutPoisoningLateReadiness() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        let writer = try XCTUnwrap(readiness.acquirePositionWriter())
+
+        let timedOut = await readiness.waitForCommandReadiness(
+            forDocument: capability,
+            until: ContinuousClock.now.advanced(by: .milliseconds(10))
+        )
+        XCTAssertEqual(timedOut, .timedOut)
+
+        readiness.release(writer)
+        let lateOutcome = await readiness.waitForCommandReadiness(forDocument: capability)
+        XCTAssertEqual(
+            lateOutcome,
+            .ready(generation: writer.generation, frameCapability: capability)
+        )
+    }
+
+    func testDeadlineBoundedDocumentReadinessIsInvalidatedByReplacementLoad() async throws {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+        let initialization = try XCTUnwrap(readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        readiness.finishInitialization(initialization, outcome: .succeeded)
+        _ = try XCTUnwrap(readiness.acquirePositionWriter())
+
+        let waiter = Task { @MainActor in
+            await readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: ContinuousClock.now.advanced(by: .seconds(5))
+            )
+        }
+        await Task.yield()
+
+        readiness.beginLoading()
+
+        let outcome = await waiter.value
         XCTAssertEqual(outcome, .invalidated)
     }
 

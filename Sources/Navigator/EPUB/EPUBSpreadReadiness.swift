@@ -408,11 +408,42 @@ final class EPUBSpreadReadiness {
     func waitForCommandReadiness(
         forDocument capability: EPUBSpreadFrameCapability
     ) async -> WaitOutcome {
+        await waitForCommandReadiness(forDocument: capability) { generation in
+            await self.waitForCommandReadiness(for: generation)
+        }
+    }
+
+    /// The deadline-bounded form of `waitForCommandReadiness(forDocument:)`.
+    ///
+    /// Every re-wait shares the SAME absolute instant, so following a document
+    /// across an unbounded number of same-document mutations cannot extend the
+    /// operation past its deadline — an advancing generation buys no extra time,
+    /// it only redistributes what is left. A document whose generation keeps
+    /// advancing (font, stylesheet and progression churn during initialization)
+    /// therefore surfaces as `.timedOut`, which the caller reads as a miss, and
+    /// never as a hang.
+    func waitForCommandReadiness(
+        forDocument capability: EPUBSpreadFrameCapability,
+        until deadline: ContinuousClock.Instant
+    ) async -> WaitOutcome {
+        await waitForCommandReadiness(forDocument: capability) { generation in
+            await self.waitForCommandReadiness(for: generation, until: deadline)
+        }
+    }
+
+    /// The one document-following law, parameterized by how each generation is
+    /// awaited. Both overloads above are this loop; keeping a single body is
+    /// what stops the bounded and unbounded forms from drifting on the question
+    /// that matters — which advances count as the same document.
+    private func waitForCommandReadiness(
+        forDocument capability: EPUBSpreadFrameCapability,
+        awaitingEachGenerationWith generationWait: (Generation) async -> WaitOutcome
+    ) async -> WaitOutcome {
         while !Task.isCancelled {
             guard currentFrameCapability == capability else {
                 return .invalidated
             }
-            let outcome = await waitForCommandReadiness(for: generation)
+            let outcome = await generationWait(generation)
             switch outcome {
             case let .ready(readyGeneration, readyCapability):
                 guard readyCapability == capability else {

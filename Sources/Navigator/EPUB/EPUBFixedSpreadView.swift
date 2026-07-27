@@ -222,7 +222,8 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // throws, so `Expired` is the only verdict `run` can rethrow. Named rather than
             // collapsed into the arm above so a future throwing operation is not silently
             // misreported as a deadline expiry.
-            log(.warning, "Fixed viewport failed type=\(type(of: error)) [\((error as NSError).domain)#\((error as NSError).code)]")
+            let ns = error as NSError
+            log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
             return false
         }
     }
