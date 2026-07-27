@@ -5,6 +5,14 @@
 # Run the test suite.
 #
 # FILTER - Optional target to run (e.g. ReadiumSharedTests)
+#
+# Environment:
+#   READIUM_TEST_DESTINATION  xcodebuild -destination to use, overriding the
+#                             device-name default below. A caller running this
+#                             alongside other suites on the same machine should
+#                             pass a UDID-targeted destination: concurrent runs
+#                             that share a simulator BY NAME clobber each
+#                             other's installed test host.
 # =============================================================================
 
 set -euo pipefail
@@ -12,7 +20,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-DESTINATION="platform=iOS Simulator,name=iPad (A16)"
+DESTINATION="${READIUM_TEST_DESTINATION:-platform=iOS Simulator,name=iPad (A16)}"
 FILTER="${1:-}"
 
 ARGS=(
