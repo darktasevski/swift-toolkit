@@ -467,10 +467,20 @@ function commandResult(token, outcome, reasonCode) {
   return { token, outcome, reasonCode };
 }
 
+// Kept local rather than imported from `utils.js`: this bundle runs in an isolated content world
+// and must not pull in the page-world module. It MUST stay identical to `isAddressableTextNode`
+// there — both implement the one `textNodeIndex` counting law the Rust indexer produces against.
+function isAddressableTextNode(node) {
+  return (
+    node.nodeType === Node.TEXT_NODE ||
+    node.nodeType === Node.CDATA_SECTION_NODE
+  );
+}
+
 function textNodeAt(element, requestedIndex) {
   let index = 0;
   for (const child of element.childNodes) {
-    if (child.nodeType !== Node.TEXT_NODE) {
+    if (!isAddressableTextNode(child)) {
       continue;
     }
     if (index === requestedIndex) {

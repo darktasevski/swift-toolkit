@@ -4,7 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-import { logError } from "./utils";
+import { isAddressableTextNode, logError } from "./utils";
 import { toNativeRect } from "./rect";
 import { TextRange } from "./vendor/hypothesis/anchoring/text-range";
 
@@ -158,7 +158,11 @@ function getCssSelector(element) {
   const path = [];
   let current = element;
 
-  while (current && current !== document.body && current !== document.documentElement) {
+  while (
+    current &&
+    current !== document.body &&
+    current !== document.documentElement
+  ) {
     if (current.nodeType !== Node.ELEMENT_NODE) {
       current = current.parentElement;
       continue;
@@ -204,8 +208,8 @@ function getCssSelector(element) {
 function getTextNodeIndex(node) {
   if (!node) return -1;
 
-  // If the node is not a text node, return -1
-  if (node.nodeType !== Node.TEXT_NODE) {
+  // If the node cannot hold a `textNodeIndex` slot, return -1
+  if (!isAddressableTextNode(node)) {
     return -1;
   }
 
@@ -217,7 +221,7 @@ function getTextNodeIndex(node) {
     if (child === node) {
       return textNodeIndex;
     }
-    if (child.nodeType === Node.TEXT_NODE) {
+    if (isAddressableTextNode(child)) {
       textNodeIndex++;
     }
   }
@@ -239,16 +243,14 @@ function computeDomRange(range) {
     const endOffset = range.endOffset;
 
     // Get the parent element for the start
-    const startElement =
-      startContainer.nodeType === Node.TEXT_NODE
-        ? startContainer.parentElement
-        : startContainer;
+    const startElement = isAddressableTextNode(startContainer)
+      ? startContainer.parentElement
+      : startContainer;
 
     // Get the parent element for the end
-    const endElement =
-      endContainer.nodeType === Node.TEXT_NODE
-        ? endContainer.parentElement
-        : endContainer;
+    const endElement = isAddressableTextNode(endContainer)
+      ? endContainer.parentElement
+      : endContainer;
 
     if (!startElement || !endElement) {
       return null;
@@ -260,20 +262,23 @@ function computeDomRange(range) {
     // Validate CSS selectors - must be non-null and non-empty.
     // Empty selectors can occur with malformed HTML, elements removed from DOM during selection,
     // or edge cases where getCssSelector cannot build a valid path (e.g., detached nodes).
-    if (!startCssSelector || !endCssSelector || startCssSelector === "" || endCssSelector === "") {
+    if (
+      !startCssSelector ||
+      !endCssSelector ||
+      startCssSelector === "" ||
+      endCssSelector === ""
+    ) {
       return null;
     }
 
     // Get text node indices
-    const startTextNodeIndex =
-      startContainer.nodeType === Node.TEXT_NODE
-        ? getTextNodeIndex(startContainer)
-        : 0;
+    const startTextNodeIndex = isAddressableTextNode(startContainer)
+      ? getTextNodeIndex(startContainer)
+      : 0;
 
-    const endTextNodeIndex =
-      endContainer.nodeType === Node.TEXT_NODE
-        ? getTextNodeIndex(endContainer)
-        : 0;
+    const endTextNodeIndex = isAddressableTextNode(endContainer)
+      ? getTextNodeIndex(endContainer)
+      : 0;
 
     // Validate text node indices - getTextNodeIndex returns -1 on failure
     if (startTextNodeIndex < 0 || endTextNodeIndex < 0) {
@@ -315,7 +320,7 @@ export function convertRangeInfo(document, rangeInfo) {
     }
     startContainer =
       startElement.childNodes[rangeInfo.startContainerChildTextNodeIndex];
-    if (startContainer.nodeType !== Node.TEXT_NODE) {
+    if (!isAddressableTextNode(startContainer)) {
       return undefined;
     }
   }
@@ -334,7 +339,7 @@ export function convertRangeInfo(document, rangeInfo) {
     }
     endContainer =
       endElement.childNodes[rangeInfo.endContainerChildTextNodeIndex];
-    if (endContainer.nodeType !== Node.TEXT_NODE) {
+    if (!isAddressableTextNode(endContainer)) {
       return undefined;
     }
   }
