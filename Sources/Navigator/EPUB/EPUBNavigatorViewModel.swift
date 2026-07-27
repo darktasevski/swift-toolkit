@@ -110,8 +110,7 @@ protocol EPUBNavigatorViewModelDelegate: AnyObject {
     /// `nonisolated` so unit tests on a non-`@MainActor` `XCTestCase` can
     /// exercise it directly. Mirrors the same pattern as
     /// `EPUBReflowableSpreadView.decodeVisibleAnchorBody`.
-    @_spi(Testing)
-    public nonisolated static func pathOnlyKey(from normalized: String) -> String {
+    nonisolated static func pathOnlyKey(from normalized: String) -> String {
         guard let schemeSep = normalized.range(of: "://") else {
             return normalized
         }
@@ -247,8 +246,7 @@ protocol EPUBNavigatorViewModelDelegate: AnyObject {
 
     // MARK: - Web View Server
 
-    @_spi(Testing)
-    public func serve(href: RelativeURL) async -> (Resource, MediaType)? {
+    func serve(href: RelativeURL) async -> (Resource, MediaType)? {
         guard var resource = publication.get(href) else {
             return nil
         }
