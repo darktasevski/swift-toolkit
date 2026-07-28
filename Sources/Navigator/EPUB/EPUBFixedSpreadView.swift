@@ -31,12 +31,19 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
         scripts: [WKUserScript],
-        animatedLoad: Bool
+        animatedLoad: Bool,
+        stabilityBudget: EPUBInitializationStabilityBudget = .production
     ) {
         var scripts = scripts
         scripts.append(WKUserScript(source: Self.fixedScript, injectionTime: .atDocumentStart, forMainFrameOnly: false))
 
-        super.init(viewModel: viewModel, spread: spread, scripts: scripts, animatedLoad: animatedLoad)
+        super.init(
+            viewModel: viewModel,
+            spread: spread,
+            scripts: scripts,
+            animatedLoad: animatedLoad,
+            stabilityBudget: stabilityBudget
+        )
     }
 
     override func setupWebView() {
@@ -177,7 +184,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         // `resolveInitializationStabilityDeadline()` would hand the stability wait a fresh
         // allowance after the viewport call had already spent time — the re-arming that
         // `EPUBLocatorOperationDeadline` exists to make impossible.
-        let deadline = stabilityDeadline ?? resolveInitializationStabilityDeadline()
+        let deadline = stabilityDeadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
         return await layoutMutation.applyLatest { [weak self] configuration in
             guard let self else { return false }
             guard await self.evaluateViewport(configuration, until: deadline) else { return false }
@@ -236,9 +243,12 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             return false
         }
 
-        let deadline = deadline ?? resolveInitializationStabilityDeadline()
+        let deadline = deadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
         let remainingMilliseconds = EPUBSpreadReadiness
-            .remainingInitializationStabilityMilliseconds(until: deadline)
+            .remainingInitializationStabilityMilliseconds(
+                until: deadline,
+                clock: stabilityBudget.clock
+            )
         guard remainingMilliseconds > 0 else { return false }
 
         do {
@@ -407,7 +417,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // The wrapper bootstrap holds no writer lease, but a hang here is just as terminal:
             // `loadSpread()` is what follows, so a viewport call that never returns means the
             // spread never loads at all.
-            let deadline = resolveInitializationStabilityDeadline()
+            let deadline = resolveInitializationStabilityDeadline(for: .ownCap)
             let succeeded = await layoutMutation.applyLatest { [weak self] configuration in
                 guard let self else { return false }
                 return await self.evaluateViewport(configuration, until: deadline)

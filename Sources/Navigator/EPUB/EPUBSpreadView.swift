@@ -121,15 +121,25 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         readiness.isCommandReady
     }
 
+    /// This spread's sole authority for the length of a stabilization budget.
+    ///
+    /// Injected so a caller can widen it or count its mints. A test driving a
+    /// real WKWebView otherwise has to bet that the host meets the production
+    /// allowance, and that bet is lost by a loaded machine while the behaviour
+    /// under test is correct.
+    let stabilityBudget: EPUBInitializationStabilityBudget
+
     required init(
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
         scripts: [WKUserScript],
-        animatedLoad: Bool
+        animatedLoad: Bool,
+        stabilityBudget: EPUBInitializationStabilityBudget = .production
     ) {
         self.viewModel = viewModel
         self.spread = spread
         self.animatedLoad = animatedLoad
+        self.stabilityBudget = stabilityBudget
 
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(viewModel.server, forURLScheme: viewModel.server.scheme)
@@ -627,10 +637,18 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// through. Every other load — an ordinary page turn, a settings re-layout, a
     /// PRELOADED NEIGHBOUR initializing during someone else's operation — keeps its own
     /// full allowance.
-    func resolveInitializationStabilityDeadline() -> ContinuousClock.Instant {
-        let clock = EPUBMonotonicClock.continuous
+    /// - Parameter purpose: `.sharedInitialization` for the one allowance an
+    ///   initialization spends across all of its rungs; `.ownCap` for a caller
+    ///   that legitimately arms an allowance of its own — a settings re-layout,
+    ///   a content-inset change, a pre-load viewport call. The distinction is
+    ///   what lets "an initialization never re-arms per rung" be asserted as a
+    ///   count rather than inferred from elapsed time.
+    func resolveInitializationStabilityDeadline(
+        for purpose: EPUBInitializationStabilityBudget.Purpose = .sharedInitialization
+    ) -> ContinuousClock.Instant {
+        let clock = stabilityBudget.clock
         return EPUBInitializationStabilityInheritance.resolve(
-            ownCap: EPUBSpreadReadiness.makeInitializationStabilityDeadline(clock: clock),
+            ownCap: stabilityBudget.deadline(purpose),
             inheritedFrom: delegate?.spreadViewLocatorOperationDeadline(self),
             at: clock.now()
         )

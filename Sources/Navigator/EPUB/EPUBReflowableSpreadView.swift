@@ -116,7 +116,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
         scripts: [WKUserScript],
-        animatedLoad: Bool
+        animatedLoad: Bool,
+        stabilityBudget: EPUBInitializationStabilityBudget = .production
     ) {
         var scripts = scripts
         scripts.append(WKUserScript(
@@ -128,7 +129,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             viewModel: viewModel,
             spread: spread,
             scripts: scripts,
-            animatedLoad: animatedLoad
+            animatedLoad: animatedLoad,
+            stabilityBudget: stabilityBudget
         )
     }
 
@@ -323,9 +325,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             // whenever layout was slow", silently leaving the prior page's observer installed.
             _ = try await EPUBLocatorCommandWatchdog.run(
                 until: EPUBLocatorOperationDeadline(
-                    expiringAt: EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+                    expiringAt: stabilityBudget.deadline(.ownCap)
                 ),
-                clock: .continuous
+                clock: stabilityBudget.clock
             ) { [webView] in
                 try await webView.callAsyncJavaScript(
                     "readium.initAnchorTracking(anchorIds);",
@@ -376,9 +378,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return false
         }
 
-        let deadline = deadline ?? resolveInitializationStabilityDeadline()
+        let deadline = deadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
         let remainingMilliseconds = EPUBSpreadReadiness
-            .remainingInitializationStabilityMilliseconds(until: deadline)
+            .remainingInitializationStabilityMilliseconds(
+                until: deadline,
+                clock: stabilityBudget.clock
+            )
         guard remainingMilliseconds > 0 else { return false }
 
         do {
@@ -747,7 +752,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             if turn.animated {
                 await scrollAnimationCoordinator.waitUntilSettled()
             }
-            let layoutCap = EPUBSpreadReadiness.makeInitializationStabilityDeadline()
+            let layoutCap = stabilityBudget.deadline(.ownCap)
             guard await waitForLayoutStability(
                 until: settleDeadline.effectiveDeadline(cappedBy: layoutCap)
             ) else {
