@@ -552,7 +552,16 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     }
 
     func testUnavailableStylesheetUsesOneBudgetAndDoesNotPoisonReplacement() async throws {
-        let spreadView = makeReflowableSpreadView()
+        // Short for the allowance this test watches get SPENT — an unavailable
+        // stylesheet never resolves, so the first initialization runs it out on
+        // purpose and pays for it in wall time. Generous for the replacement,
+        // which must genuinely succeed: a short allowance there expires before
+        // a starved host can settle a real WKWebView, and asserting `.succeeded`
+        // against it is exactly the machine-speed bet #1693 was about.
+        let mintLog = StabilityBudgetMintLog()
+        let spreadView = makeReflowableSpreadView(
+            stabilityBudget: mintLog.budget(firstSharedAllowance: 1000, then: 60000)
+        )
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
         try await waitForDocumentLoad(in: spreadView)
@@ -564,27 +573,40 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             contentWorld: .page
         )
 
-        let clock = ContinuousClock()
-        let startedAt = clock.now
-        let outcome = try await initializeLoadedReflowableSpread(spreadView)
-        let elapsed = startedAt.duration(to: clock.now)
+        // Brackets `initializeSpread()` alone, WITHOUT `applySettings()`: the
+        // content-inset re-layout that `applySettings()` triggers arms its own
+        // allowance from inside a detached Task, so it lands at an unpredictable
+        // point and would make any count here race it.
+        let generation = spreadView.readiness.generation
+        let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
+            for: generation,
+            frameCapability: EPUBSpreadFrameCapability()
+        ))
+        let mintsBefore = mintLog.totalCount()
+        let outcome = await spreadView.initializeSpread()
+        let mintsDuringInitialization = mintLog.totalCount() - mintsBefore
+        spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
 
         XCTAssertEqual(outcome, .failed)
-        // The claim is a budget COUNT, not a machine speed: an unavailable
-        // stylesheet must consume exactly one stability budget, never re-arm a
-        // fresh one per rung. So the window discriminates one budget from two
-        // and nothing finer — a tighter upper bound measures how loaded the host
-        // is, which is why this assertion used to fail on a busy machine while
-        // the behaviour it guards was correct. Both bounds carry the same 250 ms
-        // tolerance: at least one full budget elapsed, and strictly fewer than
-        // two did.
-        XCTAssertGreaterThanOrEqual(
-            elapsed,
-            .milliseconds(EPUBSpreadReadiness.initializationStabilityBudgetMilliseconds - 250)
-        )
-        XCTAssertLessThan(
-            elapsed,
-            .milliseconds(2 * EPUBSpreadReadiness.initializationStabilityBudgetMilliseconds - 250)
+        // The claim is a budget COUNT: an unavailable stylesheet must consume
+        // exactly ONE shared stability allowance, never re-arm a fresh one per
+        // rung. It used to be inferred from elapsed wall time against a ±250 ms
+        // window, which also measured how loaded the host was — and that is
+        // what failed on a busy machine while the behaviour it guards was
+        // correct (#1693).
+        //
+        // Exactly one: `initializeSpread()` returns `.failed` the moment the
+        // stylesheet wait gives up, which is before the anchor-tracking rung
+        // and its independent own cap are reached. Counting the TOTAL rather
+        // than only `.sharedInitialization` is what makes this sensitive — a
+        // rung that re-armed would fall back through the `.ownCap` path, and a
+        // shared-only count would not see the very regression this guards.
+        XCTAssertEqual(
+            mintsDuringInitialization,
+            1,
+            "Initialization armed \(mintsDuringInitialization) allowances "
+                + "(\(mintLog.describeCounts())) — expected exactly one, the "
+                + "shared budget the stylesheet wait spends"
         )
 
         spreadView.webView.configuration.userContentController.addUserScript(WKUserScript(
@@ -733,28 +755,125 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
     }
 
+    /// The stability allowance these tests build spread views with.
+    ///
+    /// Deliberately far wider than production's 5 s. The budget is a product
+    /// decision about how long a reader waits for a page to settle; what these
+    /// tests assert is the MECHANISM around it, and every one of them reaches
+    /// that mechanism through a real WKWebView whose settle time is the host's
+    /// to decide. Running them against the production allowance made the
+    /// assertions bets on machine speed, and a loaded host lost those bets
+    /// while the behaviour under test was correct (#1693). A test that wants to
+    /// observe an allowance being SPENT asks for a short one explicitly.
+    private nonisolated static let generousStabilityBudget = EPUBInitializationStabilityBudget(
+        milliseconds: 60000,
+        clock: .continuous
+    )
+
+    /// Counts stability allowances as they are minted, per purpose.
+    ///
+    /// Lets a test assert how many budgets a generation armed — the property
+    /// "one budget, never re-armed per rung" actually claims — instead of
+    /// inferring it from elapsed wall time, which measures host load as much as
+    /// it measures re-arming.
+    private final class StabilityBudgetMintLog: @unchecked Sendable {
+        private let lock = NSLock()
+        private var counts: [EPUBInitializationStabilityBudget.Purpose: Int] = [:]
+
+        func record(_ purpose: EPUBInitializationStabilityBudget.Purpose) {
+            lock.lock()
+            defer { lock.unlock() }
+            counts[purpose, default: 0] += 1
+        }
+
+        func count(_ purpose: EPUBInitializationStabilityBudget.Purpose) -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return counts[purpose, default: 0]
+        }
+
+        /// Every allowance armed, whatever its purpose.
+        ///
+        /// The total is what "an initialization never re-arms per rung" has to
+        /// be asserted against: a rung that re-armed would fall back through
+        /// the `?? resolveInitializationStabilityDeadline(for: .ownCap)` path,
+        /// so counting `.sharedInitialization` alone would miss precisely the
+        /// regression this is here to catch.
+        func totalCount() -> Int {
+            lock.lock()
+            defer { lock.unlock() }
+            return counts.values.reduce(0, +)
+        }
+
+        func describeCounts() -> String {
+            lock.lock()
+            defer { lock.unlock() }
+            return counts
+                .map { "\($0.key)=\($0.value)" }
+                .sorted()
+                .joined(separator: " ")
+        }
+
+        /// A budget of `milliseconds` that tallies every mint that passes
+        /// through it.
+        func budget(milliseconds: Int) -> EPUBInitializationStabilityBudget {
+            budget(firstSharedAllowance: milliseconds, then: milliseconds)
+        }
+
+        /// A budget that hands the FIRST shared-initialization allowance
+        /// `firstSharedAllowance` ms and every later one `then` ms.
+        ///
+        /// The two numbers answer two different needs that one number cannot.
+        /// A test that wants to watch an allowance be SPENT — an unavailable
+        /// stylesheet never resolves — pays that allowance in wall time, so it
+        /// wants a short one. The initialization that follows must genuinely
+        /// SUCCEED, and on a starved host a short allowance expires before a
+        /// real WKWebView can settle, which is the machine-speed bet #1693 was
+        /// about. Own caps are unaffected: they bound a hang, never a settle.
+        func budget(
+            firstSharedAllowance: Int,
+            then laterAllowance: Int
+        ) -> EPUBInitializationStabilityBudget {
+            let clock = EPUBMonotonicClock.continuous
+            return EPUBInitializationStabilityBudget(
+                milliseconds: laterAllowance,
+                clock: clock
+            ) { [self] purpose in
+                let isFirstShared = purpose == .sharedInitialization
+                    && count(.sharedInitialization) == 0
+                record(purpose)
+                let milliseconds = isFirstShared ? firstSharedAllowance : laterAllowance
+                return clock.now().advanced(by: .milliseconds(milliseconds))
+            }
+        }
+    }
+
     private func makeReflowableSpreadView(
         scroll: Bool = false,
-        scripts: [WKUserScript] = []
+        scripts: [WKUserScript] = [],
+        stabilityBudget: EPUBInitializationStabilityBudget = EPUBSpreadViewCommandOutcomeTests.generousStabilityBudget
     ) -> EPUBReflowableSpreadView {
         let fixture = makeFixture(layout: .reflowable, scroll: scroll)
         return EPUBReflowableSpreadView(
             viewModel: fixture.viewModel,
             spread: fixture.spread,
             scripts: scripts,
-            animatedLoad: false
+            animatedLoad: false,
+            stabilityBudget: stabilityBudget
         )
     }
 
     private func makeFixedSpreadView(
-        scripts: [WKUserScript] = []
+        scripts: [WKUserScript] = [],
+        stabilityBudget: EPUBInitializationStabilityBudget = EPUBSpreadViewCommandOutcomeTests.generousStabilityBudget
     ) -> EPUBFixedSpreadView {
         let fixture = makeFixture(layout: .fixed)
         return EPUBFixedSpreadView(
             viewModel: fixture.viewModel,
             spread: fixture.spread,
             scripts: scripts,
-            animatedLoad: false
+            animatedLoad: false,
+            stabilityBudget: stabilityBudget
         )
     }
 
@@ -828,17 +947,47 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         return (viewModel, spread)
     }
 
+    /// Waits for the spread's document to finish loading.
+    ///
+    /// This is SETUP, never the property under test: every assertion in this
+    /// class is about what happens to an already-loaded document. So a wait
+    /// that expires here means the host failed to deliver a precondition, and
+    /// the honest verdict is a skip rather than a failure attributed to the
+    /// navigator.
+    ///
+    /// The environmental cause is identified (#1693): under CPU starvation the
+    /// simulator's WebContent process becomes unresponsive — WebKit logs
+    /// `WebProcessProxy::didBecomeUnresponsive` and stops making progress with
+    /// the main resource already served, so the load hangs at
+    /// `estimatedProgress == 0.1` forever. WebKit exposes no delegate for that
+    /// state; `webViewWebContentProcessDidTerminate` fires only on termination,
+    /// which is why nothing here can convert it into a navigator-visible
+    /// failure. A longer ceiling cannot help a process that is not running.
+    ///
+    /// Deliberately narrow: only this wait skips. An initialization that
+    /// completes and reports `.failed` still fails the test, because a spent
+    /// stability budget and a broken contract are indistinguishable from the
+    /// outcome alone — and the budget these tests run with is wide enough that
+    /// starvation is no longer the likely explanation.
     private func waitForDocumentLoad(in spreadView: EPUBSpreadView) async throws {
         do {
-            try await waitUntil {
+            try await waitUntil(reportingFailure: false) {
                 guard case .loading = spreadView.readiness.state else {
                     return false
                 }
                 return !spreadView.webView.isLoading
             }
         } catch {
-            XCTFail("Document did not load: state=\(spreadView.readiness.state), isLoading=\(spreadView.webView.isLoading)")
-            throw error
+            throw XCTSkip(
+                """
+                Environment did not deliver a loaded document — WebContent \
+                process is not making progress (see #1693). \
+                state=\(spreadView.readiness.state), \
+                isLoading=\(spreadView.webView.isLoading), \
+                progress=\(spreadView.webView.estimatedProgress), \
+                committedURL=\(spreadView.webView.url?.lastPathComponent ?? "nil")
+                """
+            )
         }
     }
 
@@ -915,7 +1064,9 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
     }
 
-    /// Liveness backstop, not a performance bound — see `waitUntil`.
+    /// Liveness backstop, not a performance bound — see `waitUntil`. Setup, so
+    /// an expiry is an environmental skip for the reasons `waitForDocumentLoad`
+    /// documents.
     private func waitForFixedResourceLoad(in spreadView: EPUBFixedSpreadView) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
@@ -931,8 +1082,15 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             try await clock.sleep(for: .milliseconds(20))
         }
-        XCTFail("Fixed resource did not become available before timeout")
-        throw TestTimeout()
+        throw XCTSkip(
+            """
+            Environment did not deliver the fixed-layout iframe resource — \
+            WebContent process is not making progress (see #1693). \
+            state=\(spreadView.readiness.state), \
+            isLoading=\(spreadView.webView.isLoading), \
+            progress=\(spreadView.webView.estimatedProgress)
+            """
+        )
     }
 
     private func initializeReflowableSpread(
@@ -1036,8 +1194,12 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// failure while removing the false one a loaded host produces — a 5 s
     /// ceiling was a bet on machine speed, and a saturated simulator lost it
     /// while the behaviour under test was correct.
+    /// - Parameter reportingFailure: whether an expiry is itself a test failure.
+    ///   Setup waits pass `false` and translate the throw into an environmental
+    ///   skip; assertion waits keep the default and go red.
     private func waitUntil(
         timeout: Duration = .seconds(30),
+        reportingFailure: Bool = true,
         _ predicate: @MainActor () -> Bool
     ) async throws {
         let clock = ContinuousClock()
@@ -1048,7 +1210,9 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             try await clock.sleep(for: .milliseconds(20))
         }
-        XCTFail("Condition did not become true before timeout")
+        if reportingFailure {
+            XCTFail("Condition did not become true before timeout")
+        }
         throw TestTimeout()
     }
 }
