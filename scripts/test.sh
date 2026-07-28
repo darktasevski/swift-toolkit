@@ -17,6 +17,13 @@
 #                             "ReadiumNavigatorTests/SomeFlakyTests". A caller
 #                             that quarantines a class is responsible for saying
 #                             so in its own output; this script does not.
+#   READIUM_TEST_RESULT_BUNDLE
+#                             Path to write the xcresult bundle to. Without it
+#                             this script's entire output on a green run is the
+#                             word "Test Succeeded" — xcbeautify --quieter plus
+#                             the filter below strip every count — so a caller
+#                             cannot tell a full run from one that executed or
+#                             skipped almost nothing. Pass this to assert counts.
 # =============================================================================
 
 set -euo pipefail
@@ -34,6 +41,13 @@ ARGS=(
     -destination "$DESTINATION"
 )
 [ -n "$FILTER" ] && ARGS+=(-only-testing:"$FILTER")
+
+RESULT_BUNDLE="${READIUM_TEST_RESULT_BUNDLE:-}"
+if [ -n "$RESULT_BUNDLE" ]; then
+    # xcodebuild refuses to overwrite an existing bundle.
+    rm -rf "$RESULT_BUNDLE"
+    ARGS+=(-resultBundlePath "$RESULT_BUNDLE")
+fi
 
 # Word-split deliberately: the variable carries a list of identifiers.
 # shellcheck disable=SC2206
