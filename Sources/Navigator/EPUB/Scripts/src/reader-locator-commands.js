@@ -537,6 +537,10 @@ function projectedTextFromRange(range) {
  * - It does not use `TextQuoteAnchor.fromRange(root, range).exact`, which reconstructs the text as
  *   plain `textContent` and therefore includes `script` / `style` / `noscript` / `template` content
  *   the indexer's projection excludes. Any chunk spanning one of those compared unequal.
+ *
+ * This Tier-2 proof deliberately compares the raw projected UTF-16 text for exact equality. Do not
+ * call `normalizeDOMText` here: normalization belongs to Tier 1 and could bless the wrong endpoints
+ * by erasing the projection difference this gate exists to detect.
  */
 function rangeMatchesQuote(range, text) {
   if (!text?.highlight) {

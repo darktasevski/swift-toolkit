@@ -6,3 +6,4 @@ The Readium Swift toolkit is used to develop reading apps for iOS, with support 
 
 - `scripts/test.sh` runs all tests
 - `scripts/test.sh ReadiumSharedTests` runs only the tests for the ReadiumShared package
+- `scripts/test-test.sh` self-tests the test runner's exit-status and plan-membership contract

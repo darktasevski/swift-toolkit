@@ -1,0 +1,84 @@
+#!/usr/bin/env bash
+# Self-test for scripts/test.sh. Uses PATH-local xcodebuild/xcbeautify fakes so
+# the runner's pipeline contract is exercised without starting a simulator.
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+RUNNER="$SCRIPT_DIR/test.sh"
+TEST_PLAN="$REPO_ROOT/TestApp/TestApp.xctestplan"
+
+fail() {
+	echo "FAIL: $*" >&2
+	exit 1
+}
+
+scratch_candidate="$(mktemp -d "${TMPDIR:-/tmp}/readium-test-runner-self-test.XXXXXX")"
+[[ -d "$scratch_candidate" ]] || fail "mktemp did not create a directory"
+SCRATCH="$(cd "$scratch_candidate" && pwd -P)"
+[[ -n "$SCRATCH" && "$SCRATCH" != "/" && -d "$SCRATCH" ]] ||
+	fail "refusing unsafe scratch directory: $SCRATCH"
+
+cleanup() {
+	if [[ -n "$SCRATCH" && "$SCRATCH" != "/" && -d "$SCRATCH" ]]; then
+		rm -rf -- "$SCRATCH"
+	fi
+}
+trap cleanup EXIT
+
+FAKE_BIN="$SCRATCH/bin"
+mkdir -p "$FAKE_BIN"
+
+cat >"$FAKE_BIN/xcodebuild" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' "${FAKE_XCODEBUILD_OUTPUT:?missing fake output}"
+exit "${FAKE_XCODEBUILD_STATUS:?missing fake status}"
+EOF
+
+cat >"$FAKE_BIN/xcbeautify" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+cat
+EOF
+
+chmod +x "$FAKE_BIN/xcodebuild" "$FAKE_BIN/xcbeautify"
+
+run_runner_case() {
+	local name="$1"
+	local expected_exit="$2"
+	local xcodebuild_exit="$3"
+	local xcodebuild_output="$4"
+	local actual_exit=0
+	local output="$SCRATCH/$name.out"
+
+	if PATH="$FAKE_BIN:$PATH" \
+		FAKE_XCODEBUILD_STATUS="$xcodebuild_exit" \
+		FAKE_XCODEBUILD_OUTPUT="$xcodebuild_output" \
+		"$RUNNER" >"$output" 2>&1; then
+		actual_exit=0
+	else
+		actual_exit=$?
+	fi
+
+	if [[ "$actual_exit" -ne "$expected_exit" ]]; then
+		cat "$output" >&2
+		fail "$name — expected exit=$expected_exit, got $actual_exit"
+	fi
+	echo "  PASS: $name"
+}
+
+# Case A: downstream tools succeed, but xcodebuild's nonzero status remains authoritative.
+run_runner_case "xcodebuild failure survives pipeline" 73 73 "visible failure"
+
+# Case B: grep filters every successful-run line and exits 1; xcodebuild's zero still wins.
+run_runner_case "empty filtered output preserves success" 0 0 "Executed 1 test, with 0 failures"
+
+# Case C: the unfiltered TestApp plan structurally includes ReadiumSharedTests.
+if ! grep -Eq '"identifier"[[:space:]]*:[[:space:]]*"ReadiumSharedTests"' "$TEST_PLAN"; then
+	fail "TestApp/TestApp.xctestplan omits ReadiumSharedTests"
+fi
+echo "  PASS: TestApp plan includes ReadiumSharedTests"
+
+echo "OK: all test.sh self-tests passed"

@@ -476,6 +476,10 @@ function rangeFromDomRange(domRange) {
  * excludes — so a correct landing on any chunk spanning one of those would compare unequal and be
  * rejected. It also resolves the range relative to a root before computing `exact`, which can throw
  * for a value that does not depend on the root at all.
+ *
+ * This Tier-2 proof deliberately compares the raw projected UTF-16 text for exact equality. Do not
+ * call `normalizeDOMText` here: normalization belongs to Tier 1 and could make a wrong pair of
+ * endpoints appear valid by erasing the difference this projection-exact check must detect.
  */
 function domRangeCoversQuote(range, locator) {
   const highlight = locator.text && locator.text.highlight;
