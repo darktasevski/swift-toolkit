@@ -63,14 +63,6 @@ final class EPUBSpreadReadiness {
     /// stabilization during spread initialization.
     static let initializationStabilityBudgetMilliseconds = 5000
 
-    static func makeInitializationStabilityDeadline(
-        clock: EPUBMonotonicClock = .continuous
-    ) -> ContinuousClock.Instant {
-        clock.now().advanced(by: .milliseconds(
-            initializationStabilityBudgetMilliseconds
-        ))
-    }
-
     static func remainingInitializationStabilityMilliseconds(
         until deadline: ContinuousClock.Instant,
         clock: EPUBMonotonicClock = .continuous

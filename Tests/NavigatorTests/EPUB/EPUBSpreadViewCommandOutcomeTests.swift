@@ -583,8 +583,10 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             frameCapability: EPUBSpreadFrameCapability()
         ))
         let mintsBefore = mintLog.totalCount()
+        let sharedMintsBefore = mintLog.count(.sharedInitialization)
         let outcome = await spreadView.initializeSpread()
         let mintsDuringInitialization = mintLog.totalCount() - mintsBefore
+        let sharedMintsDuringInitialization = mintLog.count(.sharedInitialization) - sharedMintsBefore
         spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
 
         XCTAssertEqual(outcome, .failed)
@@ -607,6 +609,15 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             "Initialization armed \(mintsDuringInitialization) allowances "
                 + "(\(mintLog.describeCounts())) — expected exactly one, the "
                 + "shared budget the stylesheet wait spends"
+        )
+        // The total alone cannot tell WHICH allowance that was, so a mint site
+        // mislabelled `.ownCap` would keep the count at 1 while silently
+        // inverting what the assertion above means.
+        XCTAssertEqual(
+            sharedMintsDuringInitialization,
+            1,
+            "the one allowance initialization armed was not the shared budget "
+                + "(\(mintLog.describeCounts()))"
         )
 
         spreadView.webView.configuration.userContentController.addUserScript(WKUserScript(
@@ -978,14 +989,36 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
                 return !spreadView.webView.isLoading
             }
         } catch {
+            let diagnosis = """
+            state=\(spreadView.readiness.state), \
+            isLoading=\(spreadView.webView.isLoading), \
+            progress=\(spreadView.webView.estimatedProgress), \
+            committedURL=\(spreadView.webView.url?.lastPathComponent ?? "nil")
+            """
+
+            // A skip has to be EARNED by the environmental signature, not
+            // granted to every expired wait. Narrowness of site is not
+            // narrowness of cause: this wait also expires when readiness never
+            // enters `.loading`, when it lands in `.failed` or `.unavailable`,
+            // or when the fixture stops resolving — every one of them a genuine
+            // navigator defect that must stay red.
+            //
+            // The unresponsive-process signature is specifically: still
+            // `.loading`, and WebKit still believes it is loading. That is the
+            // state a WebContent process that stopped answering leaves behind,
+            // because nothing can move it on.
+            guard
+                case .loading = spreadView.readiness.state,
+                spreadView.webView.isLoading
+            else {
+                XCTFail("Document did not load, and not for a reason the host explains: \(diagnosis)")
+                throw error
+            }
+
             throw XCTSkip(
                 """
                 Environment did not deliver a loaded document — WebContent \
-                process is not making progress (see #1693). \
-                state=\(spreadView.readiness.state), \
-                isLoading=\(spreadView.webView.isLoading), \
-                progress=\(spreadView.webView.estimatedProgress), \
-                committedURL=\(spreadView.webView.url?.lastPathComponent ?? "nil")
+                process is not making progress (see #1693). \(diagnosis)
                 """
             )
         }
@@ -1082,15 +1115,30 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             try await clock.sleep(for: .milliseconds(20))
         }
-        throw XCTSkip(
-            """
-            Environment did not deliver the fixed-layout iframe resource — \
-            WebContent process is not making progress (see #1693). \
-            state=\(spreadView.readiness.state), \
-            isLoading=\(spreadView.webView.isLoading), \
-            progress=\(spreadView.webView.estimatedProgress)
-            """
-        )
+        let diagnosis = """
+        state=\(spreadView.readiness.state), \
+        isLoading=\(spreadView.webView.isLoading), \
+        progress=\(spreadView.webView.estimatedProgress)
+        """
+
+        // Same earned-skip rule as `waitForDocumentLoad`, and deliberately the
+        // same shape: these two are the only skip sites, so they must not drift
+        // into disagreeing about what counts as the host's fault. Here the
+        // wrapper document is already loaded and it is the iframe that has not
+        // arrived, so the signature is a readiness that has not failed —
+        // a `.failed` or `.unavailable` spread is a navigator defect.
+        switch spreadView.readiness.state {
+        case .failed, .unavailable:
+            XCTFail("Fixed resource did not load, and not for a reason the host explains: \(diagnosis)")
+            throw TestTimeout()
+        case .loading, .initializing, .ready:
+            throw XCTSkip(
+                """
+                Environment did not deliver the fixed-layout iframe resource — \
+                WebContent process is not making progress (see #1693). \(diagnosis)
+                """
+            )
+        }
     }
 
     private func initializeReflowableSpread(
