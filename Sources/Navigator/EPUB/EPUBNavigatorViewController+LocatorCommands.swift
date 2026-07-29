@@ -7,6 +7,34 @@
 import Foundation
 import ReadiumShared
 
+@MainActor
+final class EPUBLocatorCommandState {
+    private var locatorOperationSequence: UInt64 = 0
+    private weak var inFlightLocatorBridge: EPUBLocatorCommandBridge?
+
+    fileprivate func beginOperation() {
+        locatorOperationSequence &+= 1
+    }
+
+    fileprivate var operationSequence: UInt64 {
+        locatorOperationSequence
+    }
+
+    fileprivate func trackInFlightBridge(_ bridge: EPUBLocatorCommandBridge) {
+        inFlightLocatorBridge = bridge
+    }
+
+    fileprivate func clearInFlightBridge(_ bridge: EPUBLocatorCommandBridge) {
+        if inFlightLocatorBridge === bridge {
+            inFlightLocatorBridge = nil
+        }
+    }
+
+    fileprivate var currentInFlightBridge: EPUBLocatorCommandBridge? {
+        inFlightLocatorBridge
+    }
+}
+
 /// The locator-command surface: the bridge navigation this fork added, the
 /// receipt that binds the world a command landed in, and the readiness waits
 /// those two rest on.
@@ -16,11 +44,11 @@ import ReadiumShared
 /// makes it zero-conflict on a rebase — the highest-value property this file
 /// has, since the view controller is the most-diverged file in the fork.
 ///
-/// Only the stored state stayed behind: Swift extensions cannot declare stored
-/// properties, so `locatorOperationSequence`, `activeLocatorOperationSlot`,
+/// Only the stored state stays behind: Swift extensions cannot declare stored
+/// properties, so `locatorCommandState`, `activeLocatorOperationSlot`,
 /// `locatorNavigationTaskQueue`, `idleNotificationGate` and `locatorClock`
-/// remain in the class and are `internal` rather than `private` so this file
-/// can reach them. That access widening is the whole cost of the split.
+/// remain in the class. The command state's mutable payload stays private to
+/// this file behind owner-only transitions and reads.
 extension EPUBNavigatorViewController {
     /// Whether the bridge locator command may animate its scroll. After a
     /// resource hop the document was already positioned at the FULL target
@@ -69,6 +97,24 @@ extension EPUBNavigatorViewController {
         return EPUBLocatorNavigationResult(outcome: outcome, receipt: receiptSlot.receipt)
     }
 
+    /// Runs the predecessor's cancellation relay: aborts its suspended
+    /// JavaScript navigation so it acknowledges promptly. A no-op when no
+    /// navigation is in flight.
+    private func cancelInFlightLocatorNavigation() async {
+        guard let bridge = locatorCommandState.currentInFlightBridge else {
+            return
+        }
+        // Bounded by the supersession backstop rather than a command budget: this
+        // relay exists to make the predecessor acknowledge promptly, and the
+        // successor is already only willing to wait that long for it.
+        await bridge.cancelInFlightNavigation(
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: EPUBLocatorNavigationTaskQueue.predecessorAcknowledgementBudget
+            )
+        )
+    }
+
     private func performLocatorNavigation(
         _ locatorJSON: String,
         animated: Bool,
@@ -79,7 +125,7 @@ extension EPUBNavigatorViewController {
         }
         // Every locator navigation takes the next sequence number, so a later
         // one starting is exactly what makes an earlier one's receipt stale.
-        locatorOperationSequence &+= 1
+        locatorCommandState.beginOperation()
         // Operation start: the ONE deadline every rung below spends from — the
         // cross-resource hop, page identity, command readiness, and the bridge
         // command's own viewport/settle/correction waits. No rung re-mints it, so
@@ -165,11 +211,9 @@ extension EPUBNavigatorViewController {
         // command below in its own frame. Clear only if a newer request has not
         // already claimed the tracker (the bounded-acknowledgement race).
         let bridge = spreadView.locatorCommandBridge
-        inFlightLocatorBridge = bridge
+        locatorCommandState.trackInFlightBridge(bridge)
         defer {
-            if inFlightLocatorBridge === bridge {
-                inFlightLocatorBridge = nil
-            }
+            locatorCommandState.clearInFlightBridge(bridge)
         }
 
         let result = await bridge.navigate(
@@ -222,7 +266,7 @@ extension EPUBNavigatorViewController {
             generation: spreadView.readiness.generation,
             frameCapability: spreadView.readiness.currentFrameCapability,
             isCommandReady: spreadView.isCommandReady,
-            operationSequence: locatorOperationSequence
+            operationSequence: locatorCommandState.operationSequence
         )
     }
 

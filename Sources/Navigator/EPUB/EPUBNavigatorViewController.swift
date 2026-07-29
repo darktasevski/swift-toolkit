@@ -984,12 +984,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Serializes rapid locator requests with latest-request-wins semantics.
     let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
 
-    /// Monotonic count of locator navigations started on this navigator. A
-    /// receipt captures the value current when its command landed, so a newer
-    /// navigation starting is what makes every older receipt stale — which is
-    /// how a predecessor paused between its landing and its decoration is
-    /// stopped from acting after its successor has landed.
-    var locatorOperationSequence: UInt64 = 0
+    /// Owns the mutable command sequence and weak in-flight bridge tracker.
+    let locatorCommandState = EPUBLocatorCommandState()
 
     /// The locator operation whose cross-resource hop is in flight, published for the
     /// target spread to read back when it initializes. The hop's spread loads on its own
@@ -1002,31 +998,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// but collectively unsubstitutable, so nothing below could be driven to its
     /// deadline in a test without waiting out the real budget.
     let locatorClock: EPUBMonotonicClock = .continuous
-
-    /// The command bridge whose navigation is currently suspended in
-    /// JavaScript. A superseding request's cancellation relay reads this to
-    /// abort the predecessor in its own frame. Cleared only when the same
-    /// bridge instance is still tracked, so a bounded-acknowledgement race
-    /// never nils a newer request's bridge.
-    weak var inFlightLocatorBridge: EPUBLocatorCommandBridge?
-
-    /// Runs the predecessor's cancellation relay: aborts its suspended
-    /// JavaScript navigation so it acknowledges promptly. A no-op when no
-    /// navigation is in flight.
-    func cancelInFlightLocatorNavigation() async {
-        guard let bridge = inFlightLocatorBridge else {
-            return
-        }
-        // Bounded by the supersession backstop rather than a command budget: this
-        // relay exists to make the predecessor acknowledge promptly, and the
-        // successor is already only willing to wait that long for it.
-        await bridge.cancelInFlightNavigation(
-            deadline: EPUBLocatorOperationDeadline(
-                startingAt: locatorClock.now(),
-                budget: EPUBLocatorNavigationTaskQueue.predecessorAcknowledgementBudget
-            )
-        )
-    }
 
     /// The deadline for one whole decoration operation — an apply/rollback
     /// transaction, or a replay sweep — rather than one per affected resource.
