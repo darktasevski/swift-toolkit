@@ -12,6 +12,86 @@ import { TextRange } from "./vendor/hypothesis/anchoring/text-range";
 import matchAll from "string.prototype.matchall";
 matchAll.shim();
 
+const SELECTION_MIRROR_NAME = "readium-selection-mirror";
+const SELECTION_MIRROR_STYLE_ID = "readium-selection-mirror-style";
+let selectionMirrorStylePending = false;
+
+function canMirrorSelection() {
+  return (
+    typeof CSS !== "undefined" &&
+    CSS.highlights !== undefined &&
+    typeof window.Highlight !== "undefined"
+  );
+}
+
+function installSelectionMirrorStyle() {
+  if (!document.head || document.getElementById(SELECTION_MIRROR_STYLE_ID)) {
+    return;
+  }
+
+  const style = document.createElement("style");
+  style.id = SELECTION_MIRROR_STYLE_ID;
+  style.textContent = `
+    ::highlight(${SELECTION_MIRROR_NAME}) {
+      color: var(--RS__selectionTextColor, inherit);
+      background-color: var(--RS__selectionBackgroundColor, #b4d8fe);
+    }
+  `;
+  document.head.appendChild(style);
+}
+
+function ensureSelectionMirrorStyle() {
+  if (document.head) {
+    installSelectionMirrorStyle();
+    return;
+  }
+
+  if (selectionMirrorStylePending) {
+    return;
+  }
+
+  selectionMirrorStylePending = true;
+  document.addEventListener(
+    "DOMContentLoaded",
+    () => {
+      selectionMirrorStylePending = false;
+      installSelectionMirrorStyle();
+    },
+    { once: true }
+  );
+}
+
+function clearSelectionMirror() {
+  if (canMirrorSelection()) {
+    // WebKit bug 306396 was fixed in 306433@main, but the repaint fix was not
+    // backported to safari-7624, the branch used by iOS 26.4.
+    // Keep the registry entry and clear its ranges so affected runtimes repaint.
+    // https://bugs.webkit.org/show_bug.cgi?id=306396
+    CSS.highlights.get(SELECTION_MIRROR_NAME)?.clear();
+  }
+}
+
+function updateSelectionMirror(range) {
+  if (!canMirrorSelection()) {
+    return;
+  }
+
+  ensureSelectionMirrorStyle();
+  const clonedRange = range.cloneRange();
+  const mirror = CSS.highlights.get(SELECTION_MIRROR_NAME);
+  if (mirror) {
+    // Reuse the registered Highlight so changing an active selection repaints
+    // both the old and new ranges on WebKit versions affected by bug 306396.
+    mirror.clear();
+    mirror.add(clonedRange);
+  } else {
+    CSS.highlights.set(
+      SELECTION_MIRROR_NAME,
+      new window.Highlight(clonedRange)
+    );
+  }
+}
+
 export function getCurrentSelection() {
   if (!readium.link) {
     return null;
@@ -59,6 +139,7 @@ function getSelectionRect() {
 function getCurrentSelectionText() {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) {
+    clearSelectionMirror();
     return undefined;
   }
 
@@ -69,10 +150,12 @@ function getCurrentSelectionText() {
     .replace(/\s\s+/g, " ");
 
   if (cleanHighlight.length === 0) {
+    clearSelectionMirror();
     return undefined;
   }
 
   if (!selection.anchorNode || !selection.focusNode) {
+    clearSelectionMirror();
     return undefined;
   }
 
@@ -87,6 +170,7 @@ function getCurrentSelectionText() {
         );
 
   if (!range || range.collapsed) {
+    clearSelectionMirror();
     return undefined;
   }
 
@@ -97,8 +181,11 @@ function getCurrentSelectionText() {
     textRange = TextRange.fromRange(range).relativeTo(document.body);
   } catch (e) {
     logError(e);
+    clearSelectionMirror();
     return undefined;
   }
+
+  updateSelectionMirror(range);
 
   const start = textRange.start.offset;
   const end = textRange.end.offset;
