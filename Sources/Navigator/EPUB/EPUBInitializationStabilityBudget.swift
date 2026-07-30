@@ -67,4 +67,22 @@ struct EPUBInitializationStabilityBudget: Sendable {
         self.clock = clock
         self.deadline = deadline
     }
+
+    /// The page-side allowance left at `deadline`, measured by the same clock
+    /// that minted this budget. Keeping the clock inside the authority prevents
+    /// an injected clock from silently drifting away from the advertised
+    /// JavaScript allowance.
+    func remainingMilliseconds(until deadline: ContinuousClock.Instant) -> Int {
+        let remaining = clock.now().duration(to: deadline)
+        guard remaining > .zero else { return 0 }
+
+        let components = remaining.components
+        let millisecondsPerSecond: Int64 = 1000
+        let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
+        let wholeMilliseconds = components.seconds * millisecondsPerSecond
+        let partialMilliseconds = (
+            components.attoseconds + attosecondsPerMillisecond - 1
+        ) / attosecondsPerMillisecond
+        return Int(wholeMilliseconds + partialMilliseconds)
+    }
 }

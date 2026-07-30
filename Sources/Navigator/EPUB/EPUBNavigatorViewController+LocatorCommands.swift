@@ -389,14 +389,18 @@ extension EPUBNavigatorViewController {
         // generation instead. Only when no document is live is there nothing to
         // follow, and the generation wait is the honest fallback.
         let outcome: EPUBSpreadReadiness.WaitOutcome
-        if let capability = spreadView.readiness.currentFrameCapability {
+        switch Self.readySpreadWaitTarget(
+            currentCapability: spreadView.readiness.currentFrameCapability,
+            currentGeneration: spreadView.readiness.generation
+        ) {
+        case let .document(capability):
             outcome = await spreadView.readiness.waitForCommandReadiness(
                 forDocument: capability,
                 until: readinessDeadline
             )
-        } else {
+        case let .generation(generation):
             outcome = await spreadView.readiness.waitForCommandReadiness(
-                for: spreadView.readiness.generation,
+                for: generation,
                 until: readinessDeadline
             )
         }

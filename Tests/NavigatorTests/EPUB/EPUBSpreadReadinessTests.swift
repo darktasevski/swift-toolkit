@@ -564,6 +564,44 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         )
     }
 
+    func testDeadlineBoundedDocumentRewaitsReuseOneAbsoluteDeadline() async throws {
+        let readiness = try makeReadyReadiness()
+        let capability = try XCTUnwrap(readiness.currentFrameCapability)
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        var observedDeadlines: [ContinuousClock.Instant] = []
+        var observedGenerations: [EPUBSpreadReadiness.Generation] = []
+
+        let outcome = await readiness.waitForCommandReadiness(
+            forDocument: capability,
+            until: deadline
+        ) { generation, receivedDeadline in
+            observedGenerations.append(generation)
+            observedDeadlines.append(receivedDeadline)
+            guard observedDeadlines.count == 3 else {
+                guard let writer = readiness.acquirePositionWriter() else {
+                    return .failed(generation: generation)
+                }
+                readiness.release(writer)
+                return .invalidated
+            }
+            return .ready(generation: generation, frameCapability: capability)
+        }
+
+        XCTAssertEqual(
+            outcome,
+            .ready(generation: readiness.generation, frameCapability: capability)
+        )
+        XCTAssertEqual(observedDeadlines, [deadline, deadline, deadline])
+        XCTAssertEqual(observedGenerations.count, 3)
+        if let firstGeneration = observedGenerations.first {
+            XCTAssertEqual(observedGenerations, [
+                firstGeneration,
+                firstGeneration + 1,
+                firstGeneration + 2,
+            ])
+        }
+    }
+
     // MARK: - The document-following law
 
     // The `.invalidated` re-wait arm is the whole reason a document-scoped wait exists, and it is

@@ -196,14 +196,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         updateContentInset()
     }
 
-    override func applyCSSScript(_ script: String) async -> Bool {
-        guard case .success = await evaluateDocumentScript(script) else {
+    override func applyCSSScript(
+        _ script: String,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        guard await evaluateDocumentScriptBounded(script, until: deadline) else {
             return false
         }
         // Reflowable content repaginates on a CSS settings change; hold command
         // readiness until the reflow settles so a following command lands on the
         // new geometry.
-        return await waitForLayoutStability()
+        return await waitForLayoutStability(until: deadline)
     }
 
     private func updateContentInset() {
@@ -284,10 +287,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
-        let stabilityDeadline = resolveInitializationStabilityDeadline()
+        let stabilityDeadline = resolveInitializationStabilityDeadline(for: .sharedInitialization)
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
-            guard case .success = await evaluateDocumentScript("readium.link = \(linkJSON);") else {
+            guard await evaluateDocumentScriptBounded(
+                "readium.link = \(linkJSON);",
+                until: stabilityDeadline
+            ) else {
                 return .failed
             }
         }
@@ -356,7 +362,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard await pendingLocationMutation.applyLatest({ [weak self] location in
             guard let self else { return false }
             guard let location else { return true }
-            guard await self.apply(location) else { return false }
+            guard await self.apply(location, until: stabilityDeadline) else { return false }
             return await self.waitForLayoutStability(until: stabilityDeadline)
         }) else {
             return .failed
@@ -379,11 +385,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         let deadline = deadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
-        let remainingMilliseconds = EPUBSpreadReadiness
-            .remainingInitializationStabilityMilliseconds(
-                until: deadline,
-                clock: stabilityBudget.clock
-            )
+        let remainingMilliseconds = stabilityBudget.remainingMilliseconds(until: deadline)
         guard remainingMilliseconds > 0 else { return false }
 
         do {
@@ -395,7 +397,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             // by the same instant the script is told about, so the two budgets cannot disagree.
             let result = try await EPUBLocatorCommandWatchdog.run(
                 until: EPUBLocatorOperationDeadline(expiringAt: deadline),
-                clock: .continuous
+                clock: stabilityBudget.clock
             ) { [webView] in
                 try await webView.callAsyncJavaScript(
                     """
@@ -670,11 +672,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         guard let writerLease = readiness.acquirePositionWriter() else {
             return Task.isCancelled ? .cancelled : .failed
         }
+        let positionDeadline = resolveInitializationStabilityDeadline(for: .ownCap)
 
         var appliedOutcome = PageTurnOutcome.failed
         let succeeded = await pendingPositionMutation.applyLatest { [weak self] command in
             guard let self else { return false }
-            appliedOutcome = await self.apply(command)
+            appliedOutcome = await self.apply(command, until: positionDeadline)
             return appliedOutcome == .succeeded || appliedOutcome == .boundary
         }
 
@@ -695,18 +698,22 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private func apply(
-        _ command: PendingPositionCommand
+        _ command: PendingPositionCommand,
+        until deadline: ContinuousClock.Instant
     ) async -> PageTurnOutcome {
         switch command {
         case let .location(location):
-            guard await apply(location) else { return .failed }
-            return await waitForLayoutStability() ? .succeeded : .failed
+            guard await apply(location, until: deadline) else { return .failed }
+            return await waitForLayoutStability(until: deadline) ? .succeeded : .failed
         case let .pageTurn(turn):
-            return await apply(turn)
+            return await apply(turn, until: deadline)
         }
     }
 
-    private func apply(_ turn: PendingPageTurn) async -> PageTurnOutcome {
+    private func apply(
+        _ turn: PendingPageTurn,
+        until deadline: ContinuousClock.Instant
+    ) async -> PageTurnOutcome {
         let factor: CGFloat
         switch turn.direction {
         case .left:
@@ -731,31 +738,23 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // (`offsetX`) is coordinate-system agnostic and works for both LTR and
         // RTL.
         let behavior = turn.animated ? "smooth" : "instant"
-        let result = await evaluateDocumentScript(
-            "window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });"
-        )
-        guard case .success = result else {
+        guard await evaluateDocumentScriptBounded(
+            "window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });",
+            until: deadline
+        ) else {
             return .failed
         }
 
-        // One deadline for the whole page turn, spent by BOTH settle rungs. Each
-        // previously minted its own allowance, so a slow layout settle bought the
-        // scroll-position wait a fresh second rather than eating into a shared
-        // budget. Taking the earlier of this and each rung's own cap can only
-        // tighten a turn, never extend one.
-        let settleDeadline = EPUBLocatorOperationDeadline(
-            startingAt: ContinuousClock().now,
-            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
-        )
+        // The position command's one deadline is spent by the script and BOTH
+        // settle rungs. No stage can buy a fresh allowance after an earlier one
+        // ran long.
+        let settleDeadline = EPUBLocatorOperationDeadline(expiringAt: deadline)
         let settlement = Task { @MainActor [weak self] in
             guard let self else { return false }
             if turn.animated {
                 await scrollAnimationCoordinator.waitUntilSettled()
             }
-            let layoutCap = stabilityBudget.deadline(.ownCap)
-            guard await waitForLayoutStability(
-                until: settleDeadline.effectiveDeadline(cappedBy: layoutCap)
-            ) else {
+            guard await waitForLayoutStability(until: deadline) else {
                 return false
             }
             return await waitForScrollPosition(targetX, until: settleDeadline)
@@ -784,14 +783,17 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return false
     }
 
-    private func apply(_ location: PendingLocation) async -> Bool {
+    private func apply(
+        _ location: PendingLocation,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
         switch location.location {
         case let .locator(locator):
-            return await go(to: locator, animated: location.animated)
+            return await go(to: locator, animated: location.animated, until: deadline)
         case .start:
-            return await scroll(toProgression: 0, animated: location.animated)
+            return await scroll(toProgression: 0, animated: location.animated, until: deadline)
         case .end:
-            return await scroll(toProgression: 1, animated: location.animated)
+            return await scroll(toProgression: 1, animated: location.animated, until: deadline)
         }
     }
 
@@ -800,7 +802,11 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     @discardableResult
-    private func go(to locator: Locator, animated: Bool) async -> Bool {
+    private func go(
+        to locator: Locator,
+        animated: Bool,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
         if !["", "#"].contains(locator.href.string) {
             guard
                 let index = viewModel.readingOrder.firstIndexWithHREF(locator.href),
@@ -829,12 +835,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
 
         let progression = locator.locations.progression ?? 0
-        return await scroll(toProgression: progression, animated: animated)
+        return await scroll(
+            toProgression: progression,
+            animated: animated,
+            until: deadline
+        )
     }
 
     /// Scrolls at given progression (from 0.0 to 1.0)
     @discardableResult
-    private func scroll(toProgression progression: Double, animated: Bool) async -> Bool {
+    private func scroll(
+        toProgression progression: Double,
+        animated: Bool,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
         guard progression >= 0, progression <= 1 else {
             EPUBPageWorldLog.report(.invalidScrollProgression, withholding: progression)
             return false
@@ -850,11 +864,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            let result = await evaluateDocumentScript(
-                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))"
+            return await evaluateDocumentScriptBounded(
+                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))",
+                until: deadline
             )
-            guard case .success = result else { return false }
-            return true
         }
     }
 

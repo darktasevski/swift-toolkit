@@ -198,10 +198,10 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
         XCTAssertEqual(resolved, ownCap)
         let stopped = EPUBMonotonicClock(now: { afterOverrun }, sleep: { _ in })
         XCTAssertEqual(
-            EPUBSpreadReadiness.remainingInitializationStabilityMilliseconds(
-                until: resolved,
+            EPUBInitializationStabilityBudget(
+                milliseconds: 5000,
                 clock: stopped
-            ),
+            ).remainingMilliseconds(until: resolved),
             5000,
             "an expired operation must not starve the spread that outlives it"
         )
@@ -224,10 +224,10 @@ final class EPUBInitializationStabilityInheritanceTests: XCTestCase {
 
         let stopped = EPUBMonotonicClock(now: { nearlySpent }, sleep: { _ in })
         XCTAssertEqual(
-            EPUBSpreadReadiness.remainingInitializationStabilityMilliseconds(
-                until: resolved,
+            EPUBInitializationStabilityBudget(
+                milliseconds: 5000,
                 clock: stopped
-            ),
+            ).remainingMilliseconds(until: resolved),
             1
         )
     }

@@ -180,9 +180,9 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         stabilityDeadline: ContinuousClock.Instant? = nil
     ) async -> Bool {
         guard let layoutMutation else { return false }
-        // Resolved once and shared by both stages. Letting each stage fall back to its own
-        // `resolveInitializationStabilityDeadline()` would hand the stability wait a fresh
-        // allowance after the viewport call had already spent time — the re-arming that
+        // Resolved once and shared by both stages. Letting each stage mint its own
+        // `.ownCap` would hand the stability wait a fresh allowance after the viewport
+        // call had already spent time — the re-arming that
         // `EPUBLocatorOperationDeadline` exists to make impossible.
         let deadline = stabilityDeadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
         return await layoutMutation.applyLatest { [weak self] configuration in
@@ -203,7 +203,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // publishes `.ready` and the spread stays hidden.
             return try await EPUBLocatorCommandWatchdog.run(
                 until: EPUBLocatorOperationDeadline(expiringAt: deadline),
-                clock: .continuous
+                clock: stabilityBudget.clock
             ) { [weak self] in
                 guard let self else { return false }
                 return await withCheckedContinuation { continuation in
@@ -244,11 +244,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         }
 
         let deadline = deadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
-        let remainingMilliseconds = EPUBSpreadReadiness
-            .remainingInitializationStabilityMilliseconds(
-                until: deadline,
-                clock: stabilityBudget.clock
-            )
+        let remainingMilliseconds = stabilityBudget.remainingMilliseconds(until: deadline)
         guard remainingMilliseconds > 0 else { return false }
 
         do {
@@ -257,7 +253,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // leaves the spread permanently hidden.
             let result = try await EPUBLocatorCommandWatchdog.run(
                 until: EPUBLocatorOperationDeadline(expiringAt: deadline),
-                clock: .continuous
+                clock: stabilityBudget.clock
             ) { [webView] in
                 try await webView.callAsyncJavaScript(
                     """
@@ -354,7 +350,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         guard let layoutLease = readiness.acquireWriterLease(for: generation) else {
             return .failed
         }
-        let stabilityDeadline = resolveInitializationStabilityDeadline()
+        let stabilityDeadline = resolveInitializationStabilityDeadline(for: .sharedInitialization)
         let succeeded = await applyLatestLayout(stabilityDeadline: stabilityDeadline)
         readiness.finishInitialization(
             layoutLease,

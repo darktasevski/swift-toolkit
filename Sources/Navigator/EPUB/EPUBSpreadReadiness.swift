@@ -63,23 +63,6 @@ final class EPUBSpreadReadiness {
     /// stabilization during spread initialization.
     static let initializationStabilityBudgetMilliseconds = 5000
 
-    static func remainingInitializationStabilityMilliseconds(
-        until deadline: ContinuousClock.Instant,
-        clock: EPUBMonotonicClock = .continuous
-    ) -> Int {
-        let remaining = clock.now().duration(to: deadline)
-        guard remaining > .zero else { return 0 }
-
-        let components = remaining.components
-        let millisecondsPerSecond: Int64 = 1000
-        let attosecondsPerMillisecond: Int64 = 1_000_000_000_000_000
-        let wholeMilliseconds = components.seconds * millisecondsPerSecond
-        let partialMilliseconds = (
-            components.attoseconds + attosecondsPerMillisecond - 1
-        ) / attosecondsPerMillisecond
-        return Int(wholeMilliseconds + partialMilliseconds)
-    }
-
     /// Bounds controller waits after a page object is installed but before its
     /// exact render generation publishes command readiness.
     static let commandReadinessBudget: Duration = .seconds(2)
@@ -418,8 +401,30 @@ final class EPUBSpreadReadiness {
         forDocument capability: EPUBSpreadFrameCapability,
         until deadline: ContinuousClock.Instant
     ) async -> WaitOutcome {
+        await waitForCommandReadiness(
+            forDocument: capability,
+            until: deadline
+        ) { generation, sharedDeadline in
+            await self.waitForCommandReadiness(
+                for: generation,
+                until: sharedDeadline
+            )
+        }
+    }
+
+    /// Test seam for the bounded document-following law. The exact deadline is
+    /// handed to every generation wait so a test can prove re-waits reuse it
+    /// without racing a real timeout against mutation churn.
+    func waitForCommandReadiness(
+        forDocument capability: EPUBSpreadFrameCapability,
+        until deadline: ContinuousClock.Instant,
+        awaitingEachGenerationWith generationWait: (
+            Generation,
+            ContinuousClock.Instant
+        ) async -> WaitOutcome
+    ) async -> WaitOutcome {
         await waitForCommandReadiness(forDocument: capability) { generation in
-            await self.waitForCommandReadiness(for: generation, until: deadline)
+            await generationWait(generation, deadline)
         }
     }
 

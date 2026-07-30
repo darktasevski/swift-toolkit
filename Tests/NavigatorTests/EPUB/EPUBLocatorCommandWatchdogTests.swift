@@ -150,6 +150,44 @@ final class EPUBLocatorCommandWatchdogTests: XCTestCase {
         XCTAssertEqual(requested.withLock { $0 }, deadline.expiresAt)
     }
 
+    @MainActor
+    func testCancellingTheEnclosingTaskCancelsWorkAndThrowsCancellation() async {
+        let deadline = EPUBLocatorOperationDeadline(startingAt: Self.base, budget: .seconds(3600))
+        let clock = EPUBMonotonicClock(now: { Self.base }, sleep: Self.neverFires)
+        let state = Mutex((started: false, cancelled: false))
+
+        let caller = Task { @MainActor in
+            do {
+                _ = try await EPUBLocatorCommandWatchdog.run(
+                    until: deadline,
+                    clock: clock
+                ) {
+                    state.withLock { $0.started = true }
+                    return try await withTaskCancellationHandler {
+                        try await Task.sleep(for: .seconds(3600))
+                        return "never"
+                    } onCancel: {
+                        state.withLock { $0.cancelled = true }
+                    }
+                }
+                return false
+            } catch is CancellationError {
+                return true
+            } catch {
+                return false
+            }
+        }
+
+        while !state.withLock({ $0.started }) {
+            await Task.yield()
+        }
+        caller.cancel()
+
+        let wasCancelled = await caller.value
+        XCTAssertTrue(wasCancelled)
+        XCTAssertTrue(state.withLock { $0.cancelled })
+    }
+
     /// The production clock must actually be monotonic and actually wait: the default
     /// binding is what ships, and a stubbed-out default would make every test above
     /// vacuous.

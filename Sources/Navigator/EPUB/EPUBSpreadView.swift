@@ -364,6 +364,35 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
+    /// Bounds a document-script round trip by a caller-owned absolute deadline.
+    ///
+    /// The callback-based WebKit API can accept a script and never invoke its
+    /// completion handler. Callers holding a readiness writer lease must use
+    /// this seam so a hung page cannot strand the lease indefinitely.
+    func evaluateDocumentScriptBounded(
+        _ script: String,
+        inHREF href: AnyURL? = nil,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        do {
+            return try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: stabilityBudget.clock
+            ) { [weak self] in
+                guard let self else { return false }
+                guard case .success = await self.evaluateDocumentScript(
+                    script,
+                    inHREF: href
+                ) else {
+                    return false
+                }
+                return true
+            }
+        } catch {
+            return false
+        }
+    }
+
     /// Called from the JS code when logging a message.
     ///
     /// The message itself is page-world text and is withheld; only the fact that
@@ -644,7 +673,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     ///   what lets "an initialization never re-arms per rung" be asserted as a
     ///   count rather than inferred from elapsed time.
     func resolveInitializationStabilityDeadline(
-        for purpose: EPUBInitializationStabilityBudget.Purpose = .sharedInitialization
+        for purpose: EPUBInitializationStabilityBudget.Purpose
     ) -> ContinuousClock.Instant {
         let clock = stabilityBudget.clock
         return EPUBInitializationStabilityInheritance.resolve(
@@ -738,10 +767,11 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             else {
                 return
             }
+            let deadline = self.resolveInitializationStabilityDeadline(for: .ownCap)
 
             let succeeded = await self.pendingCSSMutation.applyLatest { latest in
                 guard let latest else { return true }
-                return await self.applyCSSScript(latest)
+                return await self.applyCSSScript(latest, until: deadline)
             }
             self.readiness.finishMutation(
                 writerLease,
@@ -778,11 +808,11 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// the new geometry settles. Fixed-layout content does not reflow on these
     /// properties, so the base implementation returns as soon as the write
     /// lands.
-    func applyCSSScript(_ script: String) async -> Bool {
-        guard case .success = await evaluateDocumentScript(script) else {
-            return false
-        }
-        return true
+    func applyCSSScript(
+        _ script: String,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        await evaluateDocumentScriptBounded(script, until: deadline)
     }
 
     /// A user drag takes over positioning; any in-flight precise navigation or

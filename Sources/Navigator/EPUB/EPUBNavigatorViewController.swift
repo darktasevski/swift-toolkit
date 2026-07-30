@@ -49,6 +49,21 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         case cancelled
     }
 
+    enum ReadySpreadWaitTarget: Equatable {
+        case document(EPUBSpreadFrameCapability)
+        case generation(EPUBSpreadReadiness.Generation)
+    }
+
+    static func readySpreadWaitTarget(
+        currentCapability: EPUBSpreadFrameCapability?,
+        currentGeneration: EPUBSpreadReadiness.Generation
+    ) -> ReadySpreadWaitTarget {
+        if let currentCapability {
+            return .document(currentCapability)
+        }
+        return .generation(currentGeneration)
+    }
+
     static func navigationDisposition(
         for outcome: PageCommandOutcome
     ) -> PageCommandNavigationDisposition {

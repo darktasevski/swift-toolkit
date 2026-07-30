@@ -97,6 +97,90 @@ final class EPUBNavigatorPageCommandOutcomeTests: XCTestCase {
         )
     }
 
+    func testDocumentAvailableAtACommandGateIsReportedAsMiss() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .documentAvailable(generation: 7),
+                targetIsCurrent: true,
+                documentIsCurrent: false,
+                taskIsCancelled: false
+            ),
+            .miss
+        )
+    }
+
+    func testCancelledReadySpreadWaitIsReportedAsCancelled() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .cancelled,
+                targetIsCurrent: true,
+                documentIsCurrent: false,
+                taskIsCancelled: false
+            ),
+            .cancelled
+        )
+    }
+
+    func testCallerCancellationWinsOverAReadyCurrentSpread() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadNavigationDisposition(
+                for: .ready(
+                    generation: 7,
+                    frameCapability: EPUBSpreadFrameCapability()
+                ),
+                targetIsCurrent: true,
+                documentIsCurrent: true,
+                taskIsCancelled: true
+            ),
+            .cancelled
+        )
+    }
+
+    func testReadySpreadWaitSelectionFollowsALiveDocumentCapability() {
+        let capability = EPUBSpreadFrameCapability()
+
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadWaitTarget(
+                currentCapability: capability,
+                currentGeneration: 7
+            ),
+            .document(capability)
+        )
+    }
+
+    func testReadySpreadWaitSelectionFallsBackToTheCurrentGeneration() {
+        XCTAssertEqual(
+            EPUBNavigatorViewController.readySpreadWaitTarget(
+                currentCapability: nil,
+                currentGeneration: 7
+            ),
+            .generation(7)
+        )
+    }
+
+    func testGenerationFallbackUsesTheReadyResultsCapabilityOrRefusesWhenItIsGone() {
+        let readyCapability = EPUBSpreadFrameCapability()
+        let outcome = EPUBSpreadReadiness.WaitOutcome.ready(
+            generation: 7,
+            frameCapability: readyCapability
+        )
+
+        XCTAssertTrue(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: outcome,
+                currentCapability: readyCapability,
+                currentGeneration: 7
+            )
+        )
+        XCTAssertFalse(
+            EPUBNavigatorViewController.readySpreadDocumentIsCurrent(
+                for: outcome,
+                currentCapability: nil,
+                currentGeneration: 7
+            )
+        )
+    }
+
     func testDocumentCurrencyToleratesAGenerationThatAdvancedAfterReadinessPublished() {
         // The `>=` rather than `==`. The bounded wait resumes through a task group, so several
         // main-actor suspensions separate the `.ready` publish from the currency read, and a

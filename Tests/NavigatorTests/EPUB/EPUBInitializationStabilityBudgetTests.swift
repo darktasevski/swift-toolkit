@@ -93,4 +93,20 @@ final class EPUBInitializationStabilityBudgetTests: XCTestCase {
             .milliseconds(budget.milliseconds)
         )
     }
+
+    func testRemainingMillisecondsUsesTheBudgetsOwnInjectedClock() {
+        var now = ContinuousClock.now
+        let budget = EPUBInitializationStabilityBudget(
+            milliseconds: 2500,
+            clock: EPUBMonotonicClock(
+                now: { now },
+                sleep: { _ in }
+            )
+        )
+        let deadline = budget.deadline(.sharedInitialization)
+
+        now = now.advanced(by: .microseconds(1_250_001))
+
+        XCTAssertEqual(budget.remainingMilliseconds(until: deadline), 1250)
+    }
 }
