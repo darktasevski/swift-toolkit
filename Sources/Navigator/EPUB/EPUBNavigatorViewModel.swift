@@ -9,15 +9,13 @@ import ReadiumShared
 import UIKit
 
 protocol EPUBNavigatorViewModelDelegate: AnyObject {
-    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope)
+    /// Applies a runtime CSS settings change (font family, theme, font size,
+    /// publisher styles) to every loaded spread. Each spread runs it as a
+    /// generation-bound, latest-wins same-document mutation so it participates
+    /// in the readiness authority rather than racing an in-flight command.
+    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, applyCSSSettings script: String)
     func epubNavigatorViewModelInvalidatePaginationView(_ viewModel: EPUBNavigatorViewModel)
     func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, didFailToLoadResourceAt href: RelativeURL, withError error: ReadError)
-}
-
-enum EPUBScriptScope {
-    case currentResource
-    case loadedResources
-    case resource(href: AnyURL)
 }
 
 @MainActor final class EPUBNavigatorViewModel: Loggable {
@@ -112,8 +110,7 @@ enum EPUBScriptScope {
     /// `nonisolated` so unit tests on a non-`@MainActor` `XCTestCase` can
     /// exercise it directly. Mirrors the same pattern as
     /// `EPUBReflowableSpreadView.decodeVisibleAnchorBody`.
-    @_spi(Testing)
-    public nonisolated static func pathOnlyKey(from normalized: String) -> String {
+    nonisolated static func pathOnlyKey(from normalized: String) -> String {
         guard let schemeSep = normalized.range(of: "://") else {
             return normalized
         }
@@ -249,43 +246,31 @@ enum EPUBScriptScope {
 
     // MARK: - Web View Server
 
-    private func serve(href: RelativeURL) async -> (Resource, MediaType)? {
+    func serve(href: RelativeURL) async -> (Resource, MediaType)? {
         guard var resource = publication.get(href) else {
             return nil
         }
-        let mediaType = await resolveMediaType(for: resource, at: href)
+        let resolution = await EPUBServedResourcePolicy.resolve(
+            manifestMediaType: publication.linkWithHREF(href)?.mediaType,
+            resource: resource,
+            at: href.anyURL,
+            formatSniffer: formatSniffer
+        )
         // ADR-0145 (host fork): repair malformed XHTML well-formedness BEFORE CSS
-        // injection, gated on isHTML only (fixed-layout XHTML is strict-parsed
-        // too). The closure runs inside TransformingResource, which the toolkit
-        // invokes off the main actor; the host's client hops via Task.detached
-        // for the blocking Rust call. Data-level so non-UTF-8 resources pass
-        // through unchanged.
-        if mediaType.isHTML, let repair = config.xhtmlRepairTransform {
+        // injection. The policy's closed document kind requires repair for XHTML
+        // and HTML, and forbids it for binary resources. The closure runs inside
+        // TransformingResource, which the toolkit invokes off the main actor; the
+        // host's client hops via Task.detached for the blocking Rust call.
+        // Data-level so non-UTF-8 resources pass through unchanged.
+        if resolution.documentKind.requiresCanonicalRepair,
+           let repair = config.xhtmlRepairTransform
+        {
             resource = TransformingResource(resource) { result in
                 await result.asyncMap { data in await repair(href, data) }
             }
         }
         resource = injectReadiumCSS(in: resource, at: href)
-        return (resource, mediaType)
-    }
-
-    /// Resolves the media type to use to serve the given `resource`.
-    ///
-    /// The media type declared in the manifest takes precedence, before falling
-    /// back on the `Resource` properties and sniffing the `href`.
-    ///
-    /// The manifest takes precedence because a file with a `.xml` extension
-    /// might be declared as `application/xhtml+xml` in the OPF.
-    private func resolveMediaType(for resource: Resource, at href: RelativeURL) async -> MediaType {
-        if let mediaType = publication.linkWithHREF(href)?.mediaType {
-            return mediaType
-        }
-        if let mediaType = await resource.properties().getOrNil()?.mediaType {
-            return mediaType
-        }
-
-        return href.pathExtension.flatMap { formatSniffer.sniffHints(.init(fileExtension: $0))?.mediaType }
-            ?? .binary
+        return (resource, resolution.mediaType)
     }
 
     // MARK: - User preferences
@@ -431,7 +416,8 @@ enum EPUBScriptScope {
                 }
                 return content
             } catch {
-                log(.error, error)
+                let ns = error as NSError
+                log(.error, "Publication CSS load failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
                 return content
             }
         }
@@ -454,34 +440,40 @@ enum EPUBScriptScope {
     }
 
     private func commitCSSChange(from previous: ReadiumCSS, to new: ReadiumCSS) {
-        var properties: [String: String?] = [:]
         let rsProperties = new.rsProperties.cssProperties()
-        if previous.rsProperties.cssProperties() != rsProperties {
-            for (k, v) in rsProperties {
-                properties[k] = v
-            }
-        }
         let userProperties = new.userProperties.cssProperties()
-        if previous.userProperties.cssProperties() != userProperties {
-            for (k, v) in userProperties {
-                properties[k] = v
-            }
+        let changed = previous.rsProperties.cssProperties() != rsProperties
+            || previous.userProperties.cssProperties() != userProperties
+        guard changed else {
+            return
         }
-        if !properties.isEmpty {
-            guard
-                let data = try? JSONSerialization.data(withJSONObject: properties),
-                let json = String(data: data, encoding: .utf8)
-            else {
-                log(.error, "Failed to serialize CSS properties to JSON")
-                return
-            }
 
-            delegate?.epubNavigatorViewModel(
-                self,
-                runScript: "readium.setCSSProperties(\(json));",
-                in: .loadedResources
-            )
+        // Send the FULL current property set, not just the changed bucket. The
+        // spread applies this as a newest-wins coalesced mutation: a later
+        // settings change that supersedes an in-flight one must carry every
+        // property, or the earlier change's properties would be dropped from the
+        // live DOM (they were only ever queued, never written). An absolute
+        // snapshot makes the coalescing sound.
+        var properties: [String: String?] = [:]
+        for (key, value) in rsProperties {
+            properties[key] = value
         }
+        for (key, value) in userProperties {
+            properties[key] = value
+        }
+
+        guard
+            let data = try? JSONSerialization.data(withJSONObject: properties),
+            let json = String(data: data, encoding: .utf8)
+        else {
+            log(.error, "Failed to serialize CSS properties to JSON")
+            return
+        }
+
+        delegate?.epubNavigatorViewModel(
+            self,
+            applyCSSSettings: "readium.setCSSProperties(\(json));"
+        )
     }
 
     // MARK: - Accessibility

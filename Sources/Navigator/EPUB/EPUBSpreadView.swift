@@ -51,10 +51,28 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the IntersectionObserver in the spread reports a new anchor
     /// crossing the viewport top.
     func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String)
+
+    /// The deadline of the locator operation whose cross-resource hop this spread is
+    /// the target of, or nil for every other load.
+    ///
+    /// A pull rather than a push: a spread initializes on its own load event, not from
+    /// the call stack of the navigation that asked for it, so the operation's deadline
+    /// cannot be handed down to it. Asking at the point stabilization starts is what
+    /// lets a hop spend the operation's REMAINDER instead of minting a fresh allowance
+    /// on top of it.
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline?
 }
 
 extension EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, visibleAnchorDidChange anchorId: String) {}
+
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline? {
+        nil
+    }
 }
 
 class EPUBSpreadView: UIView, Loggable, PageView {
@@ -64,6 +82,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private(set) var focusedResource: ReadingOrder.Index?
 
     let webView: WebView
+    let locatorCommandBridge: EPUBLocatorCommandBridge
 
     private var lastClick: ClickEvent?
 
@@ -73,22 +92,65 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     weak var activityIndicatorView: UIActivityIndicatorView?
     private var activityIndicatorStopWorkItem: DispatchWorkItem?
 
-    private(set) var isSpreadLoaded = false
+    /// Sole authority for this spread's render generation and position
+    /// writers. Document availability and external command readiness are
+    /// intentionally separate states.
+    let readiness = EPUBSpreadReadiness()
     private var spreadLoadTask: Task<Void, Never>?
+
+    /// Latest runtime CSS settings, replayed newest-wins if a rapid sequence
+    /// (e.g. a font-size slider drag) arrives while one apply is in flight.
+    /// `nil` is the never-applied initial value.
+    private let pendingCSSMutation = EPUBLatestMutation<String?>(initialValue: nil)
+    private var cssMutationTask: Task<Void, Never>?
+
+    private struct MainFrameNavigationRecord {
+        let navigation: WKNavigation
+        let generation: EPUBSpreadReadiness.Generation
+    }
+
+    private struct IssuingMainFrameNavigation {
+        let generation: EPUBSpreadReadiness.Generation
+        var provisionalNavigation: WKNavigation?
+    }
+
+    private var currentMainFrameNavigation: MainFrameNavigationRecord?
+    private var issuingMainFrameNavigation: IssuingMainFrameNavigation?
+
+    var isCommandReady: Bool {
+        readiness.isCommandReady
+    }
+
+    /// This spread's sole authority for the length of a stabilization budget.
+    ///
+    /// Injected so a caller can widen it or count its mints. A test driving a
+    /// real WKWebView otherwise has to bet that the host meets the production
+    /// allowance, and that bet is lost by a loaded machine while the behaviour
+    /// under test is correct.
+    let stabilityBudget: EPUBInitializationStabilityBudget
 
     required init(
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
         scripts: [WKUserScript],
-        animatedLoad: Bool
+        animatedLoad: Bool,
+        stabilityBudget: EPUBInitializationStabilityBudget = .production
     ) {
         self.viewModel = viewModel
         self.spread = spread
         self.animatedLoad = animatedLoad
+        self.stabilityBudget = stabilityBudget
 
         let config = WKWebViewConfiguration()
         config.setURLSchemeHandler(viewModel.server, forURLScheme: viewModel.server.scheme)
         config.mediaTypesRequiringUserActionForPlayback = .all
+
+        let locatorCommandBridge = EPUBLocatorCommandBridge(
+            layout: viewModel.publication.metadata.layout == .fixed ? .fixed : .reflowable,
+            publicationBaseURL: viewModel.publicationBaseURL
+        )
+        locatorCommandBridge.install(in: config)
+        self.locatorCommandBridge = locatorCommandBridge
 
         // Disable the Apple Intelligence Writing tools in the web views.
         // See https://github.com/readium/swift-toolkit/issues/509#issuecomment-2577780749
@@ -97,8 +159,12 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
 
         webView = WebView(editingActions: viewModel.editingActions, configuration: config)
+        locatorCommandBridge.attach(to: webView)
 
         super.init(frame: .zero)
+        locatorCommandBridge.onDecorationActivated = { [weak self] body in
+            self?.decorationDidActivate(body)
+        }
 
         isOpaque = false
         backgroundColor = .clear
@@ -131,9 +197,18 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
+        cssMutationTask?.cancel()
+        cssMutationTask = nil
+        readiness.invalidate()
+
+        // Revoke the frame capability and drop all frame registration so a
+        // delayed, reloaded, or self-navigated document can never register or be
+        // selected as the command target after this spread is torn down.
+        locatorCommandBridge.revokeFrameCapability()
 
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
+        locatorCommandBridge.disableMessageHandler()
     }
 
     func setupWebView() {
@@ -177,6 +252,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         if superview != nil {
             enableJSMessages()
+            locatorCommandBridge.enableMessageHandler()
             scrollView.delegate = self
         }
     }
@@ -185,16 +261,101 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         fatalError("loadSpread() must be implemented in subclasses")
     }
 
+    /// Starts the generation before issuing an owned main-frame load. WebKit's
+    /// provisional-navigation callback then validates and associates the
+    /// returned navigation identity without advancing the generation again.
+    @discardableResult
+    func issueMainFrameLoad(
+        _ operation: () -> WKNavigation?
+    ) -> WKNavigation? {
+        let generation = beginMainFrameLoading()
+        issuingMainFrameNavigation = IssuingMainFrameNavigation(
+            generation: generation,
+            provisionalNavigation: nil
+        )
+
+        let navigation = operation()
+        let provisionalNavigation = issuingMainFrameNavigation?.provisionalNavigation
+        issuingMainFrameNavigation = nil
+
+        guard
+            let navigation,
+            provisionalNavigation == nil || provisionalNavigation === navigation
+        else {
+            if readiness.fail(ifCurrent: generation) {
+                locatorCommandBridge.invalidateDocument()
+            }
+            return navigation
+        }
+
+        registerMainFrameNavigation(navigation, generation: generation)
+        return navigation
+    }
+
+    /// Called synchronously whenever a main-frame generation starts.
+    func mainFrameLoadDidBegin(_ generation: EPUBSpreadReadiness.Generation) {}
+
+    func currentMainFrameGeneration(
+        for navigation: WKNavigation?
+    ) -> EPUBSpreadReadiness.Generation? {
+        guard
+            let navigation,
+            let record = currentMainFrameNavigation,
+            record.navigation === navigation,
+            record.generation == readiness.generation
+        else {
+            return nil
+        }
+        return record.generation
+    }
+
+    private func beginMainFrameLoading() -> EPUBSpreadReadiness.Generation {
+        spreadLoadTask?.cancel()
+        spreadLoadTask = nil
+        let generation = readiness.beginLoading()
+        locatorCommandBridge.beginDocument()
+        mainFrameLoadDidBegin(generation)
+        return generation
+    }
+
+    private func registerMainFrameNavigation(
+        _ navigation: WKNavigation,
+        generation: EPUBSpreadReadiness.Generation
+    ) {
+        currentMainFrameNavigation = MainFrameNavigationRecord(
+            navigation: navigation,
+            generation: generation
+        )
+    }
+
     /// Evaluates the given JavaScript into the resource's HTML page.
     @discardableResult
     func evaluateScript(_ script: String, inHREF href: AnyURL? = nil) async -> Result<Any, Error> {
-        await spreadLoaded()
+        let generation = readiness.generation
+        guard case .ready = await readiness.waitForCommandReadiness(for: generation) else {
+            return .failure(CancellationError())
+        }
 
-        log(.trace, "Evaluate script: \(script)")
+        return await evaluateDocumentScript(script, inHREF: href)
+    }
+
+    /// Evaluates during initialization after the frame document exists, but
+    /// before external command readiness is published.
+    @discardableResult
+    func evaluateDocumentScript(
+        _ script: String,
+        inHREF href: AnyURL? = nil
+    ) async -> Result<Any, Error> {
+        let generation = readiness.generation
+        guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
+            return .failure(CancellationError())
+        }
+
         return await withCheckedContinuation { continuation in
             webView.evaluateJavaScript(script) { [weak self] res, error in
                 if let error = error {
-                    self?.log(.error, error)
+                    let ns = error as NSError
+                    self?.log(.error, "JavaScript evaluation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
                     continuation.resume(returning: .failure(error))
                 } else {
                     continuation.resume(returning: .success(res ?? ()))
@@ -203,30 +364,52 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
-    /// Called from the JS code when logging a message.
-    private func didLog(_ body: Any) {
-        guard let body = body as? String else {
-            return
+    /// Bounds a document-script round trip by a caller-owned absolute deadline.
+    ///
+    /// The callback-based WebKit API can accept a script and never invoke its
+    /// completion handler. Callers holding a readiness writer lease must use
+    /// this seam so a hung page cannot strand the lease indefinitely.
+    func evaluateDocumentScriptBounded(
+        _ script: String,
+        inHREF href: AnyURL? = nil,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        do {
+            return try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: stabilityBudget.clock
+            ) { [weak self] in
+                guard let self else { return false }
+                guard case .success = await self.evaluateDocumentScript(
+                    script,
+                    inHREF: href
+                ) else {
+                    return false
+                }
+                return true
+            }
+        } catch {
+            return false
         }
-        log(.debug, "JavaScript: \(body)")
+    }
+
+    /// Called from the JS code when logging a message.
+    ///
+    /// The message itself is page-world text and is withheld; only the fact that
+    /// the bridge fired is reported.
+    private func didLog(_ body: Any) {
+        EPUBPageWorldLog.report(.javaScriptConsoleMessage, withholding: body)
     }
 
     /// Called from the JS code when logging an error.
+    ///
+    /// The script's own message, source filename and line are all page-world
+    /// values — the filename is a resource href — so none of them are reported.
+    /// Unlike the message it replaces, this fires for every delivered body: with
+    /// nothing extracted there is no shape left to reject, and an uncaught
+    /// script error should always leave a breadcrumb.
     private func didLogError(_ body: Any) {
-        guard let error = body as? [String: Any],
-              var message = error["message"] as? String
-        else {
-            return
-        }
-        message = "JavaScript: \(message)"
-
-        if let file = error["filename"] as? String, file != "/",
-           let line = error["line"] as? Int, line != 0
-        {
-            log(.error, message, file: file, line: line)
-        } else {
-            log(.error, message)
-        }
+        EPUBPageWorldLog.report(.javaScriptUncaughtError, withholding: body)
     }
 
     /// Called from the JS code when a tap is detected.
@@ -411,41 +594,93 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// Called by the javascript code when the spread contents is fully loaded.
     /// The JS message `spreadLoaded` needs to be emitted by a subclass script, EPUBSpreadView's scripts don't.
     private func spreadDidLoad(_ body: Any) {
+        let generation = readiness.generation
+        let frameCapability = EPUBSpreadFrameCapability()
+        guard let rootLease = readiness.beginInitialization(
+            for: generation,
+            frameCapability: frameCapability
+        ) else {
+            return
+        }
+
+        // Unify the readiness authority's capability with the command bridge's:
+        // the same token gates both spread reveal and frame registration. The
+        // bridge injects it into the main frame's current document; reflowable
+        // content registers directly, while a fixed-layout wrapper forwards it one
+        // hop to its child resource frame. Either way, only the current document
+        // (or the child it delegates to) — never a delayed old instance, same-URL
+        // reload, or nested frame — can echo it back and register as the target.
+        locatorCommandBridge.setFrameCapability(frameCapability)
+
         spreadLoadTask?.cancel()
-        spreadLoadTask = Task { @MainActor in
-            isSpreadLoaded = true
+
+        spreadLoadTask = Task { @MainActor [weak self] in
+            guard let self else { return }
             applySettings()
-            await spreadDidLoad()
+            let outcome = await initializeSpread()
+            readiness.finishInitialization(
+                rootLease,
+                outcome: Task.isCancelled ? .failed : outcome
+            )
+
+            // The reveal path below keys on the frame-DOCUMENT capability, not
+            // on the load generation: a position writer acquired the instant
+            // readiness publishes (a precise locator landing racing this task's
+            // suspensions) legitimately advances the generation while keeping
+            // the same document. Requiring the original generation here left
+            // the spread permanently hidden (scrollView at alpha 0, activity
+            // indicator spinning) whenever such a command interleaved. Only a
+            // replacement load, invalidation, or failure — which clear or
+            // replace the capability — may keep the spread hidden.
+            guard
+                !Task.isCancelled,
+                case .ready = await readiness.waitForCommandReadiness(
+                    forDocument: frameCapability
+                )
+            else {
+                return
+            }
+
             await delegate?.spreadViewDidLoad(self)
-            onSpreadLoadedCallbacks.complete()
+            guard
+                !Task.isCancelled,
+                readiness.currentFrameCapability == frameCapability
+            else {
+                return
+            }
             showSpread()
         }
     }
 
     /// To be overriden to customize the behavior after the spread is loaded.
-    func spreadDidLoad() async {}
-
-    private let onSpreadLoadedCallbacks = CompletionList()
-
-    /// Awaits for the spread to be fully loaded.
-    func spreadLoaded() async {
-        if isSpreadLoaded {
-            return
-        }
-
-        await withCheckedContinuation { continuation in
-            whenSpreadLoaded {
-                continuation.resume()
-            }
-        }
+    func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
+        .succeeded
     }
 
-    /// Executes the given `callback` when the spread is fully loaded.
-    func whenSpreadLoaded(_ callback: @escaping () -> Void) {
-        let callback = onSpreadLoadedCallbacks.add(callback)
-        if isSpreadLoaded {
-            callback()
-        }
+    /// The single instant this spread's stylesheet, font and geometry stabilization
+    /// must be finished by.
+    ///
+    /// When the load is a locator operation's cross-resource hop, this is the earlier
+    /// of the operation's remaining budget and the stage's own cap, so a landing costs
+    /// the operation's budget rather than that budget once per resource it passes
+    /// through. Every other load — an ordinary page turn, a settings re-layout, a
+    /// PRELOADED NEIGHBOUR initializing during someone else's operation — keeps its own
+    /// full allowance.
+    /// - Parameter purpose: `.sharedInitialization` for the one allowance an
+    ///   initialization spends across all of its rungs; `.ownCap` for a caller
+    ///   that legitimately arms an allowance of its own — a settings re-layout,
+    ///   a content-inset change, a pre-load viewport call. The distinction is
+    ///   what lets "an initialization never re-arms per rung" be asserted as a
+    ///   count rather than inferred from elapsed time.
+    func resolveInitializationStabilityDeadline(
+        for purpose: EPUBInitializationStabilityBudget.Purpose
+    ) -> ContinuousClock.Instant {
+        let clock = stabilityBudget.clock
+        return EPUBInitializationStabilityInheritance.resolve(
+            ownCap: stabilityBudget.deadline(purpose),
+            inheritedFrom: delegate?.spreadViewLocatorOperationDeadline(self),
+            at: clock.now()
+        )
     }
 
     func showSpread() {
@@ -473,7 +708,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         else {
             focusedResource = nil
             delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
-            log(.warning, "Invalid body for selectionDidChange: \(body)")
+            EPUBPageWorldLog.report(.malformedSelectionBody, withholding: body)
             return
         }
 
@@ -482,7 +717,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         do {
             domRange = try DOMRange(json: JSONValue(selection["domRange"]))
         } catch {
-            log(.debug, "Failed to parse domRange: \(error)")
+            EPUBPageWorldLog.report(.malformedDOMRange, withholding: selection, error: error)
             domRange = nil
         }
 
@@ -497,6 +732,97 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         assert(Thread.isMainThread, "User settings must be updated from the main thread")
     }
 
+    /// Applies a runtime CSS settings change (font family, theme, font size,
+    /// publisher styles) as a generation-bound, latest-wins same-document
+    /// mutation. Acquiring a position writer transitions the spread
+    /// ready → initializing → ready in a new generation, so an in-flight precise
+    /// landing is superseded rather than racing the reflow, and any later
+    /// command awaits the settle through command readiness. Rapid changes
+    /// coalesce newest-wins — the view model sends the FULL property snapshot,
+    /// so coalescing never drops an earlier change's properties.
+    ///
+    /// A spread that is still loading applies the change once it publishes
+    /// command readiness (its load generation resolves to `.ready` unchanged),
+    /// so an offscreen neighbor mid-load is not left on stale CSS. A terminal or
+    /// replaced document (a reload, invalidation, or failure supersedes it)
+    /// drops out.
+    func applyCSSSettings(_ script: String) {
+        pendingCSSMutation.update(script)
+        let predecessor = cssMutationTask
+        predecessor?.cancel()
+        cssMutationTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+
+            if !self.readiness.isCommandReady {
+                guard case .ready = await self.readiness.waitForCommandReadiness(
+                    for: self.readiness.generation
+                ) else {
+                    return
+                }
+            }
+            guard
+                !Task.isCancelled,
+                let writerLease = self.readiness.acquirePositionWriter()
+            else {
+                return
+            }
+            let deadline = self.resolveInitializationStabilityDeadline(for: .ownCap)
+
+            let succeeded = await self.pendingCSSMutation.applyLatest { latest in
+                guard let latest else { return true }
+                return await self.applyCSSScript(latest, until: deadline)
+            }
+            self.readiness.finishMutation(
+                writerLease,
+                outcome: Self.cssMutationOutcome(
+                    succeeded: succeeded,
+                    cancelled: Task.isCancelled
+                )
+            )
+        }
+    }
+
+    /// Maps a CSS settings mutation's apply result to a readiness outcome. A
+    /// cancelled mutation is a supersession — a newer settings change or a
+    /// teardown replaced it — so it releases its lease cleanly and the document
+    /// stays command-ready; only a genuine, non-cancelled apply failure revokes
+    /// it. Success takes precedence over a late cancellation. Mirrors the
+    /// extract-and-pin shape of `readinessGateDisposition`.
+    static func cssMutationOutcome(
+        succeeded: Bool,
+        cancelled: Bool
+    ) -> EPUBSpreadReadiness.MutationOutcome {
+        if succeeded {
+            return .succeeded
+        } else if cancelled {
+            return .superseded
+        } else {
+            return .failed
+        }
+    }
+
+    /// Applies the CSS settings script into the live document, returning whether
+    /// it succeeded. The reflowable spread overrides this to also await the
+    /// resulting layout reflow, so command readiness is not republished until
+    /// the new geometry settles. Fixed-layout content does not reflow on these
+    /// properties, so the base implementation returns as soon as the write
+    /// lands.
+    func applyCSSScript(
+        _ script: String,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        await evaluateDocumentScriptBounded(script, until: deadline)
+    }
+
+    /// A user drag takes over positioning; any in-flight precise navigation or
+    /// page-turn command must yield so no programmatic scroll fights the
+    /// gesture. Overridden by the reflowable spread, whose position commands
+    /// scroll. Fixed-layout content is fully visible and runs no scrolling
+    /// command (its only user gesture is zoom, which moves no command), so the
+    /// base is a no-op.
+    func cancelInFlightCommandForUserInteraction() {}
+
     // MARK: - Location and progression.
 
     /// Current progression in the resource with given href.
@@ -505,7 +831,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         0 ... 1
     }
 
-    func go(to location: PageLocation, animated: Bool) async {
+    func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {
         fatalError("go(to:) must be implemented in subclasses")
     }
 
@@ -521,9 +847,52 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
     }
 
-    func go(to direction: Direction, options: NavigatorGoOptions) async -> Bool {
+    enum PageTurnOutcome: Equatable, Sendable {
+        case succeeded
+        case boundary
+        case failed
+        case cancelled
+    }
+
+    /// Pure disposition for a spread-level readiness gate — a `go`/page-turn
+    /// that awaits command readiness before writing geometry.
+    enum ReadinessGateDisposition: Equatable {
+        /// The document is command-ready; the caller may write geometry.
+        case proceed
+        /// The wait was interrupted: caller cancellation, or a stale-lifecycle
+        /// `.invalidated` (the generation advanced under the wait via teardown,
+        /// reload, or replacement). The caller must NOT run a fallback.
+        case cancelled
+        /// A genuine, non-lifecycle failure.
+        case failed
+    }
+
+    /// Maps a command-readiness wait outcome to a gate disposition. A
+    /// stale-lifecycle `.invalidated` maps to `.cancelled`, NOT `.failed`, so a
+    /// caller's progression / cross-resource fallback never fights a reader
+    /// interruption (teardown, reload, replacement). This mirrors the
+    /// controller-level `readySpreadNavigationDisposition`; keeping the two
+    /// layers in agreement is the point. A genuine `.failed`, a `.timedOut`, or
+    /// an unexpected `.documentAvailable` at a command gate stays a failure.
+    static func readinessGateDisposition(
+        for outcome: EPUBSpreadReadiness.WaitOutcome
+    ) -> ReadinessGateDisposition {
+        switch outcome {
+        case .ready:
+            return .proceed
+        case .cancelled, .invalidated:
+            return .cancelled
+        case .documentAvailable, .timedOut, .failed:
+            return .failed
+        }
+    }
+
+    func go(
+        to direction: Direction,
+        options: NavigatorGoOptions
+    ) async -> PageTurnOutcome {
         // The default implementation of a spread view considers that its content is entirely visible on screen.
-        false
+        .boundary
     }
 
     func findFirstVisibleElementLocator() async -> Locator? {
@@ -540,7 +909,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             return locator.copy(href: link.url(), mediaType: link.mediaType ?? .xhtml)
 
         } catch {
-            log(.error, error)
+            log(.error, "Visible locator decoding failed")
             return nil
         }
     }
@@ -572,7 +941,6 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         registerJSMessage(named: "spreadLoadStarted") { [weak self] in self?.spreadLoadDidStart($0) }
         registerJSMessage(named: "spreadLoaded") { [weak self] in self?.spreadDidLoad($0) }
         registerJSMessage(named: "selectionChanged") { [weak self] in self?.selectionDidChange($0) }
-        registerJSMessage(named: "decorationActivated") { [weak self] in self?.decorationDidActivate($0) }
         registerJSMessage(named: "keyEventReceived") { [weak self] in self?.didReceiveKeyEvent($0) }
         registerJSMessage(named: "imageActivated") { [weak self] in self?.didActivateImage($0) }
     }
@@ -620,7 +988,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let groupName = decoration["group"] as? String,
             var frame = CGRect(json: decoration["rect"])
         else {
-            log(.warning, "Invalid body for decorationDidActivate: \(body)")
+            EPUBPageWorldLog.report(.malformedDecorationActivationBody, withholding: body)
             return
         }
 
@@ -639,7 +1007,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             let srcString = data["src"] as? String,
             let url = URL(string: srcString)
         else {
-            log(.warning, "Invalid body for didActivateImage: \(body)")
+            EPUBPageWorldLog.report(.malformedImageActivationBody, withholding: body)
             return
         }
 
@@ -660,7 +1028,13 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
         isVoiceOverRunning = UIAccessibility.isVoiceOverRunning
         // Scroll mode will be activated if VoiceOver is on
+        guard let lease = readiness.acquirePositionWriter() else {
+            applySettings()
+            return
+        }
         applySettings()
+        layoutIfNeeded()
+        readiness.release(lease)
     }
 
     // MARK: - Scripts
@@ -684,11 +1058,67 @@ extension EPUBSpreadView: WKScriptMessageHandler {
 }
 
 extension EPUBSpreadView: WKNavigationDelegate {
+    func webView(_ webView: WKWebView, didStartProvisionalNavigation navigation: WKNavigation!) {
+        guard let navigation else { return }
+
+        if let record = currentMainFrameNavigation,
+           record.navigation === navigation
+        {
+            guard
+                record.generation == readiness.generation
+            else {
+                return
+            }
+            return
+        }
+
+        if var issuingMainFrameNavigation {
+            guard issuingMainFrameNavigation.generation == readiness.generation else {
+                return
+            }
+            issuingMainFrameNavigation.provisionalNavigation = navigation
+            self.issuingMainFrameNavigation = issuingMainFrameNavigation
+            registerMainFrameNavigation(
+                navigation,
+                generation: issuingMainFrameNavigation.generation
+            )
+            return
+        }
+
+        let generation = beginMainFrameLoading()
+        registerMainFrameNavigation(navigation, generation: generation)
+    }
+
     func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
-        log(.error, error)
+        guard let generation = currentMainFrameGeneration(for: navigation) else {
+            return
+        }
+        if readiness.fail(ifCurrent: generation) {
+            locatorCommandBridge.invalidateDocument()
+        }
+        let ns = error as NSError
+        log(.error, "Web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+    }
+
+    func webView(
+        _ webView: WKWebView,
+        didFailProvisionalNavigation navigation: WKNavigation!,
+        withError error: Error
+    ) {
+        guard let generation = currentMainFrameGeneration(for: navigation) else {
+            return
+        }
+        if readiness.fail(ifCurrent: generation) {
+            locatorCommandBridge.invalidateDocument()
+        }
+        let ns = error as NSError
+        log(.error, "Provisional web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        guard currentMainFrameGeneration(for: navigation) != nil else {
+            return
+        }
         setNeedsStopActivityIndicator()
     }
 
@@ -712,6 +1142,8 @@ extension EPUBSpreadView: WKNavigationDelegate {
     }
 
     func webViewWebContentProcessDidTerminate(_ webView: WKWebView) {
+        readiness.invalidate()
+        locatorCommandBridge.invalidateDocument()
         delegate?.spreadViewDidTerminate()
     }
 }
@@ -723,6 +1155,7 @@ extension EPUBSpreadView: UIScrollViewDelegate {
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
         webView.clearSelection()
+        cancelInFlightCommandForUserInteraction()
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {

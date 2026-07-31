@@ -1,0 +1,77 @@
+//
+//  Copyright 2026 Readium Foundation. All rights reserved.
+//  Use of this source code is governed by the BSD-style license
+//  available in the top-level LICENSE file of the project.
+//
+
+import Foundation
+
+/// The single absolute deadline for one locator navigation, minted at operation
+/// start and spent — never re-armed — by every rung beneath it.
+///
+/// A precise landing is not one call: it may hop to another resource, wait for the
+/// target page's identity, wait for that spread's command readiness, and only then
+/// run the bridge command, which itself waits on viewport, offset settle, and
+/// visibility corrections. When each rung minted its own allowance, the total time a
+/// navigation could occupy was the SUM of every rung's budget multiplied by the
+/// resources it touched, with no relationship to the frozen
+/// `locatorNavigationBudgets.totalCommandDeadlineMilliseconds`.
+///
+/// Passing this value instead of a duration is what makes the contract structural: a
+/// rung can only ask how much is LEFT, so there is no argument it could pass to
+/// restart the clock.
+struct EPUBLocatorOperationDeadline: Equatable, Sendable {
+    /// The instant the whole operation must be finished by.
+    let expiresAt: ContinuousClock.Instant
+
+    init(startingAt start: ContinuousClock.Instant, budget: Duration) {
+        expiresAt = start.advanced(by: budget)
+    }
+
+    /// Adopts an already-resolved instant as the deadline.
+    ///
+    /// The spread views resolve their stability instant through
+    /// `EPUBInitializationStabilityInheritance`, which has ALREADY taken the earlier of the
+    /// spread's own cap and any inherited operation deadline. Re-expressing that instant as a
+    /// budget to hand to the watchdog would reintroduce the "now plus a duration" shape this type
+    /// exists to eliminate; adopting the instant keeps the resolved value authoritative.
+    init(expiringAt instant: ContinuousClock.Instant) {
+        expiresAt = instant
+    }
+
+    func hasExpired(at now: ContinuousClock.Instant) -> Bool {
+        now >= expiresAt
+    }
+
+    /// The instant a rung that keeps its own settle cap must actually stop at.
+    ///
+    /// Some rungs legitimately bound themselves more tightly than the operation does — a
+    /// layout settle or a scroll-position poll should give up long before the whole
+    /// operation is spent. Those caps stay, but they are only ever allowed to SHORTEN the
+    /// operation: taking the earlier of the two means a rung whose cap would outlive the
+    /// operation cannot re-arm a fresh allowance after the rungs above it ran long.
+    func effectiveDeadline(
+        cappedBy rungCap: ContinuousClock.Instant
+    ) -> ContinuousClock.Instant {
+        min(rungCap, expiresAt)
+    }
+
+    /// What remains, in whole milliseconds, clamped to zero.
+    ///
+    /// Truncates toward zero rather than rounding, so a sub-millisecond remainder can
+    /// never be handed on as a millisecond the operation no longer has. The result is
+    /// non-negative because it crosses into JavaScript as the command token's
+    /// `budgetMilliseconds`, which the script validates as a non-negative integer — a
+    /// negative value would be rejected as a malformed token instead of being read as
+    /// "no time left".
+    func remainingMilliseconds(at now: ContinuousClock.Instant) -> Int {
+        guard now < expiresAt else {
+            return 0
+        }
+        let remaining = now.duration(to: expiresAt)
+        let (seconds, attoseconds) = remaining.components
+        let milliseconds =
+            seconds * 1000 + attoseconds / 1_000_000_000_000_000
+        return milliseconds > 0 ? Int(milliseconds) : 0
+    }
+}

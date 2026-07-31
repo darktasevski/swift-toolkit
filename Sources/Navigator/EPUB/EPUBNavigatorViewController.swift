@@ -32,10 +32,135 @@ public extension EPUBNavigatorDelegate {
 
 public typealias EPUBContentInsets = (top: CGFloat, bottom: CGFloat)
 
+/// The observable result of a render-faithful locator command.
+public enum LocatorNavigationOutcome: Equatable, Sendable {
+    case landed
+    case miss
+    case cancelled
+}
+
 open class EPUBNavigatorViewController: InputObservableViewController,
     VisualNavigator, ViewportObservingNavigator, VisibleAnchorObservingNavigator,
     SelectableNavigator, DecorableNavigator, Configurable, Loggable
 {
+    enum PageCommandNavigationDisposition: Equatable {
+        case landed
+        case miss
+        case cancelled
+    }
+
+    enum ReadySpreadWaitTarget: Equatable {
+        case document(EPUBSpreadFrameCapability)
+        case generation(EPUBSpreadReadiness.Generation)
+    }
+
+    static func readySpreadWaitTarget(
+        currentCapability: EPUBSpreadFrameCapability?,
+        currentGeneration: EPUBSpreadReadiness.Generation
+    ) -> ReadySpreadWaitTarget {
+        if let currentCapability {
+            return .document(currentCapability)
+        }
+        return .generation(currentGeneration)
+    }
+
+    static func navigationDisposition(
+        for outcome: PageCommandOutcome
+    ) -> PageCommandNavigationDisposition {
+        switch outcome {
+        case .succeeded:
+            return .landed
+        case .failed:
+            return .miss
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
+    /// - Parameter documentIsCurrent: whether the frame document `outcome`
+    ///   resolved against is still the one this spread owns. Read ONLY for a
+    ///   `.ready` outcome, because only a `.ready` outcome bound a document: a
+    ///   timeout or failure resolved against nothing, so folding currency into
+    ///   the guard below would turn it into a silent `.cancelled` and strand the
+    ///   caller with no fallback rung and no logged failure.
+    ///
+    ///   Currency here is document identity, never generation equality. A
+    ///   position or decoration writer acquired the instant readiness publishes
+    ///   advances the generation while keeping the same document — the benign
+    ///   same-document mutation that an equality gate reports as supersession.
+    /// Whether the world `outcome` bound is still the one the spread owns.
+    ///
+    /// Both terms are load-bearing and neither is obvious:
+    ///
+    /// - The capability is read through `currentFrameCapability`, which answers during
+    ///   `.initializing` as well as `.ready`. A `.ready`-only destructure would read nil while
+    ///   a same-document mutation is in flight and report the landing superseded — the bug this
+    ///   whole path exists to fix, one line further down.
+    /// - Generation is compared with `>=`, not `==`. The bounded wait resumes through a task
+    ///   group, so several main-actor suspensions separate the `.ready` publish from this read,
+    ///   and a same-document mutation can land in any of them. An equality gate turns that into
+    ///   a silent `.cancelled`: a tap that does nothing, with no fallback rung.
+    ///
+    /// A LOWER generation is not reachable while `targetIsCurrent` holds — that pins the same
+    /// spread object, whose readiness is a `let` — so the comparison is really "has not gone
+    /// backwards" stated for a case the caller has already excluded. Kept because the term costs
+    /// nothing and the exclusion lives in a different function.
+    static func readySpreadDocumentIsCurrent(
+        for outcome: EPUBSpreadReadiness.WaitOutcome,
+        currentCapability: EPUBSpreadFrameCapability?,
+        currentGeneration: EPUBSpreadReadiness.Generation
+    ) -> Bool {
+        // A non-`.ready` outcome bound no document; `readySpreadNavigationDisposition` ignores
+        // this value for those, and returning `false` keeps a non-landing from ever reading as
+        // a current world if a future caller forgets that.
+        guard case let .ready(readyGeneration, readyCapability) = outcome else {
+            return false
+        }
+        return currentCapability == readyCapability && currentGeneration >= readyGeneration
+    }
+
+    static func readySpreadNavigationDisposition(
+        for outcome: EPUBSpreadReadiness.WaitOutcome,
+        targetIsCurrent: Bool,
+        documentIsCurrent: Bool,
+        taskIsCancelled: Bool
+    ) -> PageCommandNavigationDisposition {
+        guard !taskIsCancelled, targetIsCurrent else {
+            return .cancelled
+        }
+
+        switch outcome {
+        case .ready:
+            return documentIsCurrent ? .landed : .cancelled
+        case .documentAvailable, .timedOut, .failed:
+            return .miss
+        case .invalidated, .cancelled:
+            return .cancelled
+        }
+    }
+
+    enum PageTurnNavigationDisposition: Equatable {
+        case moved
+        case crossResource
+        case failed
+        case cancelled
+    }
+
+    static func pageTurnNavigationDisposition(
+        for outcome: EPUBSpreadView.PageTurnOutcome
+    ) -> PageTurnNavigationDisposition {
+        switch outcome {
+        case .succeeded:
+            return .moved
+        case .boundary:
+            return .crossResource
+        case .failed:
+            return .failed
+        case .cancelled:
+            return .cancelled
+        }
+    }
+
     public enum EPUBError: Error {
         /// The provided publication is restricted. Check that any DRM was
         /// properly unlocked using a Content Protection.
@@ -263,13 +388,22 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             switch state {
             case .initializing, .loading, .jumping, .moving:
                 paginationView?.isUserInteractionEnabled = false
+                _ = idleNotificationGate.setIdle(false)
             case .idle:
                 paginationView?.isUserInteractionEnabled = true
+                // Drain a request coalesced mid-navigation the instant we settle.
+                if idleNotificationGate.setIdle(true) {
+                    Task { @MainActor [weak self] in
+                        await self?.notifyCurrentLocation()
+                    }
+                }
             }
         }
     }
 
-    private let readingOrder: [Link]
+    // Not `private`: read from EPUBNavigatorViewController+LocatorCommands.swift, and
+    // `private` is file-scoped. See that file's header for why the split is worth it.
+    let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
     private var positionsByReadingOrder: [[Locator]] = []
@@ -537,17 +671,23 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return false
         }
 
-        if
-            let spreadView = paginationView.currentView as? EPUBSpreadView,
-            await spreadView.go(to: direction, options: options)
-        {
-            on(.moved)
-            return true
+        if let spreadView = paginationView.currentView as? EPUBSpreadView {
+            let pageTurnOutcome = await spreadView.go(to: direction, options: options)
+            switch Self.pageTurnNavigationDisposition(for: pageTurnOutcome) {
+            case .moved:
+                on(.moved)
+                return true
+            case .failed, .cancelled:
+                on(.moved)
+                return false
+            case .crossResource:
+                break
+            }
         }
 
         let isRTL = (viewModel.readingProgression == .rtl)
         let delta = isRTL ? -1 : 1
-        let moved: Bool = await {
+        let outcome: PageCommandOutcome = await {
             switch direction {
             case .left:
                 let location: PageLocation = isRTL ? .start : .end
@@ -559,12 +699,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }()
 
         on(.moved)
-        return moved
+        return Self.navigationDisposition(for: outcome) == .landed
     }
 
     // MARK: - Pagination and spreads
 
-    private var paginationView: PaginationView?
+    /// Not `private`: read from EPUBNavigatorViewController+LocatorCommands.swift, and
+    /// `private` is file-scoped. See that file's header for why the split is worth it.
+    var paginationView: PaginationView?
 
     private func makePaginationView(hasPositions: Bool) -> PaginationView {
         let view = PaginationView(
@@ -587,7 +729,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         reloadSpreads()
     }
 
-    private var spreads: [EPUBSpread] = []
+    /// Not `private`: read from EPUBNavigatorViewController+LocatorCommands.swift, and
+    /// `private` is file-scoped. See that file's header for why the split is worth it.
+    var spreads: [EPUBSpread] = []
 
     /// Index of the currently visible spread.
     private var currentSpreadIndex: Int {
@@ -617,6 +761,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func _reloadSpreads() {
+        // Rebuilding the spreads invalidates any in-flight precise locator
+        // landing: its target spread is about to be torn down. Drain the queue
+        // with an explicit .cancelled outcome (and abort the suspended bridge
+        // command) before the rebuild, rather than relying on the operation
+        // self-erroring once its webview vanishes. This is also the drain point
+        // for a process-termination rebuild (spreadViewDidTerminate → reload).
+        locatorNavigationTaskQueue.cancelPending()
+
         let locator = currentLocation
 
         guard
@@ -723,28 +875,45 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
 
-    private lazy var updateCurrentLocation = execute(
-        // If we're not in an `idle` state, we postpone the notification.
-        when: { [weak self] in self?.state == .idle },
-        pollingInterval: 0.1
-    ) { [weak self] in
-        guard let self = self else {
+    /// Postpones the location notification until the navigator settles into
+    /// its `idle` state. An edge-triggered gate coalesces requests made
+    /// mid-navigation and drains them on the `busy → idle` transition (see the
+    /// `state` observer) instead of polling every fixed interval.
+    let idleNotificationGate = EPUBIdleNotificationGate(isIdle: false)
+
+    private func updateCurrentLocation() {
+        guard idleNotificationGate.request() else {
             return
         }
-
-        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
-
-        if
-            let delegate = delegate,
-            let location = currentLocation,
-            location != notifiedCurrentLocation
-        {
-            notifiedCurrentLocation = location
-            delegate.navigator(self, locationDidChange: location)
+        Task { @MainActor [weak self] in
+            await self?.notifyCurrentLocation()
         }
     }
 
+    private func notifyCurrentLocation() async {
+        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
+
+        guard
+            let delegate = delegate,
+            let location = currentLocation,
+            location != notifiedCurrentLocation
+        else {
+            return
+        }
+        notifiedCurrentLocation = location
+        delegate.navigator(self, locationDidChange: location)
+    }
+
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        await goToLocator(locator, options: options) == .succeeded
+    }
+
+    /// Executes the locator's pagination stage without collapsing failure and
+    /// cancellation into the public Navigator `Bool` contract.
+    func goToLocator(
+        _ locator: Locator,
+        options: NavigatorGoOptions
+    ) async -> PageCommandOutcome {
         let locator = publication.normalizeLocator(locator)
 
         guard
@@ -753,15 +922,19 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             let spreadIndex = spreads.firstIndexWithReadingOrderIndex(index),
             on(.jump(locator))
         else {
-            return false
+            return .failed
         }
 
-        let success = await paginationView.goToIndex(spreadIndex, location: .locator(locator), options: options)
+        let outcome = await paginationView.goToIndex(
+            spreadIndex,
+            location: .locator(locator),
+            options: options
+        )
         on(.jumped)
-        if success {
+        if Self.navigationDisposition(for: outcome) == .landed {
             delegate?.navigator(self, didJumpTo: locator)
         }
-        return success
+        return outcome
     }
 
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {
@@ -820,24 +993,42 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Decoration group callbacks, indexed by the group name.
     private var decorationCallbacks: [DecorationGroup: [DecorableNavigator.OnActivatedCallback]] = [:]
 
-    /// Pending decoration tasks, indexed by group name. Stored to allow
-    /// cancellation when a new `apply(decorations:in:)` call supersedes a
-    /// previous one.
-    private var decorationTasks: [DecorationGroup: Task<Void, Never>] = [:]
+    /// Serializes decoration replacement and cleanup within each group.
+    private let decorationApplyTaskQueue = DecorationApplyTaskQueue()
+
+    /// Serializes rapid locator requests with latest-request-wins semantics.
+    let locatorNavigationTaskQueue = EPUBLocatorNavigationTaskQueue()
+
+    /// Owns the mutable command sequence and weak in-flight bridge tracker.
+    let locatorCommandState = EPUBLocatorCommandState()
+
+    /// The locator operation whose cross-resource hop is in flight, published for the
+    /// target spread to read back when it initializes. The hop's spread loads on its own
+    /// load event rather than from this call stack, so the deadline reaches it by pull.
+    let activeLocatorOperationSlot = EPUBActiveLocatorOperationSlot()
+
+    /// The single monotonic source this authority mints deadlines from, measures
+    /// remaining budget against, and sleeps on. One seam rather than a
+    /// `ContinuousClock()` read per rung: scattered reads are individually correct
+    /// but collectively unsubstitutable, so nothing below could be driven to its
+    /// deadline in a test without waiting out the real budget.
+    let locatorClock: EPUBMonotonicClock = .continuous
+
+    /// The deadline for one whole decoration operation — an apply/rollback
+    /// transaction, or a replay sweep — rather than one per affected resource.
+    private func makeDecorationOperationDeadline() -> EPUBLocatorOperationDeadline {
+        EPUBLocatorOperationDeadline(
+            startingAt: locatorClock.now(),
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
+    }
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         config.decorationTemplates.keys.contains(style)
     }
 
     public func apply(decorations: [Decoration], in group: DecorationGroup) {
-        decorationTasks[group]?.cancel()
-        var task: Task<Void, Never>?
-        task = Task { [weak self] in
-            defer {
-                if let self, self.decorationTasks[group] == task {
-                    self.decorationTasks[group] = nil
-                }
-            }
+        decorationApplyTaskQueue.submit(in: group) { [weak self] isSuperseding in
             guard let self else { return }
             await self.initialized()
 
@@ -856,43 +1047,130 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             }
             let transaction = DecorationApplyTransaction(group: group, source: source, target: target)
 
-            await withTaskGroup(of: Void.self) { tasks in
-                guard !Task.isCancelled else { return }
-                if transaction.target.isEmpty {
-                    for (_, pageView) in paginationView.loadedViews {
-                        tasks.addTask {
-                            guard !Task.isCancelled else { return }
-                            await (pageView as? EPUBSpreadView)?.evaluateScript(
-                                // The updates command are using `requestAnimationFrame()`, so we need it for
-                                // `clear()` as well otherwise we might recreate a highlight after it has been
-                                // cleared.
-                                "requestAnimationFrame(function () { readium.getDecorations('\(group)').clear(); });"
-                            )
-                        }
-                    }
-                } else {
-                    for (href, changes) in transaction.changesByHREF {
-                        guard let script = changes.javascript(forGroup: group, styles: self.config.decorationTemplates) else {
-                            continue
-                        }
-                        tasks.addTask { @MainActor [weak self] in
-                            guard
-                                !Task.isCancelled,
-                                let spreadView = self?.loadedSpreadViewForHREF(href),
-                                spreadView.isSpreadLoaded
-                            else {
-                                return
-                            }
-                            await spreadView.evaluateScript(script, inHREF: href)
+            var affectedHREFs = Array(transaction.changesByHREF.keys)
+            if transaction.target.isEmpty || isSuperseding {
+                for (_, pageView) in paginationView.loadedViews {
+                    guard let spreadView = pageView as? EPUBSpreadView else { continue }
+                    for index in spreadView.spread.readingOrderIndices {
+                        guard let href = self.readingOrder.getOrNil(index)?.url() else { continue }
+                        if !affectedHREFs.contains(where: { $0.isEquivalentTo(href) }) {
+                            affectedHREFs.append(href)
                         }
                     }
                 }
             }
 
-            guard !Task.isCancelled else { return }
+            let activable = !(self.decorationCallbacks[group] ?? []).isEmpty
+            let decorationTemplates = self.config.decorationTemplates
+
+            @MainActor
+            func values(
+                from decorations: [DiffableDecoration],
+                for href: AnyURL
+            ) -> [EPUBDecorationCommandItem]? {
+                decorations
+                    .filter { $0.decoration.locator.href.isEquivalentTo(href) }
+                    .commandItems(styles: decorationTemplates)
+            }
+
+            // ONE deadline for the whole transaction — apply across every affected
+            // resource plus any rollback — rather than one per resource. Minting per
+            // command made a transaction's worst case the per-command budget times the
+            // number of preloaded resources it touched, doubled again by rollback, with
+            // no relationship to the frozen total.
+            let deadline = self.makeDecorationOperationDeadline()
+            // One readiness resolution per spread, shared by every HREF the
+            // transaction touches on it and by rollback. Several HREFs can be backed
+            // by ONE spread (a two-page fixed-layout spread is two), and re-deriving
+            // per HREF accepted whatever document occupied the spread at that moment
+            // — so a replacement mid-transaction let a later write land on a document
+            // the transaction never checked while the earlier writes were lost with
+            // the old one, and the transaction still committed as applied.
+            let writeGate = EPUBDecorationWriteGate()
+            let resourceTransaction = DecorationApplyResourceTransaction(resources: affectedHREFs)
+            let didApply = await resourceTransaction.run(
+                apply: { href in
+                    guard let spreadView = self.loadedSpreadViewForHREF(href) else {
+                        return true
+                    }
+                    switch writeGate.resolve(
+                        spread: ObjectIdentifier(spreadView),
+                        isCommandReady: spreadView.isCommandReady,
+                        currentCapability: spreadView.readiness.currentFrameCapability
+                    ) {
+                    case .skip:
+                        return true
+                    case .documentReplaced:
+                        return false
+                    case .write:
+                        break
+                    }
+                    guard let items = values(from: transaction.target, for: href) else {
+                        self.log(.error, "Decoration command encoding failed")
+                        return false
+                    }
+                    guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
+                        return false
+                    }
+                    defer { spreadView.readiness.release(writerLease) }
+
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: activable,
+                        deadline: deadline
+                    )
+                    guard result.outcome == .applied else {
+                        self.log(.warning, "Decoration command rejected reason=\(result.reason.rawValue)")
+                        return false
+                    }
+                    return true
+                },
+                rollback: { href in
+                    guard let spreadView = self.loadedSpreadViewForHREF(href) else {
+                        return true
+                    }
+                    switch writeGate.resolve(
+                        spread: ObjectIdentifier(spreadView),
+                        isCommandReady: spreadView.isCommandReady,
+                        currentCapability: spreadView.readiness.currentFrameCapability
+                    ) {
+                    case .skip:
+                        return true
+                    case .documentReplaced:
+                        return false
+                    case .write:
+                        break
+                    }
+                    guard let items = values(from: source, for: href) else {
+                        self.log(.error, "Decoration rollback encoding failed")
+                        return false
+                    }
+                    guard let writerLease = spreadView.readiness.acquirePositionWriter() else {
+                        return false
+                    }
+                    defer { spreadView.readiness.release(writerLease) }
+
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: activable,
+                        deadline: deadline
+                    )
+                    guard result.outcome == .applied else {
+                        self.log(.warning, "Decoration rollback rejected reason=\(result.reason.rawValue)")
+                        return false
+                    }
+                    return true
+                }
+            )
+            guard didApply else {
+                return
+            }
             transaction.commit(to: &self.decorations)
         }
-        decorationTasks[group] = task
     }
 
     public func observeDecorationInteractions(inGroup group: DecorationGroup, onActivated: @escaping OnActivatedCallback) {
@@ -901,20 +1179,65 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         decorationCallbacks[group] = callbacks
 
         Task {
-            await initialized()
+            await decorationApplyTaskQueue.replay(in: group) { [weak self] in
+                guard let self else { return }
+                await self.initialized()
 
-            guard let paginationView = paginationView else {
-                return
-            }
-
-            await withTaskGroup(of: Void.self) { tasks in
+                guard let paginationView = self.paginationView else { return }
+                // One deadline for the whole sweep: it spans every loaded spread and
+                // every reading-order index within each, so a per-command budget would
+                // scale the sweep's cost with the preload window.
+                let deadline = self.makeDecorationOperationDeadline()
+                let committed = self.decorations[group] ?? []
                 for (_, view) in paginationView.loadedViews {
-                    tasks.addTask {
-                        await (view as? EPUBSpreadView)?.evaluateScript("readium.getDecorations('\(group)').setActivable();")
+                    guard let spreadView = view as? EPUBSpreadView else { continue }
+                    for index in spreadView.spread.readingOrderIndices {
+                        guard
+                            let href = self.readingOrder.getOrNil(index)?.url(),
+                            let items = committed
+                            .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                            .commandItems(styles: self.config.decorationTemplates)
+                        else {
+                            continue
+                        }
+                        _ = await Self.runDecorationReplayWrite(
+                            on: spreadView.readiness
+                        ) {
+                            _ = await spreadView.locatorCommandBridge.replaceDecorations(
+                                items,
+                                in: group,
+                                targetHREF: href,
+                                activable: true,
+                                deadline: deadline
+                            )
+                        }
                     }
                 }
             }
         }
+    }
+
+    /// Runs a decoration replay write under a generation-bound writer lease so
+    /// re-applying committed decorations onto a live spread can never paint a
+    /// superseded generation. Returns `false` without running `write` unless
+    /// the spread currently publishes command readiness, mirroring the
+    /// apply/rollback lease discipline. The `isCommandReady` gate runs before
+    /// `acquirePositionWriter()` so a spread mid-initialization is skipped
+    /// rather than joined as an additional writer.
+    @MainActor
+    static func runDecorationReplayWrite(
+        on readiness: EPUBSpreadReadiness,
+        _ write: @MainActor () async -> Void
+    ) async -> Bool {
+        guard
+            readiness.isCommandReady,
+            let lease = readiness.acquirePositionWriter()
+        else {
+            return false
+        }
+        defer { readiness.release(lease) }
+        await write()
+        return true
     }
 
     // MARK: - Configurable
@@ -965,7 +1288,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     }
 
     private func reinjectAnchorTracking(into spread: EPUBSpreadView) async {
-        guard !Task.isCancelled, spread.isSpreadLoaded else { return }
+        guard
+            !Task.isCancelled,
+            spread.isCommandReady,
+            let writerLease = spread.readiness.acquirePositionWriter()
+        else {
+            return
+        }
+        defer { spread.readiness.release(writerLease) }
         let anchorIds = viewModel.anchorIds(forResourceAt: spread.spread.first.link.url(relativeTo: viewModel.publicationBaseURL)) ?? []
         guard anchorIds.count <= AnchorTrackingLimits.maxAnchorIdsPerResource else {
             log(.warning, "anchor tracking reinjection skipped: list size=\(anchorIds.count)")
@@ -1044,7 +1374,7 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
         invalidatePaginationView()
     }
 
-    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, runScript script: String, in scope: EPUBScriptScope) {
+    func epubNavigatorViewModel(_ viewModel: EPUBNavigatorViewModel, applyCSSSettings script: String) {
         Task {
             await initialized()
 
@@ -1052,31 +1382,13 @@ extension EPUBNavigatorViewController: EPUBNavigatorViewModelDelegate {
                 return
             }
 
-            switch scope {
-            case .currentResource:
-                await (paginationView.currentView as? EPUBSpreadView)?.evaluateScript(script)
-
-            case .loadedResources:
-                await withTaskGroup(of: Void.self) { tasks in
-                    for (_, view) in paginationView.loadedViews {
-                        tasks.addTask {
-                            await (view as? EPUBSpreadView)?.evaluateScript(script)
-                        }
-                    }
-                }
-
-            case let .resource(href):
-                for (_, view) in paginationView.loadedViews {
-                    guard
-                        let view = view as? EPUBSpreadView,
-                        let index = readingOrder.firstIndexWithHREF(href),
-                        view.spread.contains(index: index)
-                    else {
-                        continue
-                    }
-                    await view.evaluateScript(script, inHREF: href)
-                    return
-                }
+            // Each spread runs the CSS change as its own generation-bound,
+            // latest-wins mutation. The call is fire-and-forget here: the spread
+            // holds a readiness lease for the duration, so any subsequent
+            // command awaits the reflow through the authority — there is nothing
+            // for the fan-out to await.
+            for (_, view) in paginationView.loadedViews {
+                (view as? EPUBSpreadView)?.applyCSSSettings(script)
             }
         }
     }
@@ -1121,44 +1433,43 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         return insets
     }
 
+    func spreadViewLocatorOperationDeadline(
+        _ spreadView: EPUBSpreadView
+    ) -> EPUBLocatorOperationDeadline? {
+        activeLocatorOperationSlot.operationDeadline(for: spreadView.spread)
+    }
+
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {
-        let templates = config.decorationTemplates.reduce(into: [String: JSONValue]()) { styles, item in
-            styles[item.key.rawValue] = .object(item.value.jsonObject)
-        }
-
-        guard let stylesJSON = try? templates.jsonString() else {
-            log(.error, "Can't serialize decoration styles to JSON")
-            return
-        }
-        var script = "readium.registerDecorationTemplates(\(stylesJSON.replacingOccurrences(of: "\\n", with: " ")));\n"
-
-        script += decorationCallbacks
-            .compactMap { group, callbacks in
-                guard !callbacks.isEmpty else {
-                    return nil
-                }
-                return "readium.getDecorations('\(group)').setActivable();"
-            }
-            .joined(separator: "\n")
-
         let links = spreadView.spread.readingOrderIndices
             .compactMap { readingOrder.getOrNil($0) }
 
-        for link in links {
-            let href = link.url()
-            for (group, decorations) in decorations {
-                let decorations = decorations
-                    .filter { $0.decoration.locator.href.isEquivalentTo(href) }
-                    .map { DecorationChange.add($0.decoration) }
-
-                guard let decorationsScript = decorations.javascript(forGroup: group, styles: config.decorationTemplates) else {
-                    continue
+        for group in Array(decorations.keys) {
+            await decorationApplyTaskQueue.replay(in: group) { [weak self, weak spreadView] in
+                guard let self, let spreadView else { return }
+                // One deadline for this spread's whole replay, across all its links.
+                let deadline = self.makeDecorationOperationDeadline()
+                let committed = self.decorations[group] ?? []
+                for link in links {
+                    let href = link.url()
+                    guard let items = committed
+                        .filter({ $0.decoration.locator.href.isEquivalentTo(href) })
+                        .commandItems(styles: self.config.decorationTemplates)
+                    else {
+                        continue
+                    }
+                    let result = await spreadView.locatorCommandBridge.replaceDecorations(
+                        items,
+                        in: group,
+                        targetHREF: href,
+                        activable: !(self.decorationCallbacks[group] ?? []).isEmpty,
+                        deadline: deadline
+                    )
+                    if result.outcome != .applied {
+                        self.log(.warning, "Initial decoration command rejected reason=\(result.reason.rawValue)")
+                    }
                 }
-                script += decorationsScript
             }
         }
-
-        await spreadView.evaluateScript("(function() {\n\(script)\n})();")
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {
@@ -1379,3 +1690,82 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         spreads[index].positionCount(in: readingOrder, positionsByReadingOrder: positionsByReadingOrder)
     }
 }
+
+// Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`). The
+// `@_spi(Testing)` annotation below governs who may import these; it does NOT keep
+// them out of a shipping binary, which is what this condition is for. Every hook here
+// is phase-only — opaque UUIDs and Booleans — so nothing derived from book content,
+// hrefs, selectors, or geometry can cross the seam even where it IS compiled.
+#if RENDER_FAITHFUL_NAV_TESTING
+    @_spi(Testing)
+    public extension EPUBNavigatorViewController {
+        /// Test-only: the frame-capability UUIDs the current spread's readiness
+        /// authority and locator command bridge each hold. Proves `spreadDidLoad`
+        /// hands ONE capability to both authorities — a mismatch would mean a frame
+        /// that echoes the injected capability could never be selected by the bridge
+        /// registry, so a landed command would be impossible. Returns `nil` when no
+        /// spread is current. Content-free: only opaque UUIDs cross the seam.
+        var currentSpreadFrameCapabilityIDsForTesting: (readiness: UUID?, bridge: UUID?)? {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+                return nil
+            }
+            return (
+                spreadView.readiness.currentFrameCapability?.id,
+                spreadView.locatorCommandBridge.currentFrameCapability?.id
+            )
+        }
+
+        /// Test-only: whether the current spread is a fixed-layout (pre-paginated)
+        /// spread, which loads its resource inside a child iframe of a wrapper main
+        /// frame. Lets a test prove it is exercising the wrapper→child capability
+        /// forwarding path rather than a silently reflowable resource. `nil` when no
+        /// spread is current.
+        var currentSpreadIsFixedLayoutForTesting: Bool? {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
+                return nil
+            }
+            return spreadView is EPUBFixedSpreadView
+        }
+
+        /// Test-only: awaits the point at which the current spread's initialization
+        /// becomes idle — command readiness published for the LATEST generation of
+        /// the same frame document, with every generation-bound position/layout
+        /// writer released.
+        ///
+        /// A precise landing is only trustworthy if it survives the writers that
+        /// were still in flight when it returned. Because a same-document mutation
+        /// (a font/stylesheet settle, a pending progression apply, a relayout offset
+        /// correction) advances the generation while retaining the frame capability,
+        /// this follows the DOCUMENT rather than a fixed generation and resolves on
+        /// the last one to publish. That lets a test re-verify a landing's visibility
+        /// against a deterministic lifecycle gate instead of a sleep.
+        ///
+        /// Returns `false` when no spread is current, when the document holds no
+        /// capability, or when the document was replaced/invalidated before readiness
+        /// republished. Content-free: only a Boolean crosses the seam.
+        func awaitCurrentSpreadDocumentIdleForTesting() async -> Bool {
+            guard let spreadView = paginationView?.currentView as? EPUBSpreadView,
+                  let capability = spreadView.readiness.currentFrameCapability
+            else {
+                return false
+            }
+            // Bounded deliberately. The document-scoped wait loops while the capability
+            // survives, re-waiting on each successor generation — so a document whose
+            // generation keeps advancing (exactly the font/stylesheet/progression churn
+            // this probe exists to wait out) would never return. Unbounded, that is a suite
+            // HANG rather than a failure: no assertion message, no diagnostic, the whole run
+            // dies. The deadline converts that into an ordinary `false`.
+            let deadline = EPUBLocatorOperationDeadline(
+                startingAt: locatorClock.now(),
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            )
+            guard case .ready = await spreadView.readiness.waitForCommandReadiness(
+                forDocument: capability,
+                until: deadline.expiresAt
+            ) else {
+                return false
+            }
+            return true
+        }
+    }
+#endif

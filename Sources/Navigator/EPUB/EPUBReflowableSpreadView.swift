@@ -10,10 +10,105 @@ import ReadiumShared
 import UIKit
 import WebKit
 
+/// Owns the single continuation waiting for a smooth scroll to settle.
+/// Requests are removed from the coordinator before they are resumed.
+@MainActor
+final class EPUBScrollAnimationCoordinator {
+    final class Request {
+        fileprivate let id: UUID
+        private var continuation: CheckedContinuation<Void, Never>?
+
+        fileprivate init(
+            id: UUID,
+            continuation: CheckedContinuation<Void, Never>
+        ) {
+            self.id = id
+            self.continuation = continuation
+        }
+
+        func resume() {
+            let continuation = continuation
+            self.continuation = nil
+            continuation?.resume()
+        }
+    }
+
+    private var pendingRequest: Request?
+
+    var hasPendingRequest: Bool {
+        pendingRequest != nil
+    }
+
+    func waitUntilSettled() async {
+        let requestID = UUID()
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                if Task.isCancelled {
+                    continuation.resume()
+                    return
+                }
+
+                let request = Request(id: requestID, continuation: continuation)
+                let previous = takePendingRequest()
+                previous?.resume()
+                pendingRequest = request
+
+                Task { @MainActor [weak self, weak request] in
+                    try? await Task.sleep(seconds: 0.8)
+                    guard let self, let request else { return }
+                    finish(request)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                guard
+                    let self,
+                    let request = self.pendingRequest,
+                    request.id == requestID
+                else {
+                    return
+                }
+                self.takePendingRequest(matching: request)?.resume()
+            }
+        }
+    }
+
+    func takePendingRequest(matching request: Request? = nil) -> Request? {
+        guard request == nil || pendingRequest === request else {
+            return nil
+        }
+        let pendingRequest = pendingRequest
+        self.pendingRequest = nil
+        return pendingRequest
+    }
+
+    func finish(_ request: Request? = nil) {
+        takePendingRequest(matching: request)?.resume()
+    }
+}
+
 /// A view rendering a spread of resources with a reflowable layout.
 final class EPUBReflowableSpreadView: EPUBSpreadView {
+    private struct ContentInsetConfiguration: Equatable {
+        let inset: UIEdgeInsets
+        let scroll: Bool
+    }
+
     private var topConstraint: NSLayoutConstraint!
     private var bottomConstraint: NSLayoutConstraint!
+    private var contentInsetConfiguration: ContentInsetConfiguration?
+    private var settingsLayoutTask: Task<Void, Never>?
+    private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
+    private final class PositionCommandOwnership {
+        var isSupersessionAcknowledged = false
+    }
+
+    private struct PositionCommandEntry {
+        let ownership: PositionCommandOwnership
+        let task: Task<PageTurnOutcome, Never>
+    }
+
+    private var activePositionCommand: PositionCommandEntry?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -21,28 +116,31 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread,
         scripts: [WKUserScript],
-        animatedLoad: Bool
+        animatedLoad: Bool,
+        stabilityBudget: EPUBInitializationStabilityBudget = .production
     ) {
+        var scripts = scripts
+        scripts.append(WKUserScript(
+            source: Self.reflowableScript,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: false
+        ))
         super.init(
             viewModel: viewModel,
             spread: spread,
-            scripts: [
-                WKUserScript(source: Self.reflowableScript, injectionTime: .atDocumentStart, forMainFrameOnly: false),
-            ],
-            animatedLoad: animatedLoad
+            scripts: scripts,
+            animatedLoad: animatedLoad,
+            stabilityBudget: stabilityBudget
         )
     }
 
     override func clear() {
+        settingsLayoutTask?.cancel()
+        settingsLayoutTask = nil
+        activePositionCommand?.task.cancel()
+        activePositionCommand = nil
         super.clear()
-
-        // Clean up go to continuations.
-        for continuation in goToContinuations {
-            continuation.resume()
-        }
-        goToContinuations.removeAll()
-
-        scrollDidEnd()
+        scrollAnimationCoordinator.finish()
     }
 
     override func setupWebView() {
@@ -84,7 +182,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return
         }
         let url = viewModel.url(to: spread.first.link)
-        webView.load(URLRequest(url: url.url))
+        issueMainFrameLoad {
+            webView.load(URLRequest(url: url.url))
+        }
     }
 
     override func applySettings() {
@@ -96,8 +196,31 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         updateContentInset()
     }
 
+    override func applyCSSScript(
+        _ script: String,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        guard await evaluateDocumentScriptBounded(script, until: deadline) else {
+            return false
+        }
+        // Reflowable content repaginates on a CSS settings change; hold command
+        // readiness until the reflow settles so a following command lands on the
+        // new geometry.
+        return await waitForLayoutStability(until: deadline)
+    }
+
     private func updateContentInset() {
         let contentInset = delegate?.spreadViewContentInset(self) ?? .zero
+        let configuration = ContentInsetConfiguration(
+            inset: contentInset,
+            scroll: viewModel.scroll
+        )
+        guard configuration != contentInsetConfiguration else {
+            return
+        }
+        contentInsetConfiguration = configuration
+
+        let writerLease = readiness.acquirePositionWriter()
 
         if viewModel.scroll {
             topConstraint.constant = 0
@@ -108,6 +231,25 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             topConstraint.constant = contentInset.top
             bottomConstraint.constant = -contentInset.bottom
             scrollView.contentInset = .zero
+        }
+
+        layoutIfNeeded()
+
+        guard let writerLease else { return }
+        let predecessor = settingsLayoutTask
+        predecessor?.cancel()
+        settingsLayoutTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
+            let outcome: EPUBSpreadReadiness.MutationOutcome
+            if Task.isCancelled {
+                outcome = .superseded
+            } else if await self.waitForLayoutStability() {
+                outcome = .succeeded
+            } else {
+                outcome = Task.isCancelled ? .superseded : .failed
+            }
+            self.readiness.finishMutation(writerLease, outcome: outcome)
         }
     }
 
@@ -144,28 +286,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return progression
     }
 
-    override func spreadDidLoad() async {
+    override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
+        let stabilityDeadline = resolveInitializationStabilityDeadline(for: .sharedInitialization)
         let link = spread.first.link
         if let linkJSON = try? link.jsonString() {
-            await evaluateScript("readium.link = \(linkJSON);")
+            guard await evaluateDocumentScriptBounded(
+                "readium.link = \(linkJSON);",
+                until: stabilityDeadline
+            ) else {
+                return .failed
+            }
         }
 
-        // TODO: Better solution for delaying scrolling to pending location
-        // This delay is used to wait for the web view pagination to settle and give the CSS and webview time to layout
-        // correctly before attempting to scroll to the target progression, otherwise we might end up at the wrong spot.
-        // 0.2 seconds seems like a good value for it to work on an iPhone 5s.
-        try? await Task.sleep(seconds: 0.2)
-        if Task.isCancelled { return }
-
-        let location = pendingLocation
-        await go(to: location.location, animated: location.animated)
-        if Task.isCancelled { return }
-
-        // The rendering is sometimes very slow. So in case we don't show the first page of the resource, we add
-        // a generous delay before showing the spread again.
-        let delayed = !location.location.isStart
-        try? await Task.sleep(seconds: delayed ? 0.3 : 0)
-        if Task.isCancelled { return }
+        guard await waitForLayoutStability(until: stabilityDeadline) else { return .failed }
 
         // Anchor-tracking init: pull the per-resource anchor list from the
         // view model and call into the JS module. Even on oversized/invalid
@@ -186,42 +319,413 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return rawAnchorIds
         }()
         do {
-            _ = try await webView.callAsyncJavaScript(
-                "readium.initAnchorTracking(anchorIds);",
-                arguments: ["anchorIds": anchorIds],
-                in: nil,
-                contentWorld: .page
-            )
+            // Watchdogged because a `callAsyncJavaScript` WebKit never resumes would suspend
+            // `initializeSpread()` itself, so `spreadDidLoad` never completes and the spread never
+            // shows — the same terminal symptom as a stranded writer lease, reached differently.
+            //
+            // Bounded by its OWN cap, deliberately NOT the shared `stabilityDeadline`. The comment
+            // above is the reason: this call MUST dispatch, or a stale observer from the previous
+            // page survives. `waitForLayoutStability` may legitimately have spent the whole shared
+            // budget, and `EPUBLocatorCommandWatchdog.run` refuses to start an operation against an
+            // already-expired deadline — so sharing it would convert "bound a hang" into "skip
+            // whenever layout was slow", silently leaving the prior page's observer installed.
+            _ = try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(
+                    expiringAt: stabilityBudget.deadline(.ownCap)
+                ),
+                clock: stabilityBudget.clock
+            ) { [webView] in
+                try await webView.callAsyncJavaScript(
+                    "readium.initAnchorTracking(anchorIds);",
+                    arguments: ["anchorIds": anchorIds],
+                    in: nil,
+                    contentWorld: .page
+                )
+            }
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            // Anchor tracking is not load-bearing for showing the spread; the initialization
+            // continues, exactly as it does for a WebKit-reported failure below.
+            log(.warning, "anchor tracking init abandoned: deadline elapsed with the call suspended")
         } catch is CancellationError {
             // Spread teardown — not a failure.
-            return
+            return .failed
         } catch {
             // type+domain+code only — never bare \(error). WKErrorDomain.userInfo
             // can echo script source + arguments.
             let ns = error as NSError
             log(.warning, "anchor tracking init failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
         }
+
+        // Positioning is the final suspending initialization stage so a
+        // locator received during stylesheet/font or anchor setup cannot be
+        // skipped by an older pending value.
+        guard await pendingLocationMutation.applyLatest({ [weak self] location in
+            guard let self else { return false }
+            guard let location else { return true }
+            guard await self.apply(location, until: stabilityDeadline) else { return false }
+            return await self.waitForLayoutStability(until: stabilityDeadline)
+        }) else {
+            return .failed
+        }
+        return .succeeded
     }
 
-    override func go(to direction: EPUBSpreadView.Direction, options: NavigatorGoOptions) async -> Bool {
+    /// Waits for every external stylesheet, fonts and a bounded run of stable
+    /// animation frames. A caller-provided deadline lets all initialization
+    /// stages share one non-resetting budget; callers with no deadline of their
+    /// own (a CSS settings change, a content-inset re-layout) fall back to a
+    /// budget that still inherits the operation's remainder when this spread is
+    /// a locator hop's target.
+    private func waitForLayoutStability(
+        until deadline: ContinuousClock.Instant? = nil
+    ) async -> Bool {
+        let generation = readiness.generation
+        guard case .documentAvailable = await readiness.waitForDocumentAvailability(for: generation) else {
+            return false
+        }
+
+        let deadline = deadline ?? resolveInitializationStabilityDeadline(for: .ownCap)
+        let remainingMilliseconds = stabilityBudget.remainingMilliseconds(until: deadline)
+        guard remainingMilliseconds > 0 else { return false }
+
+        do {
+            // The script's own `performance.now()` budget below cannot expire a script that is
+            // not running, so a wedged page main thread suspends this call indefinitely. Every
+            // caller of this method holds a writer lease across it, and a stranded lease means
+            // readiness never publishes `.ready` and `showSpread()` never runs — the spread stays
+            // at `alpha == 0` until a reload invalidates readiness. The watchdog bounds the await
+            // by the same instant the script is told about, so the two budgets cannot disagree.
+            let result = try await EPUBLocatorCommandWatchdog.run(
+                until: EPUBLocatorOperationDeadline(expiringAt: deadline),
+                clock: stabilityBudget.clock
+            ) { [webView] in
+                try await webView.callAsyncJavaScript(
+                    """
+                    const absoluteDeadline = performance.now() + deadlineMilliseconds;
+                    const beforeDeadline = () => performance.now() < absoluteDeadline;
+                    const nextFrame = () => new Promise(resolve => requestAnimationFrame(resolve));
+                    const cappedWait = new Promise(resolve => {
+                        setTimeout(() => resolve(false), Math.max(0, absoluteDeadline - performance.now()));
+                    });
+                    const stabilityWork = async () => {
+                        while (beforeDeadline()) {
+                            const stylesheetLinks = Array.from(
+                                document.querySelectorAll('link[rel~="stylesheet"]')
+                            );
+                            if (stylesheetLinks.every(link => link.sheet !== null)) {
+                                break;
+                            }
+                            await nextFrame();
+                        }
+                        if (!beforeDeadline()) {
+                            return false;
+                        }
+                        if (document.fonts) {
+                            await document.fonts.ready;
+                        }
+                        if (!beforeDeadline()) {
+                            return false;
+                        }
+
+                        var previous = null;
+                        var stableFrames = 0;
+                        for (let frame = 0; frame < 12 && stableFrames < 2 && beforeDeadline(); frame += 1) {
+                            await nextFrame();
+                            const current = [
+                                document.documentElement.scrollWidth,
+                                document.documentElement.scrollHeight,
+                                document.body?.scrollWidth ?? 0,
+                                document.body?.scrollHeight ?? 0,
+                            ];
+                            if (previous !== null && current.every((value, index) => value === previous[index])) {
+                                stableFrames += 1;
+                            } else {
+                                stableFrames = 0;
+                            }
+                            previous = current;
+                        }
+                        return stableFrames >= 2;
+                    };
+                    return await Promise.race([stabilityWork(), cappedWait]);
+                    """,
+                    arguments: [
+                        "deadlineMilliseconds": remainingMilliseconds,
+                    ],
+                    in: nil,
+                    contentWorld: .page
+                )
+            }
+            guard
+                !Task.isCancelled,
+                generation == readiness.generation
+            else {
+                return false
+            }
+            return result as? Bool == true
+        } catch is EPUBLocatorCommandWatchdog.Expired {
+            // Not stable, and specifically: the call never came back. Reported apart from a
+            // WebKit-signalled failure because the two are different truths — one is a page that
+            // answered, one is a page that stopped answering.
+            log(.warning, "Layout stability abandoned: deadline elapsed with the call suspended")
+            return false
+        } catch is CancellationError {
+            return false
+        } catch {
+            let ns = error as NSError
+            log(.warning, "Layout stability failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            return false
+        }
+    }
+
+    override func go(
+        to direction: EPUBSpreadView.Direction,
+        options: NavigatorGoOptions
+    ) async -> PageTurnOutcome {
         guard !viewModel.scroll else {
             return await super.go(to: direction, options: options)
         }
 
-        let factor: CGFloat = {
-            switch direction {
-            case .left:
-                return -1
-            case .right:
-                return 1
+        if !readiness.isCommandReady, activePositionCommand == nil {
+            guard !Task.isCancelled else { return .cancelled }
+            let generation = readiness.generation
+            switch await Self.readinessGateDisposition(
+                for: readiness.waitForCommandReadiness(for: generation)
+            ) {
+            case .proceed:
+                guard !Task.isCancelled else { return .cancelled }
+            case .cancelled:
+                return .cancelled
+            case .failed:
+                return .failed
             }
-        }()
+        }
 
-        guard scrollView.bounds.width > 0 else { return false }
+        return await runPositionCommand(.pageTurn(PendingPageTurn(
+            direction: direction,
+            animated: options.animated
+        )))
+    }
+
+    private struct PendingPageTurn {
+        let direction: EPUBSpreadView.Direction
+        let animated: Bool
+    }
+
+    private struct PendingLocation {
+        let ownerID: UUID
+        let location: PageLocation
+        let animated: Bool
+
+        init(
+            ownerID: UUID = UUID(),
+            location: PageLocation,
+            animated: Bool
+        ) {
+            self.ownerID = ownerID
+            self.location = location
+            self.animated = animated
+        }
+    }
+
+    private enum PendingPositionCommand {
+        case location(PendingLocation)
+        case pageTurn(PendingPageTurn)
+    }
+
+    /// Location to scroll to in the resource once the page is loaded.
+    private let pendingLocationMutation = EPUBLatestMutation<PendingLocation?>(
+        initialValue: PendingLocation(location: .start, animated: false)
+    )
+    private let pendingPositionMutation = EPUBLatestMutation<PendingPositionCommand>(
+        initialValue: .location(PendingLocation(location: .start, animated: false))
+    )
+
+    func acknowledgeCommandSupersession() {
+        activePositionCommand?.ownership.isSupersessionAcknowledged = true
+    }
+
+    override func cancelInFlightCommandForUserInteraction() {
+        // The user grabbed the page: acknowledge the active command as
+        // superseded so it releases its lease cleanly (the document stays
+        // command-ready at the user's new spot rather than failing), then cancel
+        // it. The command surfaces `.cancelled`, so no fallback scroll fights
+        // the gesture. Idle when nothing is in flight.
+        acknowledgeCommandSupersession()
+        activePositionCommand?.task.cancel()
+    }
+
+    override func go(
+        to location: PageLocation,
+        animated: Bool
+    ) async -> PageCommandOutcome {
+        let pendingLocation = PendingLocation(
+            location: location,
+            animated: animated
+        )
+        pendingLocationMutation.update(pendingLocation)
+
+        return await withTaskCancellationHandler {
+            let outcome = await go(to: pendingLocation)
+            if outcome == .cancelled || Task.isCancelled {
+                clearPendingLocation(ownedBy: pendingLocation.ownerID)
+                return .cancelled
+            }
+            return outcome
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.clearPendingLocation(ownedBy: pendingLocation.ownerID)
+            }
+        }
+    }
+
+    private func go(to pendingLocation: PendingLocation) async -> PageCommandOutcome {
+        guard !Task.isCancelled else {
+            return .cancelled
+        }
+        guard readiness.isCommandReady || activePositionCommand != nil else {
+            let generation = readiness.generation
+            switch await Self.readinessGateDisposition(
+                for: readiness.waitForCommandReadiness(for: generation)
+            ) {
+            case .proceed:
+                return Task.isCancelled ? .cancelled : .succeeded
+            case .cancelled:
+                return .cancelled
+            case .failed:
+                return .failed
+            }
+        }
+
+        let outcome = await runPositionCommand(.location(pendingLocation))
+        switch outcome {
+        case .succeeded:
+            return .succeeded
+        case .cancelled:
+            return .cancelled
+        case .boundary, .failed:
+            return .failed
+        }
+    }
+
+    private func clearPendingLocation(ownedBy ownerID: UUID) {
+        guard pendingLocationMutation.latestValue?.ownerID == ownerID else {
+            return
+        }
+        pendingLocationMutation.update(nil)
+    }
+
+    private func runPositionCommand(
+        _ command: PendingPositionCommand
+    ) async -> PageTurnOutcome {
+        pendingPositionMutation.update(command)
+
+        let predecessor = activePositionCommand?.task
+        activePositionCommand?.ownership.isSupersessionAcknowledged = true
+        predecessor?.cancel()
+
+        let ownership = PositionCommandOwnership()
+        let task = Task { @MainActor [weak self, ownership] in
+            if let predecessor {
+                _ = await predecessor.value
+            }
+            guard let self else { return PageTurnOutcome.cancelled }
+            let outcome = await self.executePositionCommand(ownership: ownership)
+            if self.activePositionCommand?.ownership === ownership {
+                self.activePositionCommand = nil
+            }
+            return outcome
+        }
+        activePositionCommand = PositionCommandEntry(
+            ownership: ownership,
+            task: task
+        )
+
+        return await withTaskCancellationHandler {
+            let outcome = await task.value
+            guard Task.isCancelled else { return outcome }
+            cancelPositionCommand(ownedBy: ownership)
+            _ = await task.value
+            return .cancelled
+        } onCancel: {
+            Task { @MainActor [weak self, ownership] in
+                self?.cancelPositionCommand(ownedBy: ownership)
+            }
+        }
+    }
+
+    private func cancelPositionCommand(
+        ownedBy ownership: PositionCommandOwnership
+    ) {
+        guard activePositionCommand?.ownership === ownership else { return }
+        activePositionCommand?.task.cancel()
+    }
+
+    private func executePositionCommand(
+        ownership: PositionCommandOwnership
+    ) async -> PageTurnOutcome {
+        guard !Task.isCancelled else {
+            if !ownership.isSupersessionAcknowledged {
+                readiness.invalidate()
+            }
+            return .cancelled
+        }
+        guard let writerLease = readiness.acquirePositionWriter() else {
+            return Task.isCancelled ? .cancelled : .failed
+        }
+        let positionDeadline = resolveInitializationStabilityDeadline(for: .ownCap)
+
+        var appliedOutcome = PageTurnOutcome.failed
+        let succeeded = await pendingPositionMutation.applyLatest { [weak self] command in
+            guard let self else { return false }
+            appliedOutcome = await self.apply(command, until: positionDeadline)
+            return appliedOutcome == .succeeded || appliedOutcome == .boundary
+        }
+
+        let mutationOutcome: EPUBSpreadReadiness.MutationOutcome
+        if succeeded {
+            mutationOutcome = .succeeded
+        } else if Task.isCancelled, ownership.isSupersessionAcknowledged {
+            mutationOutcome = .superseded
+        } else {
+            mutationOutcome = .failed
+        }
+        readiness.finishMutation(writerLease, outcome: mutationOutcome)
+
+        if succeeded {
+            return appliedOutcome
+        }
+        return Task.isCancelled ? .cancelled : .failed
+    }
+
+    private func apply(
+        _ command: PendingPositionCommand,
+        until deadline: ContinuousClock.Instant
+    ) async -> PageTurnOutcome {
+        switch command {
+        case let .location(location):
+            guard await apply(location, until: deadline) else { return .failed }
+            return await waitForLayoutStability(until: deadline) ? .succeeded : .failed
+        case let .pageTurn(turn):
+            return await apply(turn, until: deadline)
+        }
+    }
+
+    private func apply(
+        _ turn: PendingPageTurn,
+        until deadline: ContinuousClock.Instant
+    ) async -> PageTurnOutcome {
+        let factor: CGFloat
+        switch turn.direction {
+        case .left:
+            factor = -1
+        case .right:
+            factor = 1
+        }
+        guard scrollView.bounds.width > 0 else { return .failed }
         let offsetX = scrollView.bounds.width * factor
         let targetX = round((scrollView.contentOffset.x + offsetX) / offsetX) * offsetX
         guard 0 ..< scrollView.contentSize.width ~= targetX else {
-            return false
+            return .boundary
         }
 
         // We use JavaScript instead of `UIScrollView.setContentOffset()` to
@@ -233,102 +737,76 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // `contentOffset.x` is always non-negative. A relative displacement
         // (`offsetX`) is coordinate-system agnostic and works for both LTR and
         // RTL.
-        let behavior = options.animated ? "smooth" : "instant"
-        await evaluateScript("window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });")
+        let behavior = turn.animated ? "smooth" : "instant"
+        guard await evaluateDocumentScriptBounded(
+            "window.scrollBy({ left: \(offsetX), behavior: '\(behavior)' });",
+            until: deadline
+        ) else {
+            return .failed
+        }
 
-        if options.animated {
-            // Waits for the scroll animation to finish.
-            await withCheckedContinuation { continuation in
-                let request = ScrollAnimationRequest(continuation)
-                pendingScrollAnimation?.resume()
-                pendingScrollAnimation = request
-
-                // Safety net in case `scrollDidEnd` never fires. The identity
-                // check on `request` ensures a stale timeout from a previous
-                // request does not resume a newer one.
-                Task { @MainActor in
-                    try? await Task.sleep(seconds: 0.8)
-                    scrollDidEnd(for: request)
-                }
+        // The position command's one deadline is spent by the script and BOTH
+        // settle rungs. No stage can buy a fresh allowance after an earlier one
+        // ran long.
+        let settleDeadline = EPUBLocatorOperationDeadline(expiringAt: deadline)
+        let settlement = Task { @MainActor [weak self] in
+            guard let self else { return false }
+            if turn.animated {
+                await scrollAnimationCoordinator.waitUntilSettled()
             }
+            guard await waitForLayoutStability(until: deadline) else {
+                return false
+            }
+            return await waitForScrollPosition(targetX, until: settleDeadline)
         }
-
-        return true
+        let didSettle = await settlement.value
+        guard didSettle else { return .failed }
+        return Task.isCancelled ? .cancelled : .succeeded
     }
 
-    private struct PendingLocation {
-        var location: PageLocation
-        var animated: Bool
+    /// - Parameter operationDeadline: the page turn's single deadline. This rung is
+    ///   bounded by the EARLIER of its own settle cap and what remains of the turn, so
+    ///   it can no longer re-arm a full second after the rungs above it ran long.
+    private func waitForScrollPosition(
+        _ targetX: CGFloat,
+        until operationDeadline: EPUBLocatorOperationDeadline
+    ) async -> Bool {
+        let clock = ContinuousClock()
+        let settleCap = clock.now.advanced(by: .seconds(1))
+        let deadline = operationDeadline.effectiveDeadline(cappedBy: settleCap)
+        while clock.now < deadline {
+            if abs(scrollView.contentOffset.x - targetX) <= 1 {
+                return true
+            }
+            try? await clock.sleep(for: .milliseconds(10))
+        }
+        return false
     }
 
-    /// Location to scroll to in the resource once the page is loaded.
-    private var pendingLocation: PendingLocation = .init(location: .start, animated: false)
-
-    override func go(to location: PageLocation, animated: Bool) async {
-        guard isSpreadLoaded else {
-            // Delays moving to the location until the document is loaded.
-            pendingLocation = PendingLocation(location: location, animated: animated)
-
-            await waitGoToCompletion()
-            return
-        }
-
-        switch location {
+    private func apply(
+        _ location: PendingLocation,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
+        switch location.location {
         case let .locator(locator):
-            await go(to: locator, animated: animated)
+            return await go(to: locator, animated: location.animated, until: deadline)
         case .start:
-            await scroll(toProgression: 0, animated: animated)
+            return await scroll(toProgression: 0, animated: location.animated, until: deadline)
         case .end:
-            await scroll(toProgression: 1, animated: animated)
-        }
-
-        didCompleteGoTo()
-    }
-
-    private func waitGoToCompletion() async {
-        await withCheckedContinuation { continuation in
-            goToContinuations.append(continuation)
+            return await scroll(toProgression: 1, animated: location.animated, until: deadline)
         }
     }
 
-    private func didCompleteGoTo() {
-        for cont in goToContinuations {
-            cont.resume()
-        }
-        goToContinuations.removeAll()
-    }
-
-    private var goToContinuations: [CheckedContinuation<Void, Never>] = []
-
-    private var pendingScrollAnimation: ScrollAnimationRequest?
-
-    /// Represents an in-flight animated page turn, waiting for the scroll
-    /// animation to settle before completing.
-    private class ScrollAnimationRequest {
-        private var continuation: CheckedContinuation<Void, Never>?
-
-        init(_ continuation: CheckedContinuation<Void, Never>) {
-            self.continuation = continuation
-        }
-
-        /// Resumes the continuation. Safe to call multiple times; only the
-        /// first call has any effect.
-        func resume() {
-            continuation?.resume()
-            continuation = nil
-        }
-    }
-
-    private func scrollDidEnd(for request: ScrollAnimationRequest? = nil) {
-        guard request == nil || pendingScrollAnimation === request else {
-            return
-        }
-        pendingScrollAnimation?.resume()
-        pendingScrollAnimation = nil
+    private func scrollDidEnd() {
+        scrollAnimationCoordinator.finish()
     }
 
     @discardableResult
-    private func go(to locator: Locator, animated: Bool) async -> Bool {
+    private func go(
+        to locator: Locator,
+        animated: Bool,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
         if !["", "#"].contains(locator.href.string) {
             guard
                 let index = viewModel.readingOrder.firstIndexWithHREF(locator.href),
@@ -339,22 +817,40 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
         }
 
-        if locator.text.highlight != nil {
-            return await scroll(toLocator: locator, animated: animated)
-            // TODO: find the first fragment matching a tag ID (need a regex)
-        } else if let id = locator.locations.fragments.first, !id.isEmpty {
-            return await scroll(toTagID: id, animated: animated)
-        } else {
-            let progression = locator.locations.progression ?? 0
-            return await scroll(toProgression: progression, animated: animated)
+        let hasDocumentAnchor = locator.locations.domRange != nil
+            || locator.locations.cssSelector != nil
+            || locator.locations.fragments.contains { !$0.isEmpty }
+            || locator.text.highlight != nil
+
+        if hasDocumentAnchor {
+            let outcome = await navigationOutcome(to: locator, animated: animated)
+            switch Self.anchorLandingDecision(for: outcome) {
+            case .landed:
+                return true
+            case .degradeToProgression:
+                break
+            case .cancelled:
+                return false
+            }
         }
+
+        let progression = locator.locations.progression ?? 0
+        return await scroll(
+            toProgression: progression,
+            animated: animated,
+            until: deadline
+        )
     }
 
     /// Scrolls at given progression (from 0.0 to 1.0)
     @discardableResult
-    private func scroll(toProgression progression: Double, animated: Bool) async -> Bool {
+    private func scroll(
+        toProgression progression: Double,
+        animated: Bool,
+        until deadline: ContinuousClock.Instant
+    ) async -> Bool {
         guard progression >= 0, progression <= 1 else {
-            log(.warning, "Scrolling to invalid progression \(progression)")
+            EPUBPageWorldLog.report(.invalidScrollProgression, withholding: progression)
             return false
         }
 
@@ -368,38 +864,66 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            await evaluateScript("readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))")
-            return true
+            return await evaluateDocumentScriptBounded(
+                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))",
+                until: deadline
+            )
         }
     }
 
-    /// Scrolls at the tag with ID `tagID`.
-    @discardableResult
-    private func scroll(toTagID tagID: String, animated: Bool) async -> Bool {
-        let result = await evaluateScript("readium.scrollToId(\'\(tagID)\', \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
-            log(.error, error)
-            return false
+    enum AnchorLandingDecision: Equatable {
+        case landed
+        case degradeToProgression
+        case cancelled
+    }
+
+    /// Pure decision over a pending-location anchor command's bridge outcome
+    /// (mirrors `EPUBNavigatorHolder.citationRetryDecision`). A genuine
+    /// `.miss` degrades to the progression landing rather than failing
+    /// initialization outright; `.cancelled` must NOT degrade, or it would
+    /// silently "succeed" via the fallback.
+    nonisolated static func anchorLandingDecision(
+        for outcome: EPUBLocatorCommandOutcome
+    ) -> AnchorLandingDecision {
+        switch outcome {
+        case .applied: return .landed
+        case .miss: return .degradeToProgression
+        case .cancelled: return .cancelled
         }
     }
 
-    /// Scrolls at the snippet matching the given text context.
-    @discardableResult
-    private func scroll(toLocator locator: Locator, animated: Bool) async -> Bool {
+    /// Resolves and scrolls to a document anchor in the isolated locator
+    /// command world. Publisher-derived locator data is passed as a typed
+    /// argument and is never interpolated into executable source.
+    ///
+    /// Returns the bridge's closed outcome so callers can distinguish a
+    /// genuine anchor miss (degradable) from cancellation (must propagate —
+    /// collapsing them into a Bool let a cancelled command "succeed" via the
+    /// caller's progression fallback). An unencodable locator is a miss: the
+    /// anchor cannot be resolved, but nothing was interrupted.
+    private func navigationOutcome(
+        to locator: Locator,
+        animated: Bool
+    ) async -> EPUBLocatorCommandOutcome {
         guard let json = try? locator.jsonString() else {
-            return false
+            return .miss
         }
-        let result = await evaluateScript("readium.scrollToLocator(\(json), \(animated));")
-        switch result {
-        case let .success(value):
-            return (value as? Bool) ?? false
-        case let .failure(error):
-            log(.error, error)
-            return false
-        }
+        // A DISTINCT operation, not a rung of `performLocatorNavigation`: this is the
+        // spread's own anchor apply, reached through `go(to:animated:)` during spread
+        // setup, and no operation deadline exists above it to inherit. Minting here is
+        // therefore the operation start — not the per-rung re-arming the single-deadline
+        // contract forbids.
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: ContinuousClock().now,
+            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+        )
+        let result = await locatorCommandBridge.navigate(
+            locatorJSON: json,
+            targetHREF: viewModel.url(to: spread.first.link),
+            animated: animated,
+            deadline: deadline
+        )
+        return result.outcome
     }
 
     // MARK: - Progression
@@ -412,7 +936,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// Called by the javascript code to notify that scrolling ended.
     private func progressionDidChange(_ body: Any) {
         guard
-            isSpreadLoaded,
+            isCommandReady,
             let body = body as? [String: Any],
             var firstProgression = body["first"] as? Double,
             var lastProgression = body["last"] as? Double

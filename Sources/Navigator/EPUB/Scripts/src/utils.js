@@ -300,11 +300,13 @@ export function rangeFromLocator(locator) {
     // Try domRange first - it's the most precise anchoring method
     if (locations && locations.domRange) {
       let range = rangeFromDomRange(locations.domRange);
-      if (range) {
+      if (range && domRangeCoversQuote(range, locator)) {
         log("rangeFromLocator: Successfully anchored using domRange");
         return range;
       }
-      log("rangeFromLocator: domRange anchoring failed, falling back to text matching");
+      log(
+        "rangeFromLocator: domRange anchoring failed, falling back to text matching"
+      );
     }
 
     // Fall back to text-based matching
@@ -377,14 +379,19 @@ function rangeFromDomRange(domRange) {
     // Find start container
     const startElement = document.querySelector(start.cssSelector);
     if (!startElement) {
-      log("rangeFromDomRange: Could not find start element: " + start.cssSelector);
+      log(
+        "rangeFromDomRange: Could not find start element: " + start.cssSelector
+      );
       return null;
     }
 
     // Find the text node at the given index
     const startTextNode = getTextNodeAtIndex(startElement, start.textNodeIndex);
     if (!startTextNode) {
-      log("rangeFromDomRange: Could not find start text node at index " + start.textNodeIndex);
+      log(
+        "rangeFromDomRange: Could not find start text node at index " +
+          start.textNodeIndex
+      );
       return null;
     }
 
@@ -403,16 +410,34 @@ function rangeFromDomRange(domRange) {
 
     const endTextNode = getTextNodeAtIndex(endElement, end.textNodeIndex);
     if (!endTextNode) {
-      log("rangeFromDomRange: Could not find end text node at index " + end.textNodeIndex);
+      log(
+        "rangeFromDomRange: Could not find end text node at index " +
+          end.textNodeIndex
+      );
+      return null;
+    }
+
+    // An out-of-range offset means the DOM is not the one the locator was recorded against
+    // (a CDATA/text-node split, a DOM-mutating reading mode, a republished resource). Clamping
+    // would silently anchor the nearest valid position and report success, so the caller would
+    // paint or scroll to prose that is not the passage asked for. Refusing lets `rangeFromLocator`
+    // fall through to text-quote matching, which either finds the real passage or misses honestly.
+    const startOffset = start.charOffset ?? 0;
+    const endOffset = end.charOffset ?? 0;
+    if (
+      startOffset < 0 ||
+      endOffset < 0 ||
+      startOffset > startTextNode.length ||
+      endOffset > endTextNode.length
+    ) {
+      log(
+        "rangeFromDomRange: charOffset out of range for the resolved text node"
+      );
       return null;
     }
 
     // Create the range
     const range = document.createRange();
-
-    // Clamp offsets to valid range (handle undefined, null, and negative values)
-    const startOffset = Math.min(Math.max(start.charOffset ?? 0, 0), startTextNode.length);
-    const endOffset = Math.min(Math.max(end.charOffset ?? 0, 0), endTextNode.length);
 
     range.setStart(startTextNode, startOffset);
     range.setEnd(endTextNode, endOffset);
@@ -432,12 +457,90 @@ function rangeFromDomRange(domRange) {
 }
 
 /**
+ * Whether a `domRange`-resolved range actually covers the passage the locator names.
+ *
+ * A structurally valid Range is not evidence that it is the RIGHT range: a locator recorded against
+ * a different DOM shape can resolve to a real node at an in-bounds offset and still cover unrelated
+ * prose. Without this check the caller paints or scrolls to that prose and reports success. A
+ * locator carrying no quote (a plain position, or a selection-derived range) has nothing to verify
+ * against and is accepted as before.
+ *
+ * Only the covered text is compared, never the stored `before`/`after` context: that context is
+ * produced with the indexer's own width, which need not equal any width reconstructed here, so
+ * requiring it to match would reject correct landings and silently cost precision-anchoring yield.
+ * The covered text is what gets painted, so it is the whole question.
+ *
+ * `TextQuoteAnchor.fromRange(root, range).exact` is deliberately NOT used for the comparison, even
+ * though it is the obvious candidate. It reconstructs the text as plain `textContent`, which
+ * includes `script` / `style` / `noscript` / `template` content that the indexer's projection
+ * excludes — so a correct landing on any chunk spanning one of those would compare unequal and be
+ * rejected. It also resolves the range relative to a root before computing `exact`, which can throw
+ * for a value that does not depend on the root at all.
+ *
+ * This Tier-2 proof deliberately compares the raw projected UTF-16 text for exact equality. Do not
+ * call `normalizeDOMText` here: normalization belongs to Tier 1 and could make a wrong pair of
+ * endpoints appear valid by erasing the difference this projection-exact check must detect.
+ */
+function domRangeCoversQuote(range, locator) {
+  const highlight = locator.text && locator.text.highlight;
+  if (!highlight) {
+    return true;
+  }
+  try {
+    return projectedTextFromRange(range) === highlight;
+  } catch (e) {
+    log("rangeFromLocator: could not read the resolved range's text");
+    return false;
+  }
+}
+
+/** Elements whose text the indexer's projection excludes, and which must therefore be dropped
+ * before comparing a resolved range against a stored quote. Mirrors the Rust projection's
+ * exclusion set; `head` is omitted because it cannot occur inside a `<body>`-scoped range. */
+const PROJECTION_EXCLUDED_SELECTOR = "script, style, noscript, template";
+
+/**
+ * The range's text as the indexer's projection would have recorded it: excluded subtrees dropped,
+ * each `<br>` contributing one space.
+ */
+function projectedTextFromRange(range) {
+  const container = document.createElement("div");
+  container.appendChild(range.cloneContents());
+  for (const excluded of Array.from(
+    container.querySelectorAll(PROJECTION_EXCLUDED_SELECTOR)
+  )) {
+    excluded.remove();
+  }
+  for (const lineBreak of Array.from(container.querySelectorAll("br"))) {
+    lineBreak.replaceWith(document.createTextNode(" "));
+  }
+  return container.textContent ?? "";
+}
+
+/**
+ * Whether a child node occupies a `textNodeIndex` slot.
+ *
+ * Both `Text` and `CDATASection` are `CharacterData`: they render as prose and accept
+ * `Range.setStart`. XML parsing (`application/xhtml+xml`, the dominant EPUB served type)
+ * materializes every `<![CDATA[…]]>` as a `CDATASection` — empty sections included — which also
+ * splits the surrounding character data into separate `Text` siblings. Counting only `Text` would
+ * therefore address a different node than the indexer recorded. The HTML parser reduces the same
+ * bytes to a comment, which neither side counts, so both parse paths agree on this predicate.
+ */
+export function isAddressableTextNode(node) {
+  return (
+    node.nodeType === Node.TEXT_NODE ||
+    node.nodeType === Node.CDATA_SECTION_NODE
+  );
+}
+
+/**
  * Gets the text node at the given index within an element.
  */
 function getTextNodeAtIndex(element, index) {
   let textNodeIndex = 0;
   for (const child of element.childNodes) {
-    if (child.nodeType === Node.TEXT_NODE) {
+    if (isAddressableTextNode(child)) {
       if (textNodeIndex === index) {
         return child;
       }
