@@ -35,36 +35,45 @@ DESTINATION="${READIUM_TEST_DESTINATION:-platform=iOS Simulator,name=iPad (A16)}
 FILTER="${1:-}"
 
 ARGS=(
-    -project "$REPO_ROOT/TestApp/TestApp.xcodeproj"
-    -scheme TestApp
-    -testPlan TestApp
-    -destination "$DESTINATION"
+	-project "$REPO_ROOT/TestApp/TestApp.xcodeproj"
+	-scheme TestApp
+	-testPlan TestApp
+	-destination "$DESTINATION"
 )
 [ -n "$FILTER" ] && ARGS+=(-only-testing:"$FILTER")
 
 RESULT_BUNDLE="${READIUM_TEST_RESULT_BUNDLE:-}"
 if [ -n "$RESULT_BUNDLE" ]; then
-    # xcodebuild refuses to overwrite an existing bundle.
-    rm -rf "$RESULT_BUNDLE"
-    ARGS+=(-resultBundlePath "$RESULT_BUNDLE")
+	# xcodebuild refuses to overwrite an existing bundle.
+	rm -rf "$RESULT_BUNDLE"
+	ARGS+=(-resultBundlePath "$RESULT_BUNDLE")
 fi
 
 # Word-split deliberately: the variable carries a list of identifiers.
 # shellcheck disable=SC2206
 skip_testing=(${READIUM_SKIP_TESTING:-})
 for skip in ${skip_testing+"${skip_testing[@]}"}; do
-    ARGS+=(-skip-testing:"$skip")
+	ARGS+=(-skip-testing:"$skip")
 done
 
-# The trailing filters must not decide the exit status. `grep -Ev` reports 1 when it filters
-# every line away, and under `pipefail` that alone would fail a passing run — which is why this
-# line used to end in `; true`. That silenced the real signal too: the script reported success for
-# every run, whatever the tests did. Take xcodebuild's own status out of PIPESTATUS instead.
+# `grep -Ev` reports 1 when it filters every line away, which is an expected successful outcome.
+# Every other pipeline failure is authoritative: xcodebuild owns the test result, xcbeautify owns
+# diagnostic rendering, and grep statuses above 1 mean the filter itself failed.
 set +e
 xcodebuild test "${ARGS[@]}" |
-    xcbeautify --quieter --disable-logging |
-    grep -Ev "^Executed |Test Suite 'All tests'|Test run started\.|Test session results:"
-status=${PIPESTATUS[0]}
+	xcbeautify --quieter --disable-logging |
+	grep -Ev "^Executed |Test Suite 'All tests'|Test run started\.|Test session results:"
+pipeline_status=("${PIPESTATUS[@]}")
 set -e
+
+if [[ "${pipeline_status[0]}" -ne 0 ]]; then
+	status="${pipeline_status[0]}"
+elif [[ "${pipeline_status[1]}" -ne 0 ]]; then
+	status="${pipeline_status[1]}"
+elif [[ "${pipeline_status[2]}" -gt 1 ]]; then
+	status="${pipeline_status[2]}"
+else
+	status=0
+fi
 
 exit "$status"

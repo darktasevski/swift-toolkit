@@ -2,7 +2,7 @@ name: Checks
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [ main, develop, fork-extensions ]
   pull_request:
 
 concurrency:
@@ -180,4 +180,3 @@ jobs:
         run: |
           set -eo pipefail
           xcodebuild build -scheme TestApp -destination "platform=$platform,name=$device" | xcbeautify --renderer github-actions
-
