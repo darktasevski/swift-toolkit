@@ -52,7 +52,8 @@ cat >"$FAKE_BIN/grep" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
 if [[ -n "${FAKE_GREP_STATUS:-}" ]]; then
-    exit "$FAKE_GREP_STATUS"
+	cat >/dev/null
+	exit "$FAKE_GREP_STATUS"
 fi
 exec /usr/bin/grep "$@"
 EOF
