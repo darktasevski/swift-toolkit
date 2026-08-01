@@ -7,7 +7,7 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$SCRIPT_DIR/test.sh"
-TEST_PLAN="$REPO_ROOT/TestApp/TestApp.xctestplan"
+TEST_PLAN="$REPO_ROOT/TestApp/Integrations/Local/TestApp.xctestplan"
 
 fail() {
 	echo "FAIL: $*" >&2
