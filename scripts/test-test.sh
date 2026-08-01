@@ -33,7 +33,11 @@ mkdir -p "$FAKE_BIN"
 cat >"$FAKE_BIN/xcodebuild" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
-printf '%s\n' "${FAKE_XCODEBUILD_OUTPUT:?missing fake output}"
+if [[ "${FAKE_XCODEBUILD_STREAM:-stdout}" == stderr ]]; then
+    printf '%s\n' "${FAKE_XCODEBUILD_OUTPUT:?missing fake output}" >&2
+else
+    printf '%s\n' "${FAKE_XCODEBUILD_OUTPUT:?missing fake output}"
+fi
 exit "${FAKE_XCODEBUILD_STATUS:?missing fake status}"
 EOF
 
@@ -50,12 +54,14 @@ run_runner_case() {
 	local expected_exit="$2"
 	local xcodebuild_exit="$3"
 	local xcodebuild_output="$4"
+	local xcodebuild_stream="$5"
 	local actual_exit=0
 	local output="$SCRATCH/$name.out"
 
 	if PATH="$FAKE_BIN:$PATH" \
 		FAKE_XCODEBUILD_STATUS="$xcodebuild_exit" \
 		FAKE_XCODEBUILD_OUTPUT="$xcodebuild_output" \
+		FAKE_XCODEBUILD_STREAM="$xcodebuild_stream" \
 		"$RUNNER" >"$output" 2>&1; then
 		actual_exit=0
 	else
@@ -70,10 +76,12 @@ run_runner_case() {
 }
 
 # Case A: downstream tools succeed, but xcodebuild's nonzero status remains authoritative.
-run_runner_case "xcodebuild failure survives pipeline" 73 73 "visible failure"
+run_runner_case "xcodebuild stderr and failure survive pipeline" 73 73 "visible failure" stderr
+grep -q "visible failure" "$SCRATCH/xcodebuild stderr and failure survive pipeline.out" ||
+	fail "xcodebuild stderr was discarded"
 
 # Case B: grep filters every successful-run line and exits 1; xcodebuild's zero still wins.
-run_runner_case "empty filtered output preserves success" 0 0 "Executed 1 test, with 0 failures"
+run_runner_case "empty filtered output preserves success" 0 0 "Executed 1 test, with 0 failures" stdout
 
 # Case C: the unfiltered TestApp plan structurally includes ReadiumSharedTests.
 if ! grep -Eq '"identifier"[[:space:]]*:[[:space:]]*"ReadiumSharedTests"' "$TEST_PLAN"; then

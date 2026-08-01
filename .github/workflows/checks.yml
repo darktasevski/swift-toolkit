@@ -101,6 +101,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v3
+      - name: Check test runner behavior
+        run: scripts/test-test.sh
       - name: Install pnpm
         uses: pnpm/action-setup@v2
         with:
@@ -178,5 +180,4 @@ jobs:
         run: |
           set -eo pipefail
           xcodebuild build -scheme TestApp -destination "platform=$platform,name=$device" | xcbeautify --renderer github-actions
-
 

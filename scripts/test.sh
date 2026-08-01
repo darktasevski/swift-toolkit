@@ -61,7 +61,7 @@ done
 # line used to end in `; true`. That silenced the real signal too: the script reported success for
 # every run, whatever the tests did. Take xcodebuild's own status out of PIPESTATUS instead.
 set +e
-xcodebuild test "${ARGS[@]}" 2> /dev/null |
+xcodebuild test "${ARGS[@]}" |
     xcbeautify --quieter --disable-logging |
     grep -Ev "^Executed |Test Suite 'All tests'|Test run started\.|Test session results:"
 status=${PIPESTATUS[0]}
