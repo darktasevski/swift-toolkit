@@ -20,12 +20,12 @@ final class EPUBReflowableSpreadViewVisibleAnchorTests: XCTestCase {
     }
 
     func test_decode_oversizedAnchorId_returnsNil() {
-        let oversized = String(repeating: "a", count: 4_097)
+        let oversized = String(repeating: "a", count: 4097)
         XCTAssertNil(EPUBReflowableSpreadView.decodeVisibleAnchorBody(["anchorId": oversized]))
     }
 
     func test_decode_anchorIdAtCap_returnsAnchorId() {
-        let atCap = String(repeating: "a", count: 4_096)
+        let atCap = String(repeating: "a", count: 4096)
         XCTAssertEqual(
             EPUBReflowableSpreadView.decodeVisibleAnchorBody(["anchorId": atCap]),
             atCap
@@ -48,8 +48,8 @@ final class EPUBReflowableSpreadViewVisibleAnchorTests: XCTestCase {
     func test_decode_multibyteAnchorIdUnderCap_returnsAnchorId() {
         // Multi-byte UTF-8 chars must count utf8.count, not String.count.
         // 4-byte emoji × 1024 = 4096 bytes (at cap).
-        let emoji = String(repeating: "🚀", count: 1_024)
-        XCTAssertEqual(emoji.utf8.count, 4_096)
+        let emoji = String(repeating: "🚀", count: 1024)
+        XCTAssertEqual(emoji.utf8.count, 4096)
         XCTAssertEqual(
             EPUBReflowableSpreadView.decodeVisibleAnchorBody(["anchorId": emoji]),
             emoji
@@ -58,8 +58,8 @@ final class EPUBReflowableSpreadViewVisibleAnchorTests: XCTestCase {
 
     func test_decode_multibyteAnchorIdOverCap_returnsNil() {
         // 4-byte emoji × 1025 = 4100 bytes (over cap).
-        let emoji = String(repeating: "🚀", count: 1_025)
-        XCTAssertGreaterThan(emoji.utf8.count, 4_096)
+        let emoji = String(repeating: "🚀", count: 1025)
+        XCTAssertGreaterThan(emoji.utf8.count, 4096)
         XCTAssertNil(EPUBReflowableSpreadView.decodeVisibleAnchorBody(["anchorId": emoji]))
     }
 }

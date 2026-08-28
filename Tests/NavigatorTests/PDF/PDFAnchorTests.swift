@@ -9,12 +9,11 @@ import ReadiumShared
 import XCTest
 
 class PDFAnchorExtractorTests: XCTestCase {
-
     // MARK: - Context Extraction Tests
 
     func testExtractContextAroundMiddleOfText() {
         let text = "The quick brown fox jumps over the lazy dog."
-        let range = 16..<19 // "fox"
+        let range = 16 ..< 19 // "fox"
 
         let (before, after) = PDFAnchorExtractor.extractContext(
             around: range,
@@ -28,7 +27,7 @@ class PDFAnchorExtractorTests: XCTestCase {
 
     func testExtractContextAtStartOfText() {
         let text = "The quick brown fox jumps over the lazy dog."
-        let range = 0..<3 // "The"
+        let range = 0 ..< 3 // "The"
 
         let (before, after) = PDFAnchorExtractor.extractContext(
             around: range,
@@ -42,7 +41,7 @@ class PDFAnchorExtractorTests: XCTestCase {
 
     func testExtractContextAtEndOfText() {
         let text = "The quick brown fox jumps over the lazy dog."
-        let range = 40..<44 // "dog."
+        let range = 40 ..< 44 // "dog."
 
         let (before, after) = PDFAnchorExtractor.extractContext(
             around: range,
@@ -56,7 +55,7 @@ class PDFAnchorExtractorTests: XCTestCase {
 
     func testExtractContextWithShortText() {
         let text = "Hello"
-        let range = 0..<5
+        let range = 0 ..< 5
 
         let (before, after) = PDFAnchorExtractor.extractContext(
             around: range,
@@ -93,7 +92,6 @@ class PDFAnchorExtractorTests: XCTestCase {
 }
 
 class PDFAnchorResolverTests: XCTestCase {
-
     // MARK: - Anchor Parsing Tests
 
     func testParseAnchorFromDictionary() {
@@ -218,7 +216,7 @@ class PDFAnchorResolverTests: XCTestCase {
         let quads = PDFAnchorResolver.parseQuads(quadsData)
 
         XCTAssertNotNil(quads)
-        XCTAssertEqual(quads?.count, 1)  // Only the valid quad should be returned
+        XCTAssertEqual(quads?.count, 1) // Only the valid quad should be returned
         XCTAssertEqual(quads?[0].count, 4)
     }
 
@@ -230,8 +228,8 @@ class PDFAnchorResolverTests: XCTestCase {
                 CGPoint(x: 10, y: 20),
                 CGPoint(x: 110, y: 20),
                 CGPoint(x: 110, y: 40),
-                CGPoint(x: 10, y: 40)
-            ]
+                CGPoint(x: 10, y: 40),
+            ],
         ]
 
         let bounds = PDFAnchorResolver.resolveFromQuads(quads)
@@ -247,14 +245,14 @@ class PDFAnchorResolverTests: XCTestCase {
                 CGPoint(x: 10, y: 100),
                 CGPoint(x: 200, y: 100),
                 CGPoint(x: 200, y: 120),
-                CGPoint(x: 10, y: 120)
+                CGPoint(x: 10, y: 120),
             ],
             [
                 CGPoint(x: 10, y: 75),
                 CGPoint(x: 150, y: 75),
                 CGPoint(x: 150, y: 95),
-                CGPoint(x: 10, y: 95)
-            ]
+                CGPoint(x: 10, y: 95),
+            ],
         ]
 
         let bounds = PDFAnchorResolver.resolveFromQuads(quads)
@@ -275,15 +273,15 @@ class PDFAnchorResolverTests: XCTestCase {
         let quads: [[CGPoint]] = [
             [
                 CGPoint(x: 10, y: 20),
-                CGPoint(x: 10, y: 20),  // Same point - zero width
+                CGPoint(x: 10, y: 20), // Same point - zero width
                 CGPoint(x: 10, y: 20),
-                CGPoint(x: 10, y: 20)
-            ]
+                CGPoint(x: 10, y: 20),
+            ],
         ]
 
         let bounds = PDFAnchorResolver.resolveFromQuads(quads)
 
-        XCTAssertNil(bounds)  // Should return nil, not empty array
+        XCTAssertNil(bounds) // Should return nil, not empty array
     }
 
     // MARK: - Context Score Tests
@@ -404,7 +402,6 @@ class PDFAnchorResolverTests: XCTestCase {
 /// Tests verifying that composite keys (group + id) work correctly for decoration storage.
 /// This validates the pattern used by DecorationKey in PDFNavigatorViewController.
 class CompositeDecorationKeyTests: XCTestCase {
-
     /// Composite key structure mirroring the private DecorationKey in PDFNavigatorViewController
     private struct TestDecorationKey: Hashable {
         let group: String

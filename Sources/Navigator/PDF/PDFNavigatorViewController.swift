@@ -964,13 +964,19 @@ extension PDFNavigatorViewController: DecorableNavigator {
     // MARK: - Highlight Appearance Constants
 
     /// Default tint color for highlights when no custom color is specified.
-    private static var defaultHighlightTint: UIColor { .yellow }
+    private static var defaultHighlightTint: UIColor {
+        .yellow
+    }
 
     /// Alpha value for active (selected) highlights.
-    private static var activeHighlightAlpha: CGFloat { 0.5 }
+    private static var activeHighlightAlpha: CGFloat {
+        0.5
+    }
 
     /// Alpha value for inactive highlights.
-    private static var inactiveHighlightAlpha: CGFloat { 0.3 }
+    private static var inactiveHighlightAlpha: CGFloat {
+        0.3
+    }
 
     // MARK: - Associated Object Storage
 
@@ -994,7 +1000,7 @@ extension PDFNavigatorViewController: DecorableNavigator {
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         // PDF supports highlight and underline decoration styles
-        return style == .highlight || style == .underline
+        style == .highlight || style == .underline
     }
 
     public func apply(decorations newDecorations: [Decoration], in group: String) {
@@ -1027,11 +1033,11 @@ extension PDFNavigatorViewController: DecorableNavigator {
         for (_, changeList) in changes {
             for change in changeList {
                 switch change {
-                case .add(let decoration):
+                case let .add(decoration):
                     addAnnotation(for: decoration, in: document, group: group)
-                case .remove(let id):
+                case let .remove(id):
                     removeAnnotation(withId: id, from: document, group: group)
-                case .update(let decoration):
+                case let .update(decoration):
                     removeAnnotation(withId: decoration.id, from: document, group: group)
                     addAnnotation(for: decoration, in: document, group: group)
                 }
@@ -1119,7 +1125,7 @@ extension PDFNavigatorViewController: DecorableNavigator {
             return
         }
 
-        let boundsArray = self.boundsForLines(for: decoration.locator, on: page)
+        let boundsArray = boundsForLines(for: decoration.locator, on: page)
         guard !boundsArray.isEmpty else {
             log(.warning, "Could not find bounds for decoration \(decoration.id) in group '\(group)' - text: '\(decoration.locator.text.highlight?.prefix(50) ?? "nil")'")
             return

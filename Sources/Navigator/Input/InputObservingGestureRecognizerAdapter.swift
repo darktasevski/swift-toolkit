@@ -28,10 +28,10 @@ final class InputObservingGestureRecognizerAdapter: UIGestureRecognizer {
         let (stream, continuation) = AsyncStream<PointerEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
-        self.eventContinuation = continuation
+        eventContinuation = continuation
 
         // Process events serially to ensure order is preserved
-        self.eventProcessor = Task { @MainActor [weak self] in
+        eventProcessor = Task { @MainActor [weak self] in
             for await event in stream {
                 guard let self else { break }
                 _ = await self.observer.didReceive(event)

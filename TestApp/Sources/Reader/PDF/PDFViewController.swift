@@ -10,7 +10,7 @@ import ReadiumShared
 import SwiftUI
 import UIKit
 
-final class PDFViewController: VisualReaderViewController<PDFNavigatorViewController>, Loggable {
+final class PDFViewController: VisualReaderViewController<PDFNavigatorViewController> {
     private let preferencesStore: AnyUserPreferencesStore<PDFPreferences>
 
     init(
@@ -29,7 +29,7 @@ final class PDFViewController: VisualReaderViewController<PDFNavigatorViewContro
             EditingAction(
                 title: "Highlight",
                 action: #selector(highlightSelection)
-            )
+            ),
         ] + EditingAction.defaultActions
 
         let navigator = try PDFNavigatorViewController(
