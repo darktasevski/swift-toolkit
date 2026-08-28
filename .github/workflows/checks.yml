@@ -3,7 +3,12 @@ name: Checks
 on:
   push:
     branches: [ main, develop, fork-extensions ]
+  # Every job below is gated on the pull request not being a draft, so without
+  # ready_for_review a PR that was parked as a draft can never acquire checks:
+  # marking it ready is not one of the default activity types, and re-running the
+  # skipped run replays the original draft payload.
   pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
