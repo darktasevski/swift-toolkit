@@ -52,13 +52,34 @@ final class WebViewEditingActionTests: XCTestCase {
         }
     }
 
+    func testCopyRoutesSelectedTextThroughEditingActions() async throws {
+        let copied = expectation(description: "selected text copied")
+        var copiedText: String?
+        let editingActions = try makeEditingActions(
+            actions: [.copy],
+            copySelection: { text in
+                copiedText = text
+                copied.fulfill()
+            }
+        )
+        let webView = WebView(editingActions: editingActions)
+
+        webView.copy(nil)
+
+        await fulfillment(of: [copied], timeout: 1)
+        XCTAssertEqual(copiedText, "Selected text")
+    }
+
     private func makeEditingActions(customSelector selector: Selector) throws -> EditingActionsController {
         try makeEditingActions(actions: [
             EditingAction(title: "Highlight", action: selector),
         ])
     }
 
-    private func makeEditingActions(actions: [EditingAction]) throws -> EditingActionsController {
+    private func makeEditingActions(
+        actions: [EditingAction],
+        copySelection: (@MainActor @Sendable (String) -> Void)? = nil
+    ) throws -> EditingActionsController {
         let href = try XCTUnwrap(RelativeURL(string: "chapter.xhtml"))
         let publication = Publication(
             manifest: Manifest(
@@ -68,7 +89,8 @@ final class WebViewEditingActionTests: XCTestCase {
         )
         let editingActions = EditingActionsController(
             actions: actions,
-            publication: publication
+            publication: publication,
+            copySelection: copySelection
         )
         editingActions.selection = Selection(
             locator: Locator(

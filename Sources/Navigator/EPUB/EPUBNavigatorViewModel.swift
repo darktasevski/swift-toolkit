@@ -198,7 +198,8 @@ protocol EPUBNavigatorViewModelDelegate: AnyObject {
         self.config = config
         editingActions = EditingActionsController(
             actions: config.editingActions,
-            publication: publication
+            publication: publication,
+            copySelection: config.copySelection
         )
         self.server = server
         self.assetsBaseURL = assetsBaseURL

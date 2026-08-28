@@ -67,12 +67,17 @@ open class PDFNavigatorViewController:
         /// prevent PDFKit's built-in annotation menus from appearing.
         public var preventDefaultAnnotationMenu: Bool
 
+        /// Receives selection text after the publication's copy rights authorize it.
+        /// When `nil`, the navigator writes to the system pasteboard directly.
+        public var copySelection: (@MainActor @Sendable (String) -> Void)?
+
         public init(
             preferences: PDFPreferences = PDFPreferences(),
             defaults: PDFDefaults = PDFDefaults(),
             editingActions: [EditingAction] = EditingAction.defaultActions,
             enableCustomActionRouting: Bool? = nil,
-            preventDefaultAnnotationMenu: Bool = false
+            preventDefaultAnnotationMenu: Bool = false,
+            copySelection: (@MainActor @Sendable (String) -> Void)? = nil
         ) {
             self.preferences = preferences
             self.defaults = defaults
@@ -89,6 +94,7 @@ open class PDFNavigatorViewController:
             }
 
             self.preventDefaultAnnotationMenu = preventDefaultAnnotationMenu
+            self.copySelection = copySelection
         }
     }
 
@@ -133,7 +139,8 @@ open class PDFNavigatorViewController:
         self.delegate = delegate
         editingActions = EditingActionsController(
             actions: config.editingActions,
-            publication: publication
+            publication: publication,
+            copySelection: config.copySelection
         )
 
         settings = PDFSettings(

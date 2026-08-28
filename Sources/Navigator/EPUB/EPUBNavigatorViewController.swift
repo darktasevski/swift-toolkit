@@ -236,6 +236,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// disabled (no cost). The host runs the blocking FFI off the main actor.
         public var xhtmlRepairTransform: (@Sendable (RelativeURL, Data) async -> Data)?
 
+        /// Receives selection text after the publication's copy rights authorize it.
+        /// When `nil`, the navigator writes to the system pasteboard directly.
+        public var copySelection: (@MainActor @Sendable (String) -> Void)?
+
         public init(
             preferences: EPUBPreferences = .empty,
             defaults: EPUBDefaults = EPUBDefaults(),
@@ -251,7 +255,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             fontFamilyDeclarations: [AnyHTMLFontFamilyDeclaration] = [],
             readiumCSSRSProperties: CSSRSProperties = CSSRSProperties(),
             debugState: Bool = false,
-            xhtmlRepairTransform: (@Sendable (RelativeURL, Data) async -> Data)? = nil
+            xhtmlRepairTransform: (@Sendable (RelativeURL, Data) async -> Data)? = nil,
+            copySelection: (@MainActor @Sendable (String) -> Void)? = nil
         ) {
             self.preferences = preferences
             self.defaults = defaults
@@ -265,6 +270,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             self.readiumCSSRSProperties = readiumCSSRSProperties
             self.debugState = debugState
             self.xhtmlRepairTransform = xhtmlRepairTransform
+            self.copySelection = copySelection
         }
 
         func contentInset(for sizeClass: UIUserInterfaceSizeClass) -> EPUBContentInsets {
