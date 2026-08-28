@@ -335,18 +335,6 @@ final class EPUBSpreadReadiness {
         state = .unavailable(generation: generation)
     }
 
-    /// Invalidates only when the supplied generation still owns the lifecycle.
-    /// Late navigation and initialization callbacks must not poison a newer
-    /// document generation.
-    @discardableResult
-    func invalidate(ifCurrent generation: Generation) -> Bool {
-        guard state.generation == generation else {
-            return false
-        }
-        invalidate()
-        return true
-    }
-
     func waitForDocumentAvailability(for generation: Generation) async -> WaitOutcome {
         await wait(for: .documentAvailability, generation: generation)
     }
