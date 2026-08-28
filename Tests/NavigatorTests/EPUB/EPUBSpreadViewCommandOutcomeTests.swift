@@ -159,6 +159,9 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             in: nil,
             contentWorld: .page
         )
+        // The position writer advances readiness exactly once before it runs the
+        // page-turn script, which fails synchronously without an observation hook.
+        let expectedFailureGeneration = spreadView.readiness.generation &+ 1
 
         let outcome = await spreadView.go(
             to: .right,
@@ -168,6 +171,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .failed)
         assertCommandCapabilityRevoked(
             in: spreadView,
+            expectedGeneration: expectedFailureGeneration,
             "Failed page turn republished command readiness"
         )
     }
@@ -190,12 +194,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             return false
         }
+        let expectedFailureGeneration = spreadView.readiness.generation
         turn.cancel()
 
         let outcome = await turn.value
         XCTAssertEqual(outcome, .cancelled)
         assertCommandCapabilityRevoked(
             in: spreadView,
+            expectedGeneration: expectedFailureGeneration,
             "Cancelled page turn retained frame capability"
         )
     }
@@ -236,6 +242,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             return false
         }
+        let expectedFailureGeneration = spreadView.readiness.generation
         let offsetAtCancellation = spreadView.scrollView.contentOffset
 
         navigation.cancel()
@@ -246,6 +253,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(spreadView.scrollView.contentOffset, offsetAtCancellation)
         assertCommandCapabilityRevoked(
             in: spreadView,
+            expectedGeneration: expectedFailureGeneration,
             "Pagination caller cancellation retained reflow capability"
         )
     }
@@ -403,6 +411,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .failed(generation: mutationGeneration))
         assertCommandCapabilityRevoked(
             in: spreadView,
+            expectedGeneration: mutationGeneration,
             "Failed runtime inset mutation republished command readiness"
         )
     }
@@ -456,6 +465,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             }
             return false
         }
+        let expectedFailureGeneration = spreadView.readiness.generation
         cancelled.cancel()
         try await releaseAnimationFrames(in: spreadView)
 
@@ -463,6 +473,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
         assertCommandCapabilityRevoked(
             in: spreadView,
+            expectedGeneration: expectedFailureGeneration,
             "Unacknowledged cancellation retained frame capability"
         )
     }
@@ -1200,14 +1211,15 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// they are defense in depth and a legible failure message, not independent
     /// catches; do not cite them as proof the capability is separately checked.
     ///
-    /// Known weaker than the contract: matching `.failed` without its
-    /// generation lets a regression that invalidated-then-failed (landing
-    /// `.failed(generation + 1)`) pass, while `fail(ifCurrent:)` promises the
-    /// identity is unchanged. Pinning the expected generation here is tracked in
-    /// issue #1708 rather than done, because four of the five call sites must
-    /// first capture the generation before the act that fails.
+    /// The expected generation is pinned by the caller. Four sites read it from
+    /// readiness before the failure lands; the synchronous page-turn script
+    /// failure has no such window, so that site derives it from the single
+    /// advance `beginMutation()` makes. Matching it here prevents an
+    /// invalidate-then-fail regression from passing merely because it still
+    /// lands in `.failed` with a newer identity.
     private func assertCommandCapabilityRevoked(
         in spreadView: EPUBSpreadView,
+        expectedGeneration: EPUBSpreadReadiness.Generation,
         _ message: String,
         file: StaticString = #filePath,
         line: UInt = #line
@@ -1224,13 +1236,20 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             file: file,
             line: line
         )
-        guard case .failed = spreadView.readiness.state else {
+        guard case let .failed(actualGeneration) = spreadView.readiness.state else {
             return XCTFail(
                 "\(message) — state=\(spreadView.readiness.state)",
                 file: file,
                 line: line
             )
         }
+        XCTAssertEqual(
+            actualGeneration,
+            expectedGeneration,
+            "\(message) — failed generation changed",
+            file: file,
+            line: line
+        )
     }
 
     /// Polls a precondition until it holds.
