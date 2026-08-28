@@ -116,6 +116,14 @@ enum EPUBLocatorCommandOperationKind: String, Hashable, Sendable {
 }
 
 struct EPUBLocatorCommandToken: Equatable, Sendable {
+    struct AuthorizationIdentity: Equatable, Sendable {
+        let webViewInstanceID: String
+        let documentEpoch: Int
+        let operationKind: EPUBLocatorCommandOperationKind
+        let sequence: Int
+        let groupID: String?
+    }
+
     let webViewInstanceID: String
     let documentEpoch: Int
     let operationKind: EPUBLocatorCommandOperationKind
@@ -133,6 +141,18 @@ struct EPUBLocatorCommandToken: Equatable, Sendable {
     /// lets frames fire normally so an internal deadline could never be driven to
     /// expiry.
     let budgetMilliseconds: Int
+
+    /// Stable fields that authorize a script message against native command
+    /// state. The remaining deadline is execution payload, not authority.
+    var authorizationIdentity: AuthorizationIdentity {
+        AuthorizationIdentity(
+            webViewInstanceID: webViewInstanceID,
+            documentEpoch: documentEpoch,
+            operationKind: operationKind,
+            sequence: sequence,
+            groupID: groupID
+        )
+    }
 
     var javascriptValue: [String: Any] {
         var value: [String: Any] = [
@@ -976,26 +996,15 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     ) -> [String: Any]? {
         guard
             let body = message.body as? [String: Any],
-            Set(body.keys) == ["id", "group", "token", "rect", "click"],
-            let identifier = body["id"] as? String,
-            identifier.utf16.count <= 4 * 1024,
             let groupID = body["group"] as? String,
             groupID.utf16.count <= 4 * 1024,
-            let tokenValue = body["token"] as? [String: Any],
-            let token = Self.decodeToken(tokenValue),
-            token.webViewInstanceID == webViewInstanceID,
-            token.documentEpoch == documentEpoch,
-            token.operationKind == .decoration,
-            token.groupID == groupID,
             let requestURL = message.frameInfo.request.url,
             publicationBaseURL.relativize(requestURL) != nil,
             let frameKey = frameKey(for: requestURL),
             case let .selected(selectedID) = registry.select(
                 href: frameKey,
                 capability: currentFrameCapability
-            ),
-            Self.validActivationRect(body["rect"]),
-            Self.validActivationClick(body["click"])
+            )
         else {
             return nil
         }
@@ -1005,9 +1014,47 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             storedFrame.capability == currentFrameCapability,
             let state = decorationActivationStates[
                 DecorationActivationStateKey(frameID: selectedID, groupID: groupID)
-            ],
-            state.token == token,
-            state.identifiers.contains(identifier)
+            ]
+        else {
+            return nil
+        }
+        return Self.validatedDecorationActivationBody(
+            body,
+            webViewInstanceID: webViewInstanceID,
+            documentEpoch: documentEpoch,
+            expectedToken: state.token,
+            identifiers: state.identifiers
+        )
+    }
+
+    /// Validates the publisher-controlled activation payload against the native
+    /// state created by the last successful activable decoration command.
+    ///
+    /// Kept pure so the authorization contract can be covered without fabricating
+    /// a `WKScriptMessage`, whose frame-bound initializer WebKit does not expose.
+    static func validatedDecorationActivationBody(
+        _ body: [String: Any],
+        webViewInstanceID: String,
+        documentEpoch: Int,
+        expectedToken: EPUBLocatorCommandToken,
+        identifiers: Set<String>
+    ) -> [String: Any]? {
+        guard
+            Set(body.keys) == ["id", "group", "token", "rect", "click"],
+            let identifier = body["id"] as? String,
+            identifier.utf16.count <= 4 * 1024,
+            identifiers.contains(identifier),
+            let groupID = body["group"] as? String,
+            groupID.utf16.count <= 4 * 1024,
+            let tokenValue = body["token"] as? [String: Any],
+            let token = decodeToken(tokenValue),
+            token.webViewInstanceID == webViewInstanceID,
+            token.documentEpoch == documentEpoch,
+            token.operationKind == .decoration,
+            token.groupID == groupID,
+            expectedToken.authorizationIdentity == token.authorizationIdentity,
+            validActivationRect(body["rect"]),
+            validActivationClick(body["click"])
         else {
             return nil
         }
