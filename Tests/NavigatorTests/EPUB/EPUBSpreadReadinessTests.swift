@@ -257,6 +257,60 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         )
     }
 
+    func testStaleFailureCannotPoisonReplacementLoadingGeneration() {
+        let readiness = EPUBSpreadReadiness()
+        let staleGeneration = readiness.beginLoading()
+        XCTAssertTrue(readiness.fail(ifCurrent: staleGeneration))
+
+        let replacementGeneration = readiness.beginLoading()
+
+        XCTAssertEqual(replacementGeneration, staleGeneration + 1)
+        XCTAssertFalse(readiness.fail(ifCurrent: staleGeneration))
+        XCTAssertEqual(
+            readiness.state,
+            .loading(generation: replacementGeneration)
+        )
+    }
+
+    func testFailedStateRejectsAllFurtherWorkWithoutChangingGeneration() {
+        let readiness = EPUBSpreadReadiness()
+        let failedGeneration = readiness.beginLoading()
+        XCTAssertTrue(readiness.fail(ifCurrent: failedGeneration))
+
+        XCTAssertNil(readiness.beginInitialization(
+            for: failedGeneration,
+            frameCapability: EPUBSpreadFrameCapability(id: UUID())
+        ))
+        XCTAssertNil(readiness.acquireWriterLease(for: failedGeneration))
+        XCTAssertNil(readiness.beginMutation())
+        XCTAssertNil(readiness.acquirePositionWriter())
+        XCTAssertEqual(
+            readiness.state,
+            .failed(generation: failedGeneration)
+        )
+    }
+
+    func testFailureDrainsDocumentAvailabilityWaiter() async {
+        let readiness = EPUBSpreadReadiness()
+        let generation = readiness.beginLoading()
+        var waiterStarted = false
+        var waiterOutcome: EPUBSpreadReadiness.WaitOutcome?
+        let waiter = Task { @MainActor in
+            waiterStarted = true
+            let outcome = await readiness.waitForDocumentAvailability(for: generation)
+            waiterOutcome = outcome
+            return outcome
+        }
+        await waitUntil { waiterStarted }
+        XCTAssertNil(waiterOutcome)
+
+        XCTAssertTrue(readiness.fail(ifCurrent: generation))
+
+        let outcome = await waiter.value
+        XCTAssertEqual(outcome, .failed(generation: generation))
+        XCTAssertEqual(readiness.state, .failed(generation: generation))
+    }
+
     func testReloadAfterFailureAdvancesOnceAndIgnoresStaleFailure() throws {
         let readiness = EPUBSpreadReadiness()
         let failedGeneration = readiness.beginLoading()

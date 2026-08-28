@@ -26,8 +26,8 @@ open class InputObservableViewController: UIViewController, InputObservable {
         let (pointerStream, pointerContinuation) = AsyncStream<PointerEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
-        self.pointerEventContinuation = pointerContinuation
-        self.pointerEventProcessor = Task { @MainActor [weak self] in
+        pointerEventContinuation = pointerContinuation
+        pointerEventProcessor = Task { @MainActor [weak self] in
             for await event in pointerStream {
                 guard let self else { break }
                 _ = await self.inputObservers.didReceive(event)
@@ -38,8 +38,8 @@ open class InputObservableViewController: UIViewController, InputObservable {
         let (keyStream, keyContinuation) = AsyncStream<KeyEvent>.makeStream(
             bufferingPolicy: .bufferingNewest(64)
         )
-        self.keyEventContinuation = keyContinuation
-        self.keyEventProcessor = Task { @MainActor [weak self] in
+        keyEventContinuation = keyContinuation
+        keyEventProcessor = Task { @MainActor [weak self] in
             for await event in keyStream {
                 guard let self else { break }
                 _ = await self.inputObservers.didReceive(event)

@@ -67,12 +67,17 @@ open class PDFNavigatorViewController:
         /// prevent PDFKit's built-in annotation menus from appearing.
         public var preventDefaultAnnotationMenu: Bool
 
+        /// Receives selection text after the publication's copy rights authorize it.
+        /// When `nil`, the navigator writes to the system pasteboard directly.
+        public var copySelection: (@MainActor @Sendable (String) -> Void)?
+
         public init(
             preferences: PDFPreferences = PDFPreferences(),
             defaults: PDFDefaults = PDFDefaults(),
             editingActions: [EditingAction] = EditingAction.defaultActions,
             enableCustomActionRouting: Bool? = nil,
-            preventDefaultAnnotationMenu: Bool = false
+            preventDefaultAnnotationMenu: Bool = false,
+            copySelection: (@MainActor @Sendable (String) -> Void)? = nil
         ) {
             self.preferences = preferences
             self.defaults = defaults
@@ -89,6 +94,7 @@ open class PDFNavigatorViewController:
             }
 
             self.preventDefaultAnnotationMenu = preventDefaultAnnotationMenu
+            self.copySelection = copySelection
         }
     }
 
@@ -133,7 +139,8 @@ open class PDFNavigatorViewController:
         self.delegate = delegate
         editingActions = EditingActionsController(
             actions: config.editingActions,
-            publication: publication
+            publication: publication,
+            copySelection: config.copySelection
         )
 
         settings = PDFSettings(
@@ -426,8 +433,11 @@ open class PDFNavigatorViewController:
         let locator = publication.normalizeLocator(locator)
 
         let readingOrderIndex: Int? =
-            if isPDFFile { 0 }
-            else { publication.readingOrder.firstIndexWithHREF(locator.href) }
+            if isPDFFile {
+                0
+            } else {
+                publication.readingOrder.firstIndexWithHREF(locator.href)
+            }
 
         guard let readingOrderIndex else {
             return false
@@ -957,13 +967,19 @@ extension PDFNavigatorViewController: DecorableNavigator {
     // MARK: - Highlight Appearance Constants
 
     /// Default tint color for highlights when no custom color is specified.
-    private static var defaultHighlightTint: UIColor { .yellow }
+    private static var defaultHighlightTint: UIColor {
+        .yellow
+    }
 
     /// Alpha value for active (selected) highlights.
-    private static var activeHighlightAlpha: CGFloat { 0.5 }
+    private static var activeHighlightAlpha: CGFloat {
+        0.5
+    }
 
     /// Alpha value for inactive highlights.
-    private static var inactiveHighlightAlpha: CGFloat { 0.3 }
+    private static var inactiveHighlightAlpha: CGFloat {
+        0.3
+    }
 
     // MARK: - Associated Object Storage
 
@@ -987,7 +1003,7 @@ extension PDFNavigatorViewController: DecorableNavigator {
 
     public func supports(decorationStyle style: Decoration.Style.Id) -> Bool {
         // PDF supports highlight and underline decoration styles
-        return style == .highlight || style == .underline
+        style == .highlight || style == .underline
     }
 
     public func apply(decorations newDecorations: [Decoration], in group: String) {
@@ -1020,11 +1036,11 @@ extension PDFNavigatorViewController: DecorableNavigator {
         for (_, changeList) in changes {
             for change in changeList {
                 switch change {
-                case .add(let decoration):
+                case let .add(decoration):
                     addAnnotation(for: decoration, in: document, group: group)
-                case .remove(let id):
+                case let .remove(id):
                     removeAnnotation(withId: id, from: document, group: group)
-                case .update(let decoration):
+                case let .update(decoration):
                     removeAnnotation(withId: decoration.id, from: document, group: group)
                     addAnnotation(for: decoration, in: document, group: group)
                 }
@@ -1112,7 +1128,7 @@ extension PDFNavigatorViewController: DecorableNavigator {
             return
         }
 
-        let boundsArray = self.boundsForLines(for: decoration.locator, on: page)
+        let boundsArray = boundsForLines(for: decoration.locator, on: page)
         guard !boundsArray.isEmpty else {
             log(.warning, "Could not find bounds for decoration \(decoration.id) in group '\(group)' - text: '\(decoration.locator.text.highlight?.prefix(50) ?? "nil")'")
             return

@@ -20,14 +20,17 @@ import UIKit
 /// construction or the action dispatch, which live in `buildMenu(with:)` and
 /// require a live `UIMenuBuilder` / responder chain.
 @MainActor
-@Suite("EditingActionsController custom action gating")
+@Suite("EditingActionsController")
 struct EditingActionsControllerTests {
     private final class FakeDelegate: EditingActionsControllerDelegate {
         var showsMenu = true
+        var preventedCopyCount = 0
         /// Actions the host app disables through `canPerformAction(_:for:)`.
         var disabledActions: Set<EditingAction> = []
 
-        func editingActionsDidPreventCopy(_ editingActions: EditingActionsController) {}
+        func editingActionsDidPreventCopy(_ editingActions: EditingActionsController) {
+            preventedCopyCount += 1
+        }
 
         func editingActions(_ editingActions: EditingActionsController, shouldShowMenuForSelection selection: Selection) -> Bool {
             showsMenu
@@ -41,7 +44,11 @@ struct EditingActionsControllerTests {
     private let highlight = EditingAction(title: "Highlight", action: Selector(("highlight:")))
 
     private let selection = Selection(
-        locator: Locator(href: AnyURL(string: "chapter1.html")!, mediaType: .html),
+        locator: Locator(
+            href: AnyURL(string: "chapter1.html")!,
+            mediaType: .html,
+            text: Locator.Text(highlight: "Selected text")
+        ),
         frame: nil
     )
 
@@ -121,4 +128,59 @@ struct EditingActionsControllerTests {
 
         #expect(!controller.shouldShowCustomAction(.copy))
     }
+
+    @Test("authorized copy uses the injected destination")
+    func authorizedCopyUsesInjectedDestination() async {
+        let delegate = FakeDelegate()
+        let recorder = CopyRecorder()
+        let publication = Publication(manifest: Manifest(metadata: Metadata(title: "Test"), links: [], readingOrder: []))
+        let controller = EditingActionsController(
+            actions: [.copy],
+            publication: publication,
+            copySelection: { recorder.text = $0 }
+        )
+        controller.delegate = delegate
+        controller.selection = selection
+
+        await controller.copy()
+
+        #expect(recorder.text == "Selected text")
+        #expect(delegate.preventedCopyCount == 0)
+    }
+
+    @Test("restricted rights deny copy before the injected destination")
+    func restrictedRightsDenyInjectedDestination() async {
+        let delegate = FakeDelegate()
+        let recorder = CopyRecorder()
+        let publication = Publication(
+            manifest: Manifest(metadata: Metadata(title: "Test"), links: [], readingOrder: []),
+            servicesBuilder: PublicationServicesBuilder(contentProtection: { _ in
+                RestrictedContentProtectionService()
+            })
+        )
+        let controller = EditingActionsController(
+            actions: [.copy],
+            publication: publication,
+            copySelection: { recorder.text = $0 }
+        )
+        controller.delegate = delegate
+        controller.selection = selection
+
+        await controller.copy()
+
+        #expect(recorder.text == nil)
+        #expect(delegate.preventedCopyCount == 1)
+    }
+}
+
+@MainActor
+private final class CopyRecorder {
+    var text: String?
+}
+
+private struct RestrictedContentProtectionService: ContentProtectionService {
+    let scheme = ContentProtectionScheme(rawValue: HTTPURL(string: "https://domain.com/drm")!)
+    let isRestricted = false
+    let error: Error? = nil
+    let rights: UserRights = AllRestrictedUserRights()
 }

@@ -24,6 +24,7 @@ extension ReadiumCSS {
         layout = settings.cssLayout
 
         // MARK: - Dynamic RS Properties Update
+
         //
         // Update `rsProperties.baseFontFamily` based on the `publisherStyles` setting.
         //

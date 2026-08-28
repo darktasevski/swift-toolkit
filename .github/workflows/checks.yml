@@ -3,7 +3,12 @@ name: Checks
 on:
   push:
     branches: [ main, develop, fork-extensions ]
+  # Every job below is gated on the pull request not being a draft, so without
+  # ready_for_review a PR that was parked as a draft can never acquire checks:
+  # marking it ready is not one of the default activity types, and re-running the
+  # skipped run replays the original draft payload.
   pull_request:
+    types: [ opened, synchronize, reopened, ready_for_review ]
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -174,6 +179,15 @@ jobs:
           brew install xcodegen
           # Preload the list of simulator for xcodebuild. The workflow is flaky without it.
           xcrun simctl list
+      # The integration templates hardcode the upstream package URL, so SPM asks
+      # readium/swift-toolkit for a SHA that only exists in the repository being
+      # tested. Retarget the templates at the running repository before xcodegen
+      # reads them; on upstream this substitutes the same URL back in.
+      - name: Point the SPM integration at this repository
+        run: |
+          sed -i '' \
+            -e "s>https://github.com/readium/swift-toolkit.git>${{ github.server_url }}/${{ github.repository }}.git>g" \
+            Integrations/SPM/project.yml Integrations/SPM/project+lcp.yml
       - name: Generate project
         run: make spm lcp=${{ secrets.LCP_URL_SPM }} commit=$commit_sha
       - name: Build

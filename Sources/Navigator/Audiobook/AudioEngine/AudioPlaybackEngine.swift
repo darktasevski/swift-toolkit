@@ -1,5 +1,5 @@
 //
-//  Copyright 2025 Readium Foundation. All rights reserved.
+//  Copyright 2026 Readium Foundation. All rights reserved.
 //  Use of this source code is governed by the BSD-style license
 //  available in the top-level LICENSE file of the project.
 //
@@ -27,7 +27,9 @@ public struct AudioLevelData: Equatable, Sendable {
     public let levels: [Float]
 
     /// Number of frequency bands represented.
-    public var bandCount: Int { levels.count }
+    public var bandCount: Int {
+        levels.count
+    }
 
     /// Overall audio level (average of all bands).
     public var overallLevel: Float {
@@ -42,7 +44,7 @@ public struct AudioLevelData: Equatable, Sendable {
 
     /// Creates single-level audio data (for simple RMS metering).
     public init(level: Float) {
-        self.levels = [min(max(level, 0), 1)]
+        levels = [min(max(level, 0), 1)]
     }
 
     /// Silent audio level data.
