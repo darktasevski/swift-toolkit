@@ -24,5 +24,5 @@ enum AnchorTrackingLimits {
     /// Max byte length (UTF-8) of a single anchor id. WebKit IPC
     /// marshaller has its own much larger ceiling; this is a defence-in-
     /// depth bound paired with the JS-side per-id length filter.
-    static let maxAnchorIdByteLength = 4_096
+    static let maxAnchorIdByteLength = 4096
 }

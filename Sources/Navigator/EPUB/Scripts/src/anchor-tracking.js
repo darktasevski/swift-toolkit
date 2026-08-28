@@ -70,9 +70,11 @@ function rootMarginForViewport() {
 
 function notifyAnchor(anchorId) {
   // Defensive: postMessage against a removed handler throws TypeError.
-  if (!window.webkit ||
-      !window.webkit.messageHandlers ||
-      !window.webkit.messageHandlers.visibleAnchorChanged) {
+  if (
+    !window.webkit ||
+    !window.webkit.messageHandlers ||
+    !window.webkit.messageHandlers.visibleAnchorChanged
+  ) {
     return;
   }
   if (anchorId === lastReportedAnchorId) return;
@@ -229,7 +231,12 @@ function emitInitialAnchorIfApplicable() {
     // Any overlap with viewport rect [0, 0, vpW, vpH]. Off-screen anchors
     // (scrolled past horizontally on a previous spread, or not yet
     // reached) have rect.right ≤ 0 or rect.left ≥ vpW respectively.
-    if (rect.right > 0 && rect.left < vpW && rect.bottom > 0 && rect.top < vpH) {
+    if (
+      rect.right > 0 &&
+      rect.left < vpW &&
+      rect.bottom > 0 &&
+      rect.top < vpH
+    ) {
       current = id;
       break;
     }
@@ -287,25 +294,28 @@ window.readium.initAnchorTracking = function (anchorIds) {
   // for malformed inputs that try to ship astral characters.
   function hasForbiddenChar(s) {
     for (let i = 0; i < s.length; i++) {
-      const cu = s.charCodeAt(i);                       // code unit, not code point
-      if (cu <= 0x1F) return true;                       // C0 controls
-      if (cu >= 0x7F && cu <= 0x9F) return true;         // DEL + C1 controls
-      if (cu >= 0xD800 && cu <= 0xDFFF) return true;     // lone surrogate halves
-      if (cu === 0xFFFE || cu === 0xFFFF) return true;   // noncharacters
-      if (cu === 0x2028 || cu === 0x2029) return true;   // line separators
+      const cu = s.charCodeAt(i); // code unit, not code point
+      if (cu <= 0x1f) return true; // C0 controls
+      if (cu >= 0x7f && cu <= 0x9f) return true; // DEL + C1 controls
+      if (cu >= 0xd800 && cu <= 0xdfff) return true; // lone surrogate halves
+      if (cu === 0xfffe || cu === 0xffff) return true; // noncharacters
+      if (cu === 0x2028 || cu === 0x2029) return true; // line separators
     }
     return false;
   }
-  trackedAnchorIds = anchorIds.filter((id) =>
-    typeof id === "string" &&
-    id.length > 0 &&
-    id.length <= 4096 &&
-    !hasForbiddenChar(id)
+  trackedAnchorIds = anchorIds.filter(
+    (id) =>
+      typeof id === "string" &&
+      id.length > 0 &&
+      id.length <= 4096 &&
+      !hasForbiddenChar(id)
   );
   if (trackedAnchorIds.length < anchorIds.length) {
     // Privacy-safe diagnostic: count only, no anchor content.
     console.warn(
-      "anchor tracking: " + (anchorIds.length - trackedAnchorIds.length) + " ids rejected by filter"
+      "anchor tracking: " +
+        (anchorIds.length - trackedAnchorIds.length) +
+        " ids rejected by filter"
     );
   }
   if (trackedAnchorIds.length === 0) return;

@@ -1,5 +1,5 @@
 //
-//  Copyright 2025 Readium Foundation. All rights reserved.
+//  Copyright 2026 Readium Foundation. All rights reserved.
 //  Use of this source code is governed by the BSD-style license
 //  available in the top-level LICENSE file of the project.
 //
@@ -77,7 +77,9 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         }
     }
 
-    public var supportsEnhancement: Bool { true }
+    public var supportsEnhancement: Bool {
+        true
+    }
 
     /// Interval between playback time updates sent to the delegate.
     public let timeUpdateInterval: TimeInterval
@@ -87,7 +89,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         initialConfiguration: AudioEnhancementConfiguration = .default
     ) {
         self.timeUpdateInterval = timeUpdateInterval
-        self.enhancementConfiguration = initialConfiguration
+        enhancementConfiguration = initialConfiguration
         setupAudioEngine()
     }
 
@@ -381,7 +383,9 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     private let fftSize = 1024
 
     /// Log2 of FFT size for vDSP.
-    private var fftLog2Size: vDSP_Length { vDSP_Length(log2(Float(fftSize))) }
+    private var fftLog2Size: vDSP_Length {
+        vDSP_Length(log2(Float(fftSize)))
+    }
 
     /// vDSP FFT setup (reusable across calls).
     private var fftSetup: FFTSetup?
@@ -400,7 +404,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
 
     /// Frequency band boundaries for 5-band visualization.
     /// Maps frequency ranges to visualization bands.
-    private struct FrequencyBands {
+    private enum FrequencyBands {
         /// Band boundaries in Hz: [bass, low-mid, mid, high-mid, treble]
         /// Band 0: 20-150 Hz (bass - kick drums, bass notes)
         /// Band 1: 150-400 Hz (low-mid - male vocals, warmth)
@@ -632,9 +636,9 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
             0
         )
         #if DEBUG
-        if status != noErr {
-            assertionFailure("Failed to set dynamics parameter \(parameter): OSStatus \(status)")
-        }
+            if status != noErr {
+                assertionFailure("Failed to set dynamics parameter \(parameter): OSStatus \(status)")
+            }
         #endif
     }
 
@@ -716,7 +720,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
             let steps = 10
             let stepDuration = rateRampDuration / Double(steps)
 
-            for i in 1...steps {
+            for i in 1 ... steps {
                 guard !Task.isCancelled else { return }
                 let progress = Float(i) / Float(steps)
                 let newRate = startRate + (targetRate - startRate) * progress
@@ -832,7 +836,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         // Bounds check: use min to prevent buffer overrun if frameLength < fftSize
         var windowedSamples = [Float](repeating: 0, count: fftSize)
         let sampleCount = min(fftSize, frameLength)
-        for i in 0..<sampleCount {
+        for i in 0 ..< sampleCount {
             windowedSamples[i] = samples[i] * windowBuffer[i]
         }
         // Remaining samples (if any) are already zero-initialized
@@ -876,7 +880,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
             guard let self, self.isPlaying else { return }
 
             // Smooth the levels for less jittery animation
-            for i in 0..<self.lastAudioLevels.count {
+            for i in 0 ..< self.lastAudioLevels.count {
                 let newValue = i < bandLevels.count ? bandLevels[i] : 0
                 self.lastAudioLevels[i] = self.lastAudioLevels[i] * self.levelSmoothingFactor +
                     newValue * (1 - self.levelSmoothingFactor)
@@ -900,7 +904,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
         var bandLevels = [Float](repeating: 0, count: FrequencyBands.count)
 
         // For each frequency band, sum magnitudes of bins that fall within it
-        for bandIndex in 0..<FrequencyBands.count {
+        for bandIndex in 0 ..< FrequencyBands.count {
             let lowFreq = FrequencyBands.boundaries[bandIndex]
             let highFreq = FrequencyBands.boundaries[bandIndex + 1]
 
@@ -914,7 +918,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
             var sum: Float = 0
             var count: Float = 0
 
-            for bin in lowBin...highBin {
+            for bin in lowBin ... highBin {
                 sum += magnitudes[bin]
                 count += 1
             }
@@ -1085,9 +1089,9 @@ public enum EnhancedAudioEngineError: Error, LocalizedError {
         switch self {
         case .unsupportedAsset:
             return "The audio asset format is not supported for enhanced playback."
-        case .audioFileLoadFailed(let error):
+        case let .audioFileLoadFailed(error):
             return "Failed to load audio file: \(error.localizedDescription)"
-        case .engineStartFailed(let error):
+        case let .engineStartFailed(error):
             return "Failed to start audio engine: \(error.localizedDescription)"
         }
     }

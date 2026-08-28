@@ -15,7 +15,6 @@ import ReadiumShared
 /// - Character ranges for text-based lookup
 /// - Surrounding text context for disambiguation
 public struct PDFAnchorExtractor: Loggable {
-
     /// Number of characters to capture before/after the selection for context.
     public static let contextCharacterCount = 20
 
@@ -50,7 +49,8 @@ public struct PDFAnchorExtractor: Loggable {
 
         // Extract character range
         if let pageText = page.string,
-           let range = extractCharacterRange(for: selectedText, in: pageText, selection: selection, page: page) {
+           let range = extractCharacterRange(for: selectedText, in: pageText, selection: selection, page: page)
+        {
             anchor["characterStart"] = .integer(range.lowerBound)
             anchor["characterEnd"] = .integer(range.upperBound)
 
@@ -91,10 +91,10 @@ public struct PDFAnchorExtractor: Loggable {
 
             // Convert CGRect to quad (4 corner points)
             let quad: JSONValue = .array([
-                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.minY))]),  // bottomLeft
-                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.minY))]),  // bottomRight
-                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.maxY))]),  // topRight
-                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.maxY))]),  // topLeft
+                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.minY))]), // bottomLeft
+                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.minY))]), // bottomRight
+                .object(["x": .double(Double(bounds.maxX)), "y": .double(Double(bounds.maxY))]), // topRight
+                .object(["x": .double(Double(bounds.minX)), "y": .double(Double(bounds.maxY))]), // topLeft
             ])
             quads.append(quad)
         }
@@ -116,7 +116,7 @@ public struct PDFAnchorExtractor: Loggable {
         var ranges: [Range<String.Index>] = []
         var searchStart = pageText.startIndex
 
-        while let range = pageText.range(of: selectedText, range: searchStart..<pageText.endIndex) {
+        while let range = pageText.range(of: selectedText, range: searchStart ..< pageText.endIndex) {
             ranges.append(range)
             searchStart = range.upperBound
         }
@@ -128,7 +128,7 @@ public struct PDFAnchorExtractor: Loggable {
             let range = ranges[0]
             let start = pageText.distance(from: pageText.startIndex, to: range.lowerBound)
             let end = pageText.distance(from: pageText.startIndex, to: range.upperBound)
-            return start..<end
+            return start ..< end
         }
 
         // Multiple occurrences: try to disambiguate using selection bounds
@@ -142,7 +142,7 @@ public struct PDFAnchorExtractor: Loggable {
                 if boundsApproximatelyEqual(selectionBounds, testBounds, tolerance: 5.0) {
                     let start = pageText.distance(from: pageText.startIndex, to: range.lowerBound)
                     let end = pageText.distance(from: pageText.startIndex, to: range.upperBound)
-                    return start..<end
+                    return start ..< end
                 }
             }
         }
@@ -151,7 +151,7 @@ public struct PDFAnchorExtractor: Loggable {
         let range = ranges[0]
         let start = pageText.distance(from: pageText.startIndex, to: range.lowerBound)
         let end = pageText.distance(from: pageText.startIndex, to: range.upperBound)
-        return start..<end
+        return start ..< end
     }
 
     /// Extracts text context around the given range.
@@ -170,7 +170,7 @@ public struct PDFAnchorExtractor: Loggable {
             offsetBy: -contextLength,
             limitedBy: text.startIndex
         ) ?? text.startIndex
-        let before = String(text[beforeStart..<startIndex])
+        let before = String(text[beforeStart ..< startIndex])
 
         // Extract after context
         let afterEnd = text.index(
@@ -178,7 +178,7 @@ public struct PDFAnchorExtractor: Loggable {
             offsetBy: contextLength,
             limitedBy: text.endIndex
         ) ?? text.endIndex
-        let after = String(text[endIndex..<afterEnd])
+        let after = String(text[endIndex ..< afterEnd])
 
         return (
             before: before.isEmpty ? nil : before,
@@ -194,8 +194,8 @@ public struct PDFAnchorExtractor: Loggable {
         tolerance: CGFloat
     ) -> Bool {
         abs(a.minX - b.minX) <= tolerance &&
-        abs(a.minY - b.minY) <= tolerance &&
-        abs(a.maxX - b.maxX) <= tolerance &&
-        abs(a.maxY - b.maxY) <= tolerance
+            abs(a.minY - b.minY) <= tolerance &&
+            abs(a.maxX - b.maxX) <= tolerance &&
+            abs(a.maxY - b.maxY) <= tolerance
     }
 }

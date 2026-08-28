@@ -34,6 +34,7 @@
 		4DC581D9DDE636037C5FAB4A /* HTMLText.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = HTMLText.swift; sourceTree = "<group>"; };
 		59844953100C517348EF23D0 /* Assets.xcassets */ = {isa = PBXFileReference; lastKnownFileType = folder.assetcatalog; path = Assets.xcassets; sourceTree = "<group>"; };
 		5BD99839EEEAFBFAF8A2264F /* PublicationMetadataView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = PublicationMetadataView.swift; sourceTree = "<group>"; };
+		5C78274791BF5FD2DEC22BB3 /* swift-toolkit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = swift-toolkit; path = ..; sourceTree = SOURCE_ROOT; };
 		5C7CDF2688AF525420855AC5 /* DocumentRepository.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentRepository.swift; sourceTree = "<group>"; };
 		5D8B2B0C8575F4648E445A44 /* DocumentList.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = DocumentList.swift; sourceTree = "<group>"; };
 		A5AE9B43C414342BBB5CDDEF /* FileManager+Ext.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "FileManager+Ext.swift"; sourceTree = "<group>"; };
@@ -44,7 +45,6 @@
 		CCB6D3C4C19C2038573D2B90 /* JSONView.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = JSONView.swift; sourceTree = "<group>"; };
 		D608867E2F9CC0B751114DE9 /* A02-ReadMetadata.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = "A02-ReadMetadata.swift"; sourceTree = "<group>"; };
 		E40DD68F934F5F0D2981ACA1 /* Playground.app */ = {isa = PBXFileReference; includeInIndex = 0; lastKnownFileType = wrapper.application; path = Playground.app; sourceTree = BUILT_PRODUCTS_DIR; };
-		ED646581982F3FF78FB275C8 /* swift-toolkit */ = {isa = PBXFileReference; lastKnownFileType = folder; name = swift-toolkit; path = ..; sourceTree = SOURCE_ROOT; };
 /* End PBXFileReference section */
 
 /* Begin PBXFrameworksBuildPhase section */
@@ -129,7 +129,7 @@
 		75054112A41CDCE58ADACF92 /* Packages */ = {
 			isa = PBXGroup;
 			children = (
-				ED646581982F3FF78FB275C8 /* swift-toolkit */,
+				5C78274791BF5FD2DEC22BB3 /* swift-toolkit */,
 			);
 			name = Packages;
 			sourceTree = "<group>";
@@ -327,7 +327,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = Sources/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
@@ -346,7 +346,7 @@
 				ASSETCATALOG_COMPILER_APPICON_NAME = AppIcon;
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				INFOPLIST_FILE = Sources/Info.plist;
-				IPHONEOS_DEPLOYMENT_TARGET = 16.0;
+				IPHONEOS_DEPLOYMENT_TARGET = 18.0;
 				LD_RUNPATH_SEARCH_PATHS = (
 					"$(inherited)",
 					"@executable_path/Frameworks",
