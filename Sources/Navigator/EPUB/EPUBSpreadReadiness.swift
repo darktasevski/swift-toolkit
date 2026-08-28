@@ -139,22 +139,6 @@ final class EPUBSpreadReadiness {
         state.generation
     }
 
-    var isDocumentAvailable: Bool {
-        switch state {
-        case .initializing, .ready:
-            return true
-        case .unavailable, .loading, .failed:
-            return false
-        }
-    }
-
-    var readyFrameCapability: EPUBSpreadFrameCapability? {
-        guard case let .ready(_, frameCapability) = state else {
-            return nil
-        }
-        return frameCapability
-    }
-
     /// The frame-document capability currently owning the lifecycle, across
     /// BOTH phases a live document can be in: `.ready`, and `.initializing`
     /// when a same-document mutation (position/layout writer) retains the

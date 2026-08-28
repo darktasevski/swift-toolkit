@@ -293,7 +293,7 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         readiness.finishMutation(mutation, outcome: .failed)
 
         XCTAssertFalse(readiness.isCommandReady)
-        XCTAssertNil(readiness.readyFrameCapability)
+        XCTAssertNil(readiness.currentFrameCapability)
         XCTAssertEqual(
             readiness.state,
             .failed(generation: mutation.generation)
