@@ -96,15 +96,18 @@ final class EditingActionsController {
     private let actions: [EditingAction]
     private let rights: UserRights
     private let canShare: Bool
+    private let copySelection: @MainActor @Sendable (String) -> Void
     private var isEnabled = true
 
     init(
         actions: [EditingAction],
-        publication: Publication
+        publication: Publication,
+        copySelection: (@MainActor @Sendable (String) -> Void)? = nil
     ) {
         self.actions = actions
         rights = publication.rights
         canShare = !publication.isProtected
+        self.copySelection = copySelection ?? { UIPasteboard.general.string = $0 }
     }
 
     /// Current user selection contents and frame in the publication view.
@@ -271,6 +274,6 @@ final class EditingActionsController {
             return
         }
 
-        UIPasteboard.general.string = text
+        copySelection(text)
     }
 }
