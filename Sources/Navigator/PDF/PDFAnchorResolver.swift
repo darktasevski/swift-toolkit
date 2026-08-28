@@ -15,7 +15,6 @@ import ReadiumShared
 /// 2. Character range (precise) - create selection from stored offsets
 /// 3. Context-aware text search (fallback) - find text with surrounding context
 public struct PDFAnchorResolver: Loggable {
-
     /// Resolves anchor data from a locator to renderable bounds.
     ///
     /// - Parameters:
@@ -72,7 +71,8 @@ public struct PDFAnchorResolver: Loggable {
         } else if let jsonString = data.string,
                   let jsonData = jsonString.data(using: .utf8),
                   let parsed = try? JSONValue(jsonData: jsonData),
-                  let d = parsed.object {
+                  let d = parsed.object
+        {
             dict = d
         } else {
             return nil
@@ -173,7 +173,7 @@ public struct PDFAnchorResolver: Loggable {
         var ranges: [Range<String.Index>] = []
         var searchStart = pageText.startIndex
 
-        while let range = pageText.range(of: anchor.text, range: searchStart..<pageText.endIndex) {
+        while let range = pageText.range(of: anchor.text, range: searchStart ..< pageText.endIndex) {
             ranges.append(range)
             searchStart = range.upperBound
         }
@@ -201,7 +201,7 @@ public struct PDFAnchorResolver: Loggable {
         // Multiple occurrences: score by context match
         let bestRange = ranges.max { range1, range2 in
             contextScore(for: range1, textBefore: anchor.textBefore, textAfter: anchor.textAfter, in: pageText) <
-            contextScore(for: range2, textBefore: anchor.textBefore, textAfter: anchor.textAfter, in: pageText)
+                contextScore(for: range2, textBefore: anchor.textBefore, textAfter: anchor.textAfter, in: pageText)
         }
 
         guard let best = bestRange else { return nil }
@@ -231,10 +231,10 @@ public struct PDFAnchorResolver: Loggable {
                 offsetBy: -contextLength,
                 limitedBy: text.startIndex
             ) ?? text.startIndex
-            let actualBefore = String(text[contextStart..<range.lowerBound])
+            let actualBefore = String(text[contextStart ..< range.lowerBound])
 
             if actualBefore == before {
-                score += 20  // Exact match
+                score += 20 // Exact match
             } else if actualBefore.hasSuffix(before) {
                 score += 15
             } else if actualBefore.lowercased().hasSuffix(before.lowercased()) {
@@ -249,10 +249,10 @@ public struct PDFAnchorResolver: Loggable {
                 offsetBy: contextLength,
                 limitedBy: text.endIndex
             ) ?? text.endIndex
-            let actualAfter = String(text[range.upperBound..<contextEnd])
+            let actualAfter = String(text[range.upperBound ..< contextEnd])
 
             if actualAfter == after {
-                score += 20  // Exact match
+                score += 20 // Exact match
             } else if actualAfter.hasPrefix(after) {
                 score += 15
             } else if actualAfter.lowercased().hasPrefix(after.lowercased()) {
@@ -381,7 +381,7 @@ public struct PDFAnchorResolver: Loggable {
 
             if isWhitespace {
                 if !inWhitespace {
-                    normalizedPosition += 1  // Count whitespace run as single space
+                    normalizedPosition += 1 // Count whitespace run as single space
                     inWhitespace = true
                 }
             } else {
@@ -389,11 +389,11 @@ public struct PDFAnchorResolver: Loggable {
                 inWhitespace = false
             }
 
-            if originalStart == nil && normalizedPosition > targetStart {
+            if originalStart == nil, normalizedPosition > targetStart {
                 originalStart = i
             }
 
-            if originalStart != nil && normalizedPosition >= targetEnd {
+            if originalStart != nil, normalizedPosition >= targetEnd {
                 originalEnd = originalText.index(after: i)
                 break
             }
@@ -405,7 +405,7 @@ public struct PDFAnchorResolver: Loggable {
             return nil
         }
 
-        return start..<end
+        return start ..< end
     }
 
     // MARK: - Internal Types

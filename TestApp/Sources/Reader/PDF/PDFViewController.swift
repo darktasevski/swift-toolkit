@@ -29,7 +29,7 @@ final class PDFViewController: VisualReaderViewController<PDFNavigatorViewContro
             EditingAction(
                 title: "Highlight",
                 action: #selector(highlightSelection)
-            )
+            ),
         ] + EditingAction.defaultActions
 
         let navigator = try PDFNavigatorViewController(
