@@ -34,6 +34,43 @@ final class EPUBLocatorDecorationActivationTests: XCTestCase {
         }
     }
 
+    func test_identifierOutsideActivatedSetRejectsActivation() {
+        let expected = token()
+        var forged = body(token: expected)
+        forged["id"] = "highlight-2"
+
+        XCTAssertNil(validate(forged, expectedToken: expected))
+    }
+
+    func test_unexpectedBodyKeyRejectsActivation() {
+        let expected = token()
+        var forged = body(token: expected)
+        forged["extra"] = "payload"
+
+        XCTAssertNil(validate(forged, expectedToken: expected))
+    }
+
+    func test_outOfRangeRectRejectsActivation() {
+        let expected = token()
+        var forged = body(token: expected)
+        forged["rect"] = ["left": 10.0, "top": 20.0, "width": -1.0, "height": 40.0]
+
+        XCTAssertNil(validate(forged, expectedToken: expected))
+    }
+
+    func test_nonFiniteClickRejectsActivation() {
+        let expected = token()
+        var forged = body(token: expected)
+        forged["click"] = [
+            "defaultPrevented": false,
+            "x": Double.infinity,
+            "y": 35.0,
+            "targetElement": "mark",
+        ]
+
+        XCTAssertNil(validate(forged, expectedToken: expected))
+    }
+
     private func validate(
         _ body: [String: Any],
         expectedToken: EPUBLocatorCommandToken
