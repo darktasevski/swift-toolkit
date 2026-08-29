@@ -31,7 +31,18 @@ function installSelectionMirrorStyle() {
 
   const style = document.createElement("style");
   style.id = SELECTION_MIRROR_STYLE_ID;
+  // Suppressing the native paint is what makes the mirror a replacement rather
+  // than a second layer. Both draw the same range with the same colour, and
+  // --RS__selectionBackgroundColor is translucent on a themed reader, so
+  // leaving both on composes the two alphas and the run darkens the moment the
+  // mirror lands. The suppression lives in the style the mirror installs, and
+  // only after a range is registered, so a runtime without the Custom
+  // Highlight API keeps WebKit's own paint untouched.
   style.textContent = `
+    ::selection {
+      background-color: transparent !important;
+    }
+
     ::highlight(${SELECTION_MIRROR_NAME}) {
       color: var(--RS__selectionTextColor, inherit);
       background-color: var(--RS__selectionBackgroundColor, #b4d8fe);
@@ -76,7 +87,6 @@ function updateSelectionMirror(range) {
     return;
   }
 
-  ensureSelectionMirrorStyle();
   const clonedRange = range.cloneRange();
   const mirror = CSS.highlights.get(SELECTION_MIRROR_NAME);
   if (mirror) {
@@ -90,6 +100,52 @@ function updateSelectionMirror(range) {
       new window.Highlight(clonedRange)
     );
   }
+  // Only once a range is actually registered, because installing the style is
+  // what turns the native paint off.
+  ensureSelectionMirrorStyle();
+}
+
+function mirrorCurrentSelection() {
+  const selection = window.getSelection();
+  if (!selection || selection.isCollapsed || selection.rangeCount === 0) {
+    clearSelectionMirror();
+    return;
+  }
+
+  const range = selection.getRangeAt(0);
+  if (range.collapsed) {
+    clearSelectionMirror();
+    return;
+  }
+
+  updateSelectionMirror(range);
+}
+
+let selectionMirrorInstalled = false;
+
+/**
+ * Starts painting the selection. Called once, from the page-world entry point.
+ *
+ * Deliberately not a module side effect: this file is reachable from the
+ * isolated command bundle too (through `rect` → `utils`), and a second world
+ * registering a second highlight for the same range would stack a second
+ * translucent band — the very thing the mirror suppresses the native paint to
+ * avoid. Painting is a page-world concern, so the page world asks for it.
+ *
+ * The mirror tracks the selection on its own, undebounced, listener rather than
+ * riding the debounced bridge that reports a selection to the host. That bridge
+ * is a trailing debounce: during a drag `selectionchange` keeps firing and it
+ * never settles, so the paint would not appear until the finger stopped. It can
+ * afford to wait because it does the expensive part — text extraction and the
+ * message to the host. Repainting a highlight range costs no DOM work, so it
+ * runs on every event and the band stays under the finger.
+ */
+export function installSelectionMirror() {
+  if (selectionMirrorInstalled) {
+    return;
+  }
+  selectionMirrorInstalled = true;
+  document.addEventListener("selectionchange", mirrorCurrentSelection);
 }
 
 export function getCurrentSelection() {
@@ -139,7 +195,6 @@ function getSelectionRect() {
 function getCurrentSelectionText() {
   const selection = window.getSelection();
   if (!selection || selection.isCollapsed) {
-    clearSelectionMirror();
     return undefined;
   }
 
@@ -150,12 +205,10 @@ function getCurrentSelectionText() {
     .replace(/\s\s+/g, " ");
 
   if (cleanHighlight.length === 0) {
-    clearSelectionMirror();
     return undefined;
   }
 
   if (!selection.anchorNode || !selection.focusNode) {
-    clearSelectionMirror();
     return undefined;
   }
 
@@ -170,7 +223,6 @@ function getCurrentSelectionText() {
         );
 
   if (!range || range.collapsed) {
-    clearSelectionMirror();
     return undefined;
   }
 
@@ -181,11 +233,8 @@ function getCurrentSelectionText() {
     textRange = TextRange.fromRange(range).relativeTo(document.body);
   } catch (e) {
     logError(e);
-    clearSelectionMirror();
     return undefined;
   }
-
-  updateSelectionMirror(range);
 
   const start = textRange.start.offset;
   const end = textRange.end.offset;

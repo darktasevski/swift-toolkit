@@ -20,6 +20,9 @@ import {
   setCSSProperties,
 } from "./utils";
 import { getDecorations, registerTemplates } from "./decorator";
+import { installSelectionMirror } from "./selection";
+
+installSelectionMirror();
 
 // Public API used by the navigator.
 global.readium = {
