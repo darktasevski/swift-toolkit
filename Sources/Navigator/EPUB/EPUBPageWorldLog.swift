@@ -18,9 +18,8 @@ import ReadiumShared
 /// back a static closed reason code. The payload is *accepted* so that no call
 /// site has to remember to strip it, and *never read* so that no call site is
 /// able to render it — the same posture as the redacting log wrappers used for
-/// identity values. An error is reduced to its Swift type plus its bridged
-/// `NSError` domain and code, all three of which are compile-time constants of
-/// the error's own declaration rather than anything derived from the document.
+/// identity values. Errors are withheld too: NSError domains and custom error
+/// descriptions can contain document-derived strings.
 enum EPUBPageWorldLog: Loggable {
     /// Why a page-world payload was withheld.
     ///
@@ -43,6 +42,24 @@ enum EPUBPageWorldLog: Loggable {
         /// A scroll was requested to a progression outside `0...1`.
         case invalidScrollProgression = "invalid_scroll_progression"
 
+        case positionsLoadFailed = "positions_load_failed"
+        case internalLinkUnavailable = "internal_link_unavailable"
+        case noteFragmentUnavailable = "note_fragment_unavailable"
+        case noteResourceUnavailable = "note_resource_unavailable"
+        case noteElementUnavailable = "note_element_unavailable"
+        case noteReadFailed = "note_read_failed"
+        case resourceRangeReadFailed = "resource_range_read_failed"
+        case resourceReadFailed = "resource_read_failed"
+        case anchorTrackingReinjectionFailed = "anchor_tracking_reinjection_failed"
+        case fixedViewportFailed = "fixed_viewport_failed"
+        case fixedLayoutStabilityFailed = "fixed_layout_stability_failed"
+        case publicationCSSLoadFailed = "publication_c_s_s_load_failed"
+        case anchorTrackingInitializationFailed = "anchor_tracking_initialization_failed"
+        case reflowableLayoutStabilityFailed = "reflowable_layout_stability_failed"
+        case javaScriptEvaluationFailed = "java_script_evaluation_failed"
+        case webNavigationFailed = "web_navigation_failed"
+        case provisionalWebNavigationFailed = "provisional_web_navigation_failed"
+
         /// The severity this reason is reported at.
         ///
         /// Owned by the reason rather than passed per call, so the level is part
@@ -51,12 +68,12 @@ enum EPUBPageWorldLog: Loggable {
             switch self {
             case .javaScriptConsoleMessage, .malformedDOMRange:
                 return .debug
-            case .javaScriptUncaughtError:
+            case .javaScriptUncaughtError, .positionsLoadFailed, .resourceRangeReadFailed, .resourceReadFailed, .publicationCSSLoadFailed, .javaScriptEvaluationFailed, .webNavigationFailed, .provisionalWebNavigationFailed:
                 return .error
             case .malformedSelectionBody,
                  .malformedDecorationActivationBody,
                  .malformedImageActivationBody,
-                 .invalidScrollProgression:
+                 .invalidScrollProgression, .internalLinkUnavailable, .noteFragmentUnavailable, .noteResourceUnavailable, .noteElementUnavailable, .noteReadFailed, .anchorTrackingReinjectionFailed, .fixedViewportFailed, .fixedLayoutStabilityFailed, .anchorTrackingInitializationFailed, .reflowableLayoutStabilityFailed:
                 return .warning
             }
         }
@@ -76,11 +93,10 @@ enum EPUBPageWorldLog: Loggable {
         line: Int = #line
     ) {
         _ = payload
-        log(reason.level, message(reason), file: file, line: line)
+        log(reason.level, "Page world payload withheld reason=\(reason.rawValue)", file: file, line: line)
     }
 
-    /// Reports `reason`, withholding `payload` and reducing `error` to its type,
-    /// bridged domain and bridged code.
+    /// Accepts both values without rendering or forwarding either to the sink.
     static func report(
         _ reason: Reason,
         withholding payload: Any?,
@@ -88,18 +104,29 @@ enum EPUBPageWorldLog: Loggable {
         file: String = #file,
         line: Int = #line
     ) {
-        _ = payload
-        let ns = error as NSError
-        log(
-            reason.level,
-            "\(message(reason)) type=\(type(of: error)) [\(ns.domain)#\(ns.code)]",
-            file: file,
-            line: line
-        )
+        _ = error
+        report(reason, withholding: payload, file: file, line: line)
     }
 
-    /// The message logged for `reason`, without any error detail.
-    static func message(_ reason: Reason) -> String {
-        "\(messagePrefix) reason=\(reason.rawValue)"
+    enum NavigationState: String, CaseIterable {
+        case initializing, loading, idle, jumping, moving
+    }
+
+    enum NavigationEvent: String, CaseIterable {
+        case load, loaded, jump, jumped, move, moved
+    }
+
+    static func reportState(_ state: NavigationState, file: String = #file, line: Int = #line) {
+        log(.debug, "Navigation state=\(state.rawValue)", file: file, line: line)
+    }
+
+    static func reportEvent(_ event: NavigationEvent, file: String = #file, line: Int = #line) {
+        log(.debug, "Navigation event=\(event.rawValue)", file: file, line: line)
+    }
+
+    static func reportInvalidTransition(state: NavigationState, event: NavigationEvent,
+                                        file: String = #file, line: Int = #line)
+    {
+        log(.error, "Invalid navigation event=\(event.rawValue) state=\(state.rawValue)", file: file, line: line)
     }
 }

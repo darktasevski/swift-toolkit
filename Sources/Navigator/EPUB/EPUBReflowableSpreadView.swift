@@ -352,8 +352,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         } catch {
             // type+domain+code only — never bare \(error). WKErrorDomain.userInfo
             // can echo script source + arguments.
-            let ns = error as NSError
-            log(.warning, "anchor tracking init failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            EPUBPageWorldLog.report(.anchorTrackingInitializationFailed, withholding: error)
         }
 
         // Positioning is the final suspending initialization stage so a
@@ -471,8 +470,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         } catch is CancellationError {
             return false
         } catch {
-            let ns = error as NSError
-            log(.warning, "Layout stability failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            EPUBPageWorldLog.report(.reflowableLayoutStabilityFailed, withholding: error)
             return false
         }
     }
