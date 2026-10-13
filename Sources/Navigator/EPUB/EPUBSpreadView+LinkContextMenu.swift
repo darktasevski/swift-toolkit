@@ -37,30 +37,35 @@ extension EPUBSpreadView {
         ])
     }
 
-    /// Replaces WebKit's link context menu. Returning `nil` would not suppress it for an `http(s)`
-    /// link: WebKit's source falls back to DataDetectors' URL menu, whose preview loads the
-    /// destination and whose "Open Link" hands it to Safari without consulting the navigation
-    /// policy. A non-`nil` configuration with no `previewProvider` skips that fallback and loads
-    /// nothing; its one item takes the same path as a tap.
-    func webView(
-        _: WKWebView,
-        contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
-        completionHandler: @escaping @MainActor @Sendable (UIContextMenuConfiguration?) -> Void
-    ) {
+    /// What the hook hands WebKit for `linkURL`: `nil` for a link inside the publication or for no
+    /// link, otherwise a configuration with no preview whose one item takes the same path as a tap.
+    func linkContextMenuConfiguration(forLinkURL linkURL: URL?) -> UIContextMenuConfiguration? {
         guard let url = Self.outboundLinkURL(
-            for: elementInfo.linkURL,
+            for: linkURL,
             publicationBaseURL: viewModel.publicationBaseURL
         ) else {
-            completionHandler(nil)
-            return
+            return nil
         }
-        completionHandler(UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
+        return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             Self.outboundLinkMenu(title: Self.outboundLinkMenuTitle) {
                 guard let self else {
                     return
                 }
                 self.delegate?.spreadView(self, didTapOnExternalURL: url)
             }
-        })
+        }
+    }
+
+    /// Replaces WebKit's link context menu. Returning `nil` would not suppress it for an `http(s)`
+    /// link: WebKit's source falls back to DataDetectors' URL menu, whose preview loads the
+    /// destination and whose "Open Link" hands it to Safari without consulting the navigation
+    /// policy. A non-`nil` configuration with no `previewProvider` skips that fallback and loads
+    /// nothing.
+    func webView(
+        _: WKWebView,
+        contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,
+        completionHandler: @escaping @MainActor @Sendable (UIContextMenuConfiguration?) -> Void
+    ) {
+        completionHandler(linkContextMenuConfiguration(forLinkURL: elementInfo.linkURL))
     }
 }

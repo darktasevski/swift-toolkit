@@ -53,6 +53,35 @@ final class EPUBSpreadViewLinkContextMenuTests: XCTestCase {
     /// drifted off the protocol requirement (or that was deleted) would compile, never run, and
     /// leave WebKit's own menu in place.
     func testTheSpreadViewAnswersWebKitsContextMenuSelector() {
+        XCTAssertTrue(makeSpreadView().responds(
+            to: #selector(WKUIDelegate.webView(_:contextMenuConfigurationForElement:completionHandler:))
+        ))
+    }
+
+    /// A `nil` here would hand an `http(s)` link back to WebKit's own menu and its preview.
+    func testTheHookOffersAConfigurationForAnOutboundLink() throws {
+        let url = try XCTUnwrap(URL(string: "https://example.com/page"))
+        XCTAssertNotNil(makeSpreadView().linkContextMenuConfiguration(forLinkURL: url))
+    }
+
+    func testTheHookOffersNoConfigurationForAnInternalLink() throws {
+        let spreadView = makeSpreadView()
+        let base = try XCTUnwrap(spreadView.viewModel.publicationBaseURL)
+        XCTAssertNil(spreadView.linkContextMenuConfiguration(forLinkURL: base.url.appendingPathComponent("chapter.html")))
+    }
+
+    func testTheHookOffersNoConfigurationWithoutALink() {
+        XCTAssertNil(makeSpreadView().linkContextMenuConfiguration(forLinkURL: nil))
+    }
+
+    /// The default an app sees when it does not override the key in its main bundle.
+    func testTheMenuTitleDefaultsToTheNavigatorString() {
+        XCTAssertEqual(EPUBSpreadView.outboundLinkMenuTitle, "Open Link…")
+    }
+
+    /// A one-chapter reflowable spread, built the way `makeFixture(layout:scroll:)` in
+    /// `EPUBSpreadViewCommandOutcomeTests` builds one.
+    private func makeSpreadView() -> EPUBReflowableSpreadView {
         let link = Link(href: "chapter.html", mediaType: .html)
         let publication = Publication(
             manifest: Manifest(metadata: Metadata(title: "Menu"), readingOrder: [link]),
@@ -61,19 +90,11 @@ final class EPUBSpreadViewLinkContextMenuTests: XCTestCase {
                 at: RelativeURL(path: "chapter.html")!.anyURL
             )
         )
-        let spreadView = EPUBReflowableSpreadView(
+        return EPUBReflowableSpreadView(
             viewModel: EPUBNavigatorViewModel(publication: publication, readingOrder: [link], config: .init()),
             spread: .single(EPUBSingleSpread(resource: EPUBSpreadResource(index: 0, link: link))),
             scripts: [],
             animatedLoad: false
         )
-        XCTAssertTrue(spreadView.responds(
-            to: #selector(WKUIDelegate.webView(_:contextMenuConfigurationForElement:completionHandler:))
-        ))
-    }
-
-    /// The default an app sees when it does not override the key in its main bundle.
-    func testTheMenuTitleDefaultsToTheNavigatorString() {
-        XCTAssertEqual(EPUBSpreadView.outboundLinkMenuTitle, "Open Link…")
     }
 }
