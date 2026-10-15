@@ -51,6 +51,9 @@ extension PageView {
 
 @MainActor
 protocol PaginationViewDelegate: AnyObject {
+    /// Called before a recognized native drag changes the spine position.
+    func paginationViewWillBeginUserNavigation(_ paginationView: PaginationView)
+
     /// Creates the page view for the page at given index.
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)?
 

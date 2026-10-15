@@ -11,6 +11,34 @@ import XCTest
 
 @MainActor
 final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
+    func testNavigatorForwardsNativeInputBeforeReportsAndExcludesSelection() throws {
+        let fixture = makeFixture(layout: .reflowable)
+        let locator = Locator(href: RelativeURL(path: "chapter.html")!.anyURL, mediaType: .html)
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: locator)
+        let delegate = NavigationInputDelegate()
+        navigator.delegate = delegate
+        let spread = makeReflowableSpreadView()
+        spread.delegate = navigator
+        spread.scrollViewWillBeginDragging(spread.scrollView)
+        XCTAssertEqual(delegate.inputs, 1)
+        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), frame: .zero, domRange: nil)
+        XCTAssertNotNil(navigator.currentSelection)
+        spread.scrollViewWillBeginDragging(spread.scrollView)
+        XCTAssertEqual(delegate.inputs, 1, "Selection dragging must not admit navigation")
+    }
+
+    func testNativeDragAdmitsPaginatedAndContinuousNavigation() {
+        for scrolling in [false, true] {
+            let spread = makeReflowableSpreadView(scroll: scrolling)
+            let delegate = TestSpreadDelegate()
+            spread.delegate = delegate
+            spread.scrollViewWillBeginDragging(spread.scrollView)
+            XCTAssertEqual(delegate.navigationInputs, 1)
+            spread.scrollViewDidScroll(spread.scrollView)
+            XCTAssertEqual(delegate.navigationInputs, 1, "Geometry is not another input")
+        }
+    }
+
     func testFreshReflowablePaginationImmediatelyAwaitsItsPageCommand() async {
         let spreadView = makeReflowableSpreadView(
             scroll: true,
@@ -1341,6 +1369,11 @@ private final class SpreadPaginationDelegate: PaginationViewDelegate {
 
 @MainActor
 private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
+    var navigationInputs = 0
+    func spreadViewWillBeginUserNavigation(_ spreadView: EPUBSpreadView) {
+        navigationInputs += 1
+    }
+
     var contentInset: UIEdgeInsets = .zero
 
     func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets {
@@ -1358,4 +1391,14 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: KeyEvent) {}
     func spreadViewDidTerminate() {}
+}
+
+@MainActor
+private final class NavigationInputDelegate: EPUBNavigatorDelegate {
+    var inputs = 0
+    func navigatorWillBeginUserNavigation(_ navigator: EPUBNavigatorViewController) {
+        inputs += 1
+    }
+
+    func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
 }
