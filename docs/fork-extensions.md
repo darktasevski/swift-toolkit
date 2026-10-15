@@ -86,6 +86,31 @@ A long-press on a link that leaves the publication showed WebKit's link menu, wh
 | --- | --- |
 | `Tests/NavigatorTests/EPUB/EPUBSpreadViewLinkContextMenuTests.swift` | 11 tests: internal, outbound, `mailto:`, no-link and no-base classification; the one-item menu and its default title; the spread view answering WebKit's selector; and the hook's configuration for an outbound, an internal and no link. That the menu replaces WebKit's on a device, with no preview request, is measured in the host app. |
 
+## Outbound link clicks open no connection
+
+A click on a link in a reflowable EPUB starts a main-frame navigation, and WebKit connects to the target's host as that navigation begins, before `webView(_:decidePolicyFor:decisionHandler:)` can cancel it: the reader reached the host before a host app that confirms outbound links (Reader app #3016) had asked. Measured with a loopback listener: an accept at the tap, no bytes, the real request only on Open. A fixed-layout EPUB (its page is an iframe) and the PDF navigator did not connect. The page script now cancels, in the capture phase, the click of a link whose scheme or host differs from the document's and posts its URL; the navigation policy stays the path for anything the script does not see.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBSpreadView+ExternalLinkActivation.swift` | Handles the `externalLinkActivated` message: hands its `href` to `spreadView(_:didTapOnExternalURL:)`, or reports `malformedLinkActivationBody` to `EPUBPageWorldLog`. | Yes — upstream has the same connection. |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/gestures.js` | Adds `onLinkLeavingPublication`, a capture-phase click listener on `window`, and `hrefLeavingPublication`. A `javascript:` link and a link on the document's own scheme and host are left alone. The rebuilt `readium-reflowable.js` and `readium-fixed.js` bundles carry it. | Yes. |
+| `Sources/Navigator/EPUB/EPUBSpreadView.swift` | Registers the `externalLinkActivated` message (one line beside `imageActivated`). | Yes. |
+| `Sources/Navigator/EPUB/EPUBPageWorldLog.swift` | Adds the `malformedLinkActivationBody` reason, at `.warning`. | Yes. |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewExternalLinkActivationTests.swift` | 2 tests: a body's `href` becomes the URL; a body without one, or not a dictionary, yields none. That a click opens no connection, and that the confirmation still appears, is measured in the host app. |
+| `Tests/NavigatorTests/EPUB/EPUBPageWorldLogTests.swift` | The new reason joins the level table and the warning-floor count. |
+
 ## Upstream-rebase guidance
 
 When merging upstream `develop` into `fork-extensions`:
@@ -98,5 +123,6 @@ When merging upstream `develop` into `fork-extensions`:
 6. In `PDFParser.swift`, preserve the `NormalizingPDFContentIterator.Factory(wrapping:)` wrapper around the content-iterator factory; the two `Sources/Streamer/Parser/PDF/` files (`PDFTextNormalizer.swift`, `NormalizingPDFContentIterator.swift`) are fork-only — keep both. If upstream adopts a normalizing pass on `PDFResourceContentIterator` directly, the decorator + `PDFTextNormalizer` can be deleted and the host app's `DatabaseRebuilder+PDF` reuse re-pointed at upstream's symbol.
 
 7. `EPUBSpreadView.swift` keeps its empty `extension EPUBSpreadView: WKUIDelegate {}` and `webView.uiDelegate = self`; `EPUBSpreadView+LinkContextMenu.swift` relies on both. If upstream implements the context-menu delegate method itself, delete the fork's file rather than merging two implementations.
+8. Keep the `externalLinkActivated` registration in `EPUBSpreadView.swift` and the capture-phase listener in `gestures.js`, then rebuild the bundles. If upstream starts cancelling outbound clicks itself, keep one path: two would report the link twice.
 
 If upstream introduces a `VisibleAnchorObservingNavigator`-equivalent API, this fork's protocol can be deleted and the class conformance can switch to upstream's. The host app's `Coordinator` already speaks via `(@MainActor @Sendable (String, String) -> Void)?` closures so the wire shape is upstream-agnostic.
