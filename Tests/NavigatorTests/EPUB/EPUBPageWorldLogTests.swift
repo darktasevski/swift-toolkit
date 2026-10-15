@@ -249,6 +249,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
             .malformedSelectionBody: .warning,
             .malformedDecorationActivationBody: .warning,
             .malformedImageActivationBody: .warning,
+            .malformedLinkActivationBody: .warning,
             .invalidScrollProgression: .warning,
         ]
         // Driven off `allCases` so a new reason forces a decision here rather
@@ -280,7 +281,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
         }
 
         let captured = logger.captured
-        XCTAssertEqual(captured.count, 5, "expected the five non-debug reasons only")
+        XCTAssertEqual(captured.count, 6, "expected the six non-debug reasons only")
         XCTAssertFalse(captured.contains { $0.contains("reason=js_console_message") })
         XCTAssertFalse(captured.contains { $0.contains("reason=malformed_dom_range") })
         XCTAssertTrue(

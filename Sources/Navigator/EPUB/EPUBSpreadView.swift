@@ -943,6 +943,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         registerJSMessage(named: "selectionChanged") { [weak self] in self?.selectionDidChange($0) }
         registerJSMessage(named: "keyEventReceived") { [weak self] in self?.didReceiveKeyEvent($0) }
         registerJSMessage(named: "imageActivated") { [weak self] in self?.didActivateImage($0) }
+        registerJSMessage(named: "externalLinkActivated") { [weak self] in self?.didActivateExternalLink($0) }
     }
 
     /// Add the message handlers for incoming javascript events.
