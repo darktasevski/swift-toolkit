@@ -311,6 +311,145 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertFalse(inserted, "The isolated world inserted a virtual column into the page")
     }
 
+    // MARK: - Bridge progression read
+
+    /// The real hand-off registers the main frame, and the bridge's read runs
+    /// in it under the capability it was issued.
+    func test_bridgeReadMeasuresTheRegisteredMainFrame() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        let capability = EPUBSpreadFrameCapability()
+        try await page.register(capability)
+        try await page.scroll(x: 600, y: 0)
+
+        let outcome = try await page.readThroughBridge()
+
+        XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: (1.0 / 3) ... (2.0 / 3))))
+    }
+
+    func test_bridgeReadOfUnmeasurableGeometryIsUnavailable() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        let capability = EPUBSpreadFrameCapability()
+        try await page.register(capability)
+        let measurable = try await page.readThroughBridge()
+        XCTAssertEqual(
+            measurable,
+            .sample(EPUBProgressionSample(capability: capability, range: 0 ... (1.0 / 3))),
+            "Setup: the page did not measure before the stub"
+        )
+
+        try await page.runInCommandWorld(#"Object.defineProperty(globalThis, "innerWidth", { value: 0, configurable: true });"#)
+        let unmeasurable = try await page.readThroughBridge()
+
+        XCTAssertEqual(unmeasurable, .unavailable)
+    }
+
+    /// An answer is current only if the document and its capability are the
+    /// ones the read was started for.
+    func test_bridgeReadAnsweredAfterTheDocumentOrCapabilityChangedIsCancelled() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        let acrossDocuments = BridgeReadOutcomes()
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: acrossDocuments), .started)
+        page.bridge.beginDocument()
+        let documentChanged = try await acrossDocuments.single()
+        XCTAssertEqual(documentChanged, .cancelled, "A read answered for the previous document was accepted")
+
+        try await page.register(EPUBSpreadFrameCapability())
+        let acrossCapabilities = BridgeReadOutcomes()
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: acrossCapabilities), .started)
+        page.bridge.setFrameCapability(EPUBSpreadFrameCapability())
+        let capabilityChanged = try await acrossCapabilities.single()
+        XCTAssertEqual(capabilityChanged, .cancelled, "A read answered under a superseded capability was accepted")
+    }
+
+    /// The capability alone does not name the frame, so an answer counts only
+    /// while the frame it was read in is still the selected one. The page's
+    /// real echo registers the frame; the read is held until the frame changes.
+    func test_bridgeReadAnsweredAfterTheSelectedFrameChangedIsCancelled() async throws {
+        let held = HeldScripts()
+        let page = try await openProgressionPage(.leftToRightPages, invokeLocationScript: held.invocation)
+        let capability = EPUBSpreadFrameCapability()
+        page.bridge.setFrameCapability(capability)
+        held.complete(0, with: .success(NSNull()))
+        try await page.echo(capability)
+        let answer: [String: Any] = ["capability": capability.id.uuidString, "first": 0, "last": 0.5]
+
+        let unchanged = BridgeReadOutcomes()
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: unchanged), .started)
+        held.complete(1, with: .success(answer))
+        XCTAssertEqual(
+            unchanged.received,
+            [.sample(EPUBProgressionSample(capability: capability, range: 0 ... 0.5))],
+            "Setup: the held answer was not accepted while the frame stayed selected"
+        )
+
+        let reselected = BridgeReadOutcomes()
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: reselected), .started)
+        try await page.echo(capability)
+        held.complete(2, with: .success(answer))
+
+        XCTAssertEqual(reselected.received, [.cancelled])
+    }
+
+    /// The registration that ends a hand-off is the one reads and commands
+    /// would select, and it ends it before its deadline.
+    func test_aSelectableRegistrationEndsTheHandshake() async throws {
+        let deadlines = ManualDeadlines()
+        let page = try await openProgressionPage(.leftToRightPages, deadlineScheduler: deadlines.scheduler)
+        let capability = EPUBSpreadFrameCapability()
+        try await page.register(capability)
+
+        deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
+
+        XCTAssertEqual(page.transportEvents, [], "A registered hand-off still reported a failure at its deadline")
+    }
+
+    /// A frame that echoes the capability but cannot be selected, here a main
+    /// frame outside the publication's origin, is neither reported as the
+    /// registration nor allowed to end the hand-off.
+    func test_aRegistrationThatCannotBeSelectedIsNotReported() async throws {
+        let deadlines = ManualDeadlines()
+        let page = try await openProgressionPage(
+            .leftToRightPages,
+            deadlineScheduler: deadlines.scheduler,
+            publicationBaseURL: "https://elsewhere.test/"
+        )
+        let capability = EPUBSpreadFrameCapability()
+        page.bridge.setFrameCapability(capability)
+        try await page.waitUntilTheDocumentHolds(capability)
+        try await Task.sleep(for: .milliseconds(300))
+
+        XCTAssertEqual(page.registrations, [], "An unselectable frame was reported as registered")
+        deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
+        XCTAssertEqual(page.transportEvents, [.handshakeFailed(capability, .registrationMissing)])
+    }
+
+    func test_bridgeReadStartsNothingWithoutAFrameOrBesideAnotherCall() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: BridgeReadOutcomes()), .frameUnavailable)
+
+        try await page.register(EPUBSpreadFrameCapability())
+        let first = BridgeReadOutcomes()
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: first), .started)
+        XCTAssertEqual(try page.startBridgeRead(reportingTo: BridgeReadOutcomes()), .transportOccupied)
+        _ = try await first.single()
+    }
+
+    /// A retried hand-off echoes the same capability again from a new frame
+    /// handle. The main frame is replaced, not registered twice, so it stays
+    /// selectable.
+    func test_aRepeatedEchoOfTheCurrentCapabilityReplacesTheMainFrame() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        let capability = EPUBSpreadFrameCapability()
+        try await page.register(capability)
+
+        try await page.register(capability)
+        let outcome = try await page.readThroughBridge()
+
+        XCTAssertEqual(page.registrations, [capability, capability])
+        XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: 0 ... (1.0 / 3))))
+    }
+
     // MARK: - Page-world scroll hint
 
     /// Scroll events within one frame coalesce into a single hint carrying the
@@ -438,9 +577,17 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     private func openProgressionPage(
         _ document: ProgressionDocument,
-        carryingReflowableScript: Bool = false
+        carryingReflowableScript: Bool = false,
+        invokeLocationScript: EPUBLocatorCommandBridge.LocationScriptInvocation? = nil,
+        deadlineScheduler: EPUBDeadlineScheduler? = nil,
+        publicationBaseURL: String = "https://readium.test/"
     ) async throws -> ProgressionPage {
-        let page = try ProgressionPage(carryingReflowableScript: carryingReflowableScript)
+        let page = try ProgressionPage(
+            carryingReflowableScript: carryingReflowableScript,
+            invokeLocationScript: invokeLocationScript,
+            deadlineScheduler: deadlineScheduler,
+            publicationBaseURL: publicationBaseURL
+        )
         addTeardownBlock { @MainActor in
             page.window.isHidden = true
             page.window.rootViewController = nil
@@ -752,13 +899,33 @@ private final class ProgressionPage {
 
     let window: UIWindow
     let webView: WKWebView
+    /// Installed and attached as a reflowable spread installs it, so its
+    /// hand-off and reads run against this page. No capability is issued
+    /// through it unless a test registers one.
+    let bridge: EPUBLocatorCommandBridge
     private let loads = LoadObserver()
     private let pageMessages = PageMessageRecorder()
+    private(set) var registrations: [EPUBSpreadFrameCapability] = []
+    private(set) var transportEvents: [EPUBLocationTransportEvent] = []
 
-    init(carryingReflowableScript: Bool = false) throws {
-        let bridge = try EPUBLocatorCommandBridge(
+    /// - Parameters:
+    ///   - invokeLocationScript: replaces the bridge's location calls, for a
+    ///     test that must hold one open while the page changes under it.
+    ///   - deadlineScheduler: replaces the bridge's deadlines, for a test that
+    ///     must pass one without waiting it out.
+    ///   - publicationBaseURL: the bridge's publication origin; another origin
+    ///     makes the page's main frame register as cross-origin.
+    init(
+        carryingReflowableScript: Bool = false,
+        invokeLocationScript: EPUBLocatorCommandBridge.LocationScriptInvocation? = nil,
+        deadlineScheduler: EPUBDeadlineScheduler? = nil,
+        publicationBaseURL: String = "https://readium.test/"
+    ) throws {
+        bridge = try EPUBLocatorCommandBridge(
             layout: .reflowable,
-            publicationBaseURL: XCTUnwrap(HTTPURL(string: "https://readium.test/"))
+            publicationBaseURL: XCTUnwrap(HTTPURL(string: publicationBaseURL)),
+            deadlineScheduler: deadlineScheduler,
+            invokeLocationScript: invokeLocationScript
         )
         let configuration = WKWebViewConfiguration()
         // iPad's desktop-class default scales wide content down to fit, which
@@ -783,6 +950,95 @@ private final class ProgressionPage {
         host.view.addSubview(webView)
         window.rootViewController = host
         window.makeKeyAndVisible()
+        bridge.attach(to: webView)
+        bridge.onFrameRegistered = { [unowned self] capability in
+            registrations.append(capability)
+        }
+        bridge.onLocationTransportEvent = { [unowned self] event in
+            transportEvents.append(event)
+        }
+    }
+
+    /// Issues `capability` through the bridge's hand-off and waits for the
+    /// page's main frame to register under it.
+    func register(_ capability: EPUBSpreadFrameCapability) async throws {
+        let before = registrations.count
+        bridge.setFrameCapability(capability)
+        try await waitUntil("the main frame registers") {
+            self.registrations.count > before && self.registrations.last == capability
+        }
+    }
+
+    /// Starts a bridge read of this page's resource.
+    func startBridgeRead(
+        reportingTo outcomes: BridgeReadOutcomes
+    ) throws -> EPUBLocatorCommandBridge.ProgressionReadStart {
+        try bridge.readProgression(
+            targetHREF: XCTUnwrap(AnyURL(string: "chapter.xhtml")),
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: ContinuousClock().now,
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            ),
+            completion: { outcomes.received.append($0) }
+        )
+    }
+
+    /// Reads this page's resource through the bridge and waits for the one
+    /// outcome the started read owes.
+    func readThroughBridge() async throws -> EPUBProgressionReadOutcome {
+        let outcomes = BridgeReadOutcomes()
+        let start = try startBridgeRead(reportingTo: outcomes)
+        XCTAssertEqual(start, .started, "Setup: the bridge read did not start")
+        return try await outcomes.single()
+    }
+
+    /// Runs `script` in the locator command world of this page.
+    func runInCommandWorld(_ script: String, arguments: [String: Any] = [:]) async throws {
+        _ = try await webView.callAsyncJavaScript(
+            script,
+            arguments: arguments,
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+    }
+
+    /// Waits until the document answers a read under `capability`, which it
+    /// can do only once the hand-off has reached it.
+    func waitUntilTheDocumentHolds(_ capability: EPUBSpreadFrameCapability) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while try await read(capability.id.uuidString) == nil {
+            guard clock.now < deadline else {
+                XCTFail("Setup: the document never received the capability")
+                throw SetupTimeout()
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// Hands `capability` to the document directly, as an injection would, and
+    /// waits for the registration its echo produces.
+    func echo(_ capability: EPUBSpreadFrameCapability) async throws {
+        let before = registrations.count
+        try await runInCommandWorld(
+            "readerLocatorCommands.acceptFrameCapability(capability);",
+            arguments: ["capability": capability.id.uuidString]
+        )
+        try await waitUntil("the echo registers") {
+            self.registrations.count > before
+        }
+    }
+
+    private func waitUntil(_ description: String, _ condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while !condition() {
+            guard clock.now < deadline else {
+                XCTFail("Setup: timed out waiting until \(description)")
+                throw SetupTimeout()
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
     }
 
     /// Loads `document` at the same URL every time, so a second load is a
@@ -1080,6 +1336,29 @@ private final class ProgressionPage {
             in: nil,
             contentWorld: .defaultClient
         ) as? Bool == true
+    }
+}
+
+/// The outcomes a bridge read delivered, in order.
+@MainActor
+private final class BridgeReadOutcomes {
+    var received: [EPUBProgressionReadOutcome] = []
+
+    /// Waits for the started read's outcome, then confirms no second one
+    /// follows it.
+    func single() async throws -> EPUBProgressionReadOutcome {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(30))
+        while received.isEmpty {
+            guard clock.now < deadline else {
+                XCTFail("The started bridge read never delivered an outcome")
+                throw SetupTimeout()
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        try await clock.sleep(for: .milliseconds(100))
+        XCTAssertEqual(received.count, 1, "The bridge read delivered more than one outcome: \(received)")
+        return received[0]
     }
 }
 

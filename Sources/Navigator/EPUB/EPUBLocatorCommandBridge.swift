@@ -49,13 +49,27 @@ struct EPUBLocatorFrameRegistry: Sendable {
         self.layout = layout
     }
 
+    /// Registers a frame and returns the IDs it replaced. A reflowable main frame
+    /// replaces every main-frame entry holding the same capability: a handshake
+    /// retry echoes that capability again from a new frame handle, which must not
+    /// leave two eligible entries. Fixed-layout duplicates still fail closed.
+    @discardableResult
     mutating func register(
         id: String,
         href: String,
         capability: EPUBSpreadFrameCapability,
         isMainFrame: Bool,
         isSameOrigin: Bool
-    ) {
+    ) -> [String] {
+        var replaced: [String] = []
+        if layout == .reflowable, isMainFrame {
+            replaced = entriesByID.values
+                .filter { $0.id != id && $0.isMainFrame && $0.capability == capability }
+                .map(\.id)
+            for replacedID in replaced {
+                entriesByID[replacedID] = nil
+            }
+        }
         entriesByID[id] = Entry(
             id: id,
             href: href,
@@ -63,6 +77,7 @@ struct EPUBLocatorFrameRegistry: Sendable {
             isMainFrame: isMainFrame,
             isSameOrigin: isSameOrigin
         )
+        return replaced
     }
 
     mutating func removeAll() {
@@ -308,6 +323,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private static let commandScript = "return await readerLocatorCommands.execute(command, token);"
     private static let invalidateScript = "return readerLocatorCommands.invalidate(token);"
     private static let acceptFrameCapabilityScript = "readerLocatorCommands.acceptFrameCapability(capability);"
+    private static let readProgressionScript = "return readerLocatorCommands.readProgression(expectedCapability);"
     private static let visibleTextScript = """
     const range = document.caretRangeFromPoint(globalThis.innerWidth / 2, globalThis.innerHeight / 2);
     if (!range) return '';
@@ -352,15 +368,85 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private var isMessageHandlerEnabled = false
     var onDecorationActivated: ((Any) -> Void)?
 
+    /// Performs one location-reporting script call in `frame` (the main frame
+    /// when `nil`) of the locator command world.
+    typealias LocationScriptInvocation = @MainActor (
+        _ webView: WKWebView,
+        _ script: String,
+        _ arguments: [String: Any],
+        _ frame: WKFrameInfo?,
+        _ completion: @escaping @MainActor @Sendable (Result<Any, any Error>) -> Void
+    ) -> Void
+
+    /// The production invocation: the completion-handler `callAsyncJavaScript`,
+    /// whose completion WebKit calls exactly once, even for a call that outlives
+    /// every deadline.
+    static let callAsyncJavaScript: LocationScriptInvocation = { webView, script, arguments, frame, completion in
+        webView.callAsyncJavaScript(
+            script,
+            arguments: arguments,
+            in: frame,
+            in: contentWorld,
+            completionHandler: completion
+        )
+    }
+
+    /// One reflowable capability hand-off: the injection and the wait for the
+    /// frame's registration, bounded together by one deadline.
+    private struct HandshakeAttempt {
+        enum Phase: Equatable {
+            case awaitingTransport
+            case injecting
+            case awaitingRegistration
+        }
+
+        let capability: EPUBSpreadFrameCapability
+        let deadline: EPUBLocatorOperationDeadline
+        let timer: EPUBScheduledDeadline
+        var phase: Phase
+    }
+
+    private let deadlineScheduler: EPUBDeadlineScheduler
+    private let invokeLocationScript: LocationScriptInvocation
+    /// The one physical reflowable capability injection or progression read
+    /// this web view may have outstanding.
+    private let locationTransport: EPUBLocationTransport
+    private var handshake: HandshakeAttempt?
+
+    /// Called after a frame registers under the current capability.
+    var onFrameRegistered: (@MainActor (EPUBSpreadFrameCapability) -> Void)?
+    /// Called with the location transport's closed, content-free outcomes.
+    var onLocationTransportEvent: (@MainActor (EPUBLocationTransportEvent) -> Void)?
+
+    /// - Parameters:
+    ///   - deadlineScheduler: arms the location transport's deadlines; derived
+    ///     from `clock` unless a test supplies its own.
+    ///   - invokeLocationScript: reaches WebKit for location reporting; replaced
+    ///     by a test to hold a call open and complete it on demand.
+    @MainActor
     init(
         layout: EPUBLocatorFrameLayout,
         publicationBaseURL: AbsoluteURL,
-        clock: EPUBMonotonicClock = .continuous
+        clock: EPUBMonotonicClock = .continuous,
+        deadlineScheduler: EPUBDeadlineScheduler? = nil,
+        invokeLocationScript: LocationScriptInvocation? = nil
     ) {
         self.publicationBaseURL = publicationBaseURL
         self.clock = clock
         registry = EPUBLocatorFrameRegistry(layout: layout)
+        let scheduler = deadlineScheduler ?? .clock(clock)
+        self.deadlineScheduler = scheduler
+        self.invokeLocationScript = invokeLocationScript ?? Self.callAsyncJavaScript
+        locationTransport = EPUBLocationTransport(scheduler: scheduler)
         super.init()
+        // A pending hand-off takes the freed slot before any read: it carries
+        // the authority every later read needs.
+        locationTransport.onSlotFreed = { [weak self] in
+            self?.startPendingHandshake()
+        }
+        locationTransport.onLateCompletion = { [weak self] in
+            self?.onLocationTransportEvent?(.lateCompletion)
+        }
     }
 
     func install(in configuration: WKWebViewConfiguration) {
@@ -417,6 +503,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         isMessageHandlerEnabled = false
     }
 
+    /// Starts a new document. An outstanding location call keeps the transport
+    /// until WebKit completes it; a read's answer then reports `.cancelled`.
+    @MainActor
     func beginDocument() {
         documentEpoch += 1
         currentFrameCapability = nil
@@ -425,8 +514,10 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         latestSequences.removeAll(keepingCapacity: true)
         decorationActivationStates.removeAll(keepingCapacity: true)
         inFlightNavigation = nil
+        endHandshake(reporting: nil)
     }
 
+    @MainActor
     func invalidateDocument() {
         beginDocument()
     }
@@ -442,10 +533,13 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// The JavaScript side self-revokes its own copy on `pagehide` (see
     /// `reader-locator-commands.js`), covering a child self-navigation or reload
     /// the native spread load never observes.
+    @MainActor
     func revokeFrameCapability() {
         currentFrameCapability = nil
         framesByID.removeAll(keepingCapacity: true)
         registry.removeAll()
+        endHandshake(reporting: nil)
+        locationTransport.close()
     }
 
     /// Publishes the capability the current spread generation minted and injects
@@ -457,9 +551,20 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// its child resource frame (see `forwardCapabilityToChildFrames` in
     /// `reader-locator-commands.js`), which is where registration happens for that
     /// layout. Either way only the current document tree can echo it back.
+    ///
+    /// A reflowable hand-off shares the location transport: it waits for an
+    /// outstanding call rather than adding a second one, injects the latest
+    /// capability once the slot frees, and reports an attempt that ends without
+    /// a registration through `onLocationTransportEvent`. Registration, not the
+    /// injection's completion, is what authorizes the frame.
+    @MainActor
     func setFrameCapability(_ capability: EPUBSpreadFrameCapability) {
         currentFrameCapability = capability
         guard let webView else {
+            return
+        }
+        guard registry.layout == .fixed else {
+            beginHandshake(for: capability)
             return
         }
         // Bounded even though nothing awaits it: a wedged page would otherwise retain
@@ -480,6 +585,200 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                     contentWorld: Self.contentWorld
                 )
             }
+        }
+    }
+
+    /// Why a progression read did not start. When it does start, its
+    /// completion receives exactly one outcome unless the spread is cleared
+    /// first.
+    enum ProgressionReadStart: Equatable {
+        case started
+        /// Another location call is still outstanding.
+        case transportOccupied
+        /// No frame is registered and selectable under the current capability.
+        case frameUnavailable
+        case deadlinePassed
+    }
+
+    /// Reads the viewport of the reflowable main frame registered under the
+    /// current capability, in that frame and the locator command world.
+    ///
+    /// The capability alone does not identify the resource frame (a direct
+    /// same-origin child holds it too), so the read runs in the frame the
+    /// registry selected, and its answer counts only if the capability and that
+    /// selection are both unchanged when it arrives.
+    @MainActor
+    func readProgression(
+        targetHREF: AnyURL,
+        deadline: EPUBLocatorOperationDeadline,
+        completion: @escaping @MainActor (EPUBProgressionReadOutcome) -> Void
+    ) -> ProgressionReadStart {
+        guard !locationTransport.isOccupied else {
+            return .transportOccupied
+        }
+        guard
+            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
+            let targetKey = frameKey(for: targetURL),
+            let capability = currentFrameCapability,
+            case let .selected(frameID) = registry.select(href: targetKey, capability: capability),
+            let storedFrame = framesByID[frameID],
+            let webView
+        else {
+            return .frameUnavailable
+        }
+        let invoke = invokeLocationScript
+        let started = locationTransport.start(
+            until: deadline,
+            invocation: { done in
+                invoke(
+                    webView,
+                    Self.readProgressionScript,
+                    ["expectedCapability": capability.id.uuidString],
+                    storedFrame.info,
+                    done
+                )
+            },
+            deliver: { [weak self] delivery in
+                guard let self else {
+                    return
+                }
+                completion(progressionReadOutcome(
+                    delivery,
+                    targetKey: targetKey,
+                    frameID: frameID,
+                    capability: capability
+                ))
+            }
+        )
+        return started ? .started : .deadlinePassed
+    }
+
+    /// Currency outranks the answer: a read that completes after its capability
+    /// or selected frame changed is `.cancelled`, whatever it says. A new
+    /// document clears the registry, so the selection check covers it too.
+    @MainActor
+    private func progressionReadOutcome(
+        _ delivery: EPUBLocationTransport.Delivery,
+        targetKey: String,
+        frameID: String,
+        capability: EPUBSpreadFrameCapability
+    ) -> EPUBProgressionReadOutcome {
+        guard case let .completed(result) = delivery else {
+            return .expired
+        }
+        guard
+            currentFrameCapability == capability,
+            registry.select(href: targetKey, capability: capability) == .selected(frameID)
+        else {
+            return .cancelled
+        }
+        switch result {
+        case .failure:
+            return .failed
+        case let .success(value):
+            return .decoding(value, expecting: capability)
+        }
+    }
+
+    /// Replaces any earlier attempt: only the latest capability is worth
+    /// injecting, and it waits for the transport if a call is outstanding.
+    @MainActor
+    private func beginHandshake(for capability: EPUBSpreadFrameCapability) {
+        endHandshake(reporting: nil)
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: deadlineScheduler.now(),
+            budget: .milliseconds(Self.totalCommandDeadlineMilliseconds)
+        )
+        let timer = deadlineScheduler.schedule(deadline.expiresAt) { [weak self] in
+            self?.handshakeDeadlineDidPass(for: capability)
+        }
+        handshake = HandshakeAttempt(
+            capability: capability,
+            deadline: deadline,
+            timer: timer,
+            phase: .awaitingTransport
+        )
+        startPendingHandshake()
+    }
+
+    @MainActor
+    private func startPendingHandshake() {
+        guard
+            let attempt = handshake,
+            attempt.phase == .awaitingTransport,
+            let webView
+        else {
+            return
+        }
+        let capability = attempt.capability
+        let invoke = invokeLocationScript
+        let started = locationTransport.start(
+            until: attempt.deadline,
+            invocation: { done in
+                invoke(
+                    webView,
+                    Self.acceptFrameCapabilityScript,
+                    ["capability": capability.id.uuidString],
+                    nil,
+                    done
+                )
+            },
+            deliver: { [weak self] delivery in
+                self?.handshakeInjectionDidFinish(delivery, for: capability)
+            }
+        )
+        if started {
+            handshake?.phase = .injecting
+        }
+    }
+
+    /// The attempt's own deadline reports an injection that never answered, so
+    /// the transport's `.expired` is not a second verdict here.
+    @MainActor
+    private func handshakeInjectionDidFinish(
+        _ delivery: EPUBLocationTransport.Delivery,
+        for capability: EPUBSpreadFrameCapability
+    ) {
+        guard
+            case let .completed(result) = delivery,
+            let attempt = handshake,
+            attempt.capability == capability,
+            attempt.phase == .injecting
+        else {
+            return
+        }
+        switch result {
+        case .success:
+            handshake?.phase = .awaitingRegistration
+        case .failure:
+            endHandshake(reporting: .injectionFailed)
+        }
+    }
+
+    @MainActor
+    private func handshakeDeadlineDidPass(for capability: EPUBSpreadFrameCapability) {
+        guard let attempt = handshake, attempt.capability == capability else {
+            return
+        }
+        switch attempt.phase {
+        case .awaitingTransport:
+            endHandshake(reporting: .transportOccupied)
+        case .injecting:
+            endHandshake(reporting: .injectionUnresponsive)
+        case .awaitingRegistration:
+            endHandshake(reporting: .registrationMissing)
+        }
+    }
+
+    @MainActor
+    private func endHandshake(reporting failure: EPUBHandshakeFailure?) {
+        guard let attempt = handshake else {
+            return
+        }
+        attempt.timer.cancel()
+        handshake = nil
+        if let failure {
+            onLocationTransportEvent?(.handshakeFailed(attempt.capability, failure))
         }
     }
 
@@ -1256,16 +1555,31 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
             return
         }
 
-        framesByID[registration.id] = StoredFrame(
-            info: message.frameInfo,
-            capability: registration.capability
-        )
-        registry.register(
+        let replaced = registry.register(
             id: registration.id,
             href: registration.key,
             capability: registration.capability,
             isMainFrame: message.frameInfo.isMainFrame,
             isSameOrigin: registration.isSameOrigin
         )
+        for replacedID in replaced {
+            framesByID[replacedID] = nil
+        }
+        framesByID[registration.id] = StoredFrame(
+            info: message.frameInfo,
+            capability: registration.capability
+        )
+        // A child frame holding the forwarded capability registers too; only
+        // the frame commands and reads would select has completed the hand-off.
+        guard
+            registry.select(href: registration.key, capability: registration.capability)
+            == .selected(registration.id)
+        else {
+            return
+        }
+        if handshake?.capability == registration.capability {
+            endHandshake(reporting: nil)
+        }
+        onFrameRegistered?(registration.capability)
     }
 }
