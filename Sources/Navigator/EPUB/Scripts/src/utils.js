@@ -9,6 +9,7 @@
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getCurrentSelection } from "./selection";
 import { measureProgression } from "./progression";
+import { log } from "./native-log";
 
 window.addEventListener(
   "error",
@@ -575,10 +576,7 @@ function debounce(delay, func) {
   };
 }
 
-export function log() {
-  var message = Array.prototype.slice.call(arguments).join(" ");
-  webkit.messageHandlers.log.postMessage(message);
-}
+export { log };
 
 export function logErrorMessage(msg) {
   logError(new Error(msg));

@@ -244,6 +244,22 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertNil(stale, "The predecessor's capability still answers after the successor was issued")
     }
 
+    /// The locator command script must not carry the page world's listeners
+    /// into its own world. A two-column spread with an odd page count is the
+    /// page script's cue to insert a virtual column, so a page left untouched
+    /// shows the isolated world never ran that resize handling.
+    func test_isolatedScriptLeavesThePageLayoutAlone() async throws {
+        let page = try await openProgressionPage(.oddTwoColumnSpread)
+        let layout = try await page.columnLayout()
+        XCTAssertEqual(layout?.columnCount, "2", "Setup: the spread is not laid out in two columns")
+        XCTAssertEqual(layout?.screens, 1.5, "Setup: the spread does not have an odd page count")
+
+        try await Task.sleep(for: Self.isolationWatchWindow)
+
+        let inserted = try await page.hasVirtualColumn()
+        XCTAssertFalse(inserted, "The isolated world inserted a virtual column into the page")
+    }
+
     /// The read returns exactly the capability it answered under and the
     /// measured range; anything more or less is a malformed sample.
     private func assertSample(
@@ -273,6 +289,10 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// How long an absent report is watched for. Several times the production
     /// debounce, so a late report of an invented move would land inside it.
     private static let quietWindow: TimeInterval = 2
+
+    /// Page-world resize handling runs within a frame or two of load; the
+    /// window is many times that.
+    private static let isolationWatchWindow: Duration = .seconds(1)
 
     private static let longChapterHREF = RelativeURL(path: "long.html")!
     private static let nextChapterHREF = RelativeURL(path: "next.html")!
@@ -486,12 +506,14 @@ private struct SetupTimeout: Error {}
 
 /// Documents whose geometry is fixed by construction, so every expected
 /// progression is a constant rather than something read back from the page.
-/// Each fills a 600×800 viewport three or four times over along one axis.
+/// The first four fill a 600×800 viewport three or four times over along one
+/// axis; the odd spread lays out three 300 px columns, one and a half screens.
 private enum ProgressionDocument {
     case leftToRightPages
     case rightToLeftPages
     case verticalScroll
     case verticalWritingScroll
+    case oddTwoColumnSpread
 
     var html: String {
         switch self {
@@ -506,6 +528,12 @@ private enum ProgressionDocument {
                 rootAttributes: #"style="writing-mode: vertical-rl; --USER__view: readium-scroll-on""#,
                 width: 1800,
                 height: 800
+            )
+        case .oddTwoColumnSpread:
+            Self.page(
+                rootAttributes: #"style="height: 800px; column-count: 2; column-gap: 0; column-fill: auto""#,
+                width: 600,
+                height: 2400
             )
         }
     }
@@ -685,6 +713,31 @@ private final class ProgressionPage {
         ) as? [String: Any]
         let sample = value?["sample"]
         return (value?["observed"] as? String, sample is NSNull ? nil : sample)
+    }
+
+    func columnLayout() async throws -> (columnCount: String, screens: Double)? {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            const root = document.scrollingElement;
+            return [getComputedStyle(document.documentElement).columnCount, root.scrollWidth / innerWidth];
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        ) as? [Any]
+        guard let columnCount = value?.first as? String, let screens = value?.last as? NSNumber else {
+            return nil
+        }
+        return (columnCount, screens.doubleValue)
+    }
+
+    func hasVirtualColumn() async throws -> Bool {
+        try await webView.callAsyncJavaScript(
+            #"return document.getElementById("readium-virtual-page") !== null;"#,
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        ) as? Bool == true
     }
 
     /// Fires the `pagehide` the document receives when it stops being current.

@@ -4,7 +4,7 @@
 //  available in the top-level LICENSE file of the project.
 //
 
-import { log as logNative } from "./utils";
+import { log as logNative } from "./native-log";
 
 const debug = false;
 
