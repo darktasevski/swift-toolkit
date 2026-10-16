@@ -9,7 +9,7 @@
 import XCTest
 
 /// Captures everything the framework logs so a test can assert on it.
-private final class CapturingLogger: LoggerType {
+final class CapturingLogger: LoggerType {
     private let lock = NSLock()
     private var lines: [String] = []
     private var levels: [SeverityLevel] = []
@@ -339,11 +339,13 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
         "name",
     ]
 
-    private static let spreadSourceNames = [
-        "EPUBSpreadView.swift",
-        "EPUBReflowableSpreadView.swift",
-        "EPUBFixedSpreadView.swift",
-    ]
+    /// Every spread view source in the directory — the base class, both subclasses and each
+    /// `EPUBSpreadView+*.swift` extension — so a new extension file is scanned without an edit here.
+    private static func spreadSourceNames() throws -> [String] {
+        try FileManager.default.contentsOfDirectory(atPath: spreadSourceDirectory.path)
+            .filter { $0.hasSuffix(".swift") && $0.contains("SpreadView") }
+            .sorted()
+    }
 
     /// `Sources/Navigator/EPUB`, derived from this file's location so the test
     /// needs no bundled resource.
@@ -383,7 +385,7 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
     // MARK: - The inventory
 
     func testNoLogCallInTheSpreadSourcesInterpolatesAnythingUnreviewed() throws {
-        for name in Self.spreadSourceNames {
+        for name in try Self.spreadSourceNames() {
             let source = try source(named: name)
             for line in logEmittingLines(in: source) {
                 for interpolation in Self.interpolations(in: line) {
@@ -403,7 +405,7 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
 
     /// A log call split across lines would hide its message from the scan above.
     func testEveryLogCallInTheSpreadSourcesIsWrittenOnOneLine() throws {
-        for name in Self.spreadSourceNames {
+        for name in try Self.spreadSourceNames() {
             let source = try source(named: name)
             for line in logEmittingLines(in: source) {
                 XCTAssertEqual(
@@ -431,6 +433,20 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
 
     // MARK: - Harness controls
 
+    /// The derived list can only grow past these; one that lost a file would scan it no more.
+    func testTheScanCoversTheSpreadClassesAndTheirExtensions() throws {
+        let names = Set(try Self.spreadSourceNames())
+        for name in [
+            "EPUBSpreadView.swift",
+            "EPUBReflowableSpreadView.swift",
+            "EPUBFixedSpreadView.swift",
+            "EPUBSpreadView+ExternalLinkActivation.swift",
+            "EPUBSpreadView+LinkContextMenu.swift",
+        ] {
+            XCTAssertTrue(names.contains(name), "the scan does not cover \(name)")
+        }
+    }
+
     /// Without this, a scan that found no log lines at all — wrong directory,
     /// renamed file — would report success.
     func testTheScanFindsLogCallsAndAKnownInterpolation() throws {
@@ -447,7 +463,7 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
         var interpolations: Set<String> = []
         var logLineCount = 0
 
-        for name in Self.spreadSourceNames {
+        for name in try Self.spreadSourceNames() {
             let lines = try logEmittingLines(in: source(named: name))
             logLineCount += lines.count
             for line in lines {

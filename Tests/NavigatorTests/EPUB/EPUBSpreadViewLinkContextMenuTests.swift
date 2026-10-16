@@ -79,22 +79,7 @@ final class EPUBSpreadViewLinkContextMenuTests: XCTestCase {
         XCTAssertEqual(EPUBSpreadView.outboundLinkMenuTitle, "Open Link…")
     }
 
-    /// A one-chapter reflowable spread, built the way `makeFixture(layout:scroll:)` in
-    /// `EPUBSpreadViewCommandOutcomeTests` builds one.
     private func makeSpreadView() -> EPUBReflowableSpreadView {
-        let link = Link(href: "chapter.html", mediaType: .html)
-        let publication = Publication(
-            manifest: Manifest(metadata: Metadata(title: "Menu"), readingOrder: [link]),
-            container: SingleResourceContainer(
-                resource: DataResource(string: "<!doctype html><html><body>Chapter</body></html>"),
-                at: RelativeURL(path: "chapter.html")!.anyURL
-            )
-        )
-        return EPUBReflowableSpreadView(
-            viewModel: EPUBNavigatorViewModel(publication: publication, readingOrder: [link], config: .init()),
-            spread: .single(EPUBSingleSpread(resource: EPUBSpreadResource(index: 0, link: link))),
-            scripts: [],
-            animatedLoad: false
-        )
+        EPUBSpreadViewHosting.makeReflowableSpreadView(chapter: "<!doctype html><html><body>Chapter</body></html>")
     }
 }
