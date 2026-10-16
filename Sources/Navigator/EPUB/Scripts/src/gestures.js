@@ -12,7 +12,6 @@ import { getCssSelector } from "css-selector-generator";
 let isSelecting = false;
 
 window.addEventListener("DOMContentLoaded", function () {
-  window.addEventListener("click", onLinkLeavingPublication, true);
   document.addEventListener("click", onClick, false);
   document.addEventListener("pointerdown", onPointerDown, false);
   document.addEventListener("pointerup", onPointerUp, false);
@@ -23,53 +22,6 @@ window.addEventListener("DOMContentLoaded", function () {
     isSelecting = !window.getSelection().isCollapsed;
   });
 });
-
-/**
- * A link that leaves the publication must not start a navigation: WebKit connects to the target's
- * host as a main-frame navigation begins, before the navigation delegate can cancel it, so the
- * reader would reach the host before the app has asked. The click is cancelled and the URL handed
- * to the navigator instead. Registered in the capture phase, so the publication's own click
- * handlers cannot keep it from seeing the link.
- */
-function onLinkLeavingPublication(event) {
-  const href = hrefLeavingPublication(event.target);
-  if (href == null) {
-    return;
-  }
-  event.preventDefault();
-  webkit.messageHandlers.externalLinkActivated.postMessage({ href: href });
-}
-
-/**
- * The absolute URL of the link `target` is in, when it points away from the server the document
- * came from. A `javascript:` link runs script rather than leaving, so it is not one.
- */
-function hrefLeavingPublication(target) {
-  const link = target instanceof Element ? target.closest("a, area") : null;
-  if (link == null) {
-    return null;
-  }
-  const raw =
-    link.getAttribute("href") ??
-    link.getAttributeNS("http://www.w3.org/1999/xlink", "href");
-  if (raw == null) {
-    return null;
-  }
-  let url;
-  try {
-    url = new URL(raw, document.baseURI);
-  } catch {
-    return null;
-  }
-  const page = new URL(document.baseURI);
-  if (
-    url.protocol === "javascript:" ||
-    (url.protocol === page.protocol && url.host === page.host)
-  ) {
-    return null;
-  }
-  return url.href;
-}
 
 function onClick(event) {
   if (!getSelection().isCollapsed) {

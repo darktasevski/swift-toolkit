@@ -10,9 +10,10 @@ import WebKit
 
 extension EPUBSpreadView {
     /// The link a long-press menu is offered for: one that leaves the publication. A URL the
-    /// publication base relativizes is internal and gets no menu — the test the navigation policy
-    /// applies to a tap. With no base yet, the link is treated as leaving, which routes it to the
-    /// app rather than to WebKit.
+    /// publication base relativizes is internal and gets no menu — the navigation policy's test.
+    /// A tap is classified first in the page, by `external-link-activation.js`, against the
+    /// document's own scheme and host; the policy sees only what that script lets through. With no
+    /// base yet, the link is treated as leaving, which routes it to the app rather than to WebKit.
     static func outboundLinkURL(for linkURL: URL?, publicationBaseURL: AbsoluteURL?) -> URL? {
         guard let linkURL else {
             return nil
