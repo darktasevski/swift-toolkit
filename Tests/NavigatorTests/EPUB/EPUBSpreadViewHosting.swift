@@ -14,29 +14,37 @@ import XCTest
 enum EPUBSpreadViewHosting {
     struct Timeout: Error {}
 
-    /// A reflowable spread over a one-chapter publication whose `chapter.html` is `html`.
+    /// The resource both factories serve the chapter at.
+    static let chapterHREF = "chapter.html"
+
+    /// A reflowable spread over a one-chapter publication whose `chapter.html` is `html`, framed as
+    /// the suites that wait for a load off a window frame theirs: a web view with no size may not load.
     static func makeReflowableSpreadView(chapter html: String) -> EPUBReflowableSpreadView {
         let (viewModel, spread) = makeFixture(layout: .reflowable, chapter: html)
-        return EPUBReflowableSpreadView(viewModel: viewModel, spread: spread, scripts: [], animatedLoad: false)
+        let spreadView = EPUBReflowableSpreadView(viewModel: viewModel, spread: spread, scripts: [], animatedLoad: false)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        return spreadView
     }
 
     /// A fixed-layout spread over a one-chapter publication whose `chapter.html` is `html`, which
-    /// the wrapper page loads in an iframe.
+    /// the wrapper page loads in an iframe. Framed like `makeReflowableSpreadView(chapter:)`.
     static func makeFixedSpreadView(chapter html: String) -> EPUBFixedSpreadView {
         let (viewModel, spread) = makeFixture(layout: .fixed, chapter: html)
-        return EPUBFixedSpreadView(viewModel: viewModel, spread: spread, scripts: [], animatedLoad: false)
+        let spreadView = EPUBFixedSpreadView(viewModel: viewModel, spread: spread, scripts: [], animatedLoad: false)
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        return spreadView
     }
 
     private static func makeFixture(
         layout: ReadiumShared.Layout,
         chapter html: String
     ) -> (EPUBNavigatorViewModel, EPUBSpread) {
-        let link = Link(href: "chapter.html", mediaType: .html)
+        let link = Link(href: chapterHREF, mediaType: .html)
         let publication = Publication(
             manifest: Manifest(metadata: Metadata(title: "Hosted spread", layout: layout), readingOrder: [link]),
             container: SingleResourceContainer(
                 resource: DataResource(string: html),
-                at: RelativeURL(path: "chapter.html")!.anyURL
+                at: RelativeURL(path: chapterHREF)!.anyURL
             )
         )
         let viewModel = EPUBNavigatorViewModel(publication: publication, readingOrder: [link], config: .init())
@@ -126,13 +134,17 @@ enum EPUBSpreadViewHosting {
     /// Liveness backstop, not a performance bound — see `waitUntil`. Setup, so
     /// an expiry is an environmental skip for the reasons `waitForDocumentLoad`
     /// documents.
-    static func waitForFixedResourceLoad(in spreadView: EPUBFixedSpreadView) async throws {
+    /// - Parameter resourceHREF: the resource the iframe is expected to hold.
+    static func waitForFixedResourceLoad(
+        in spreadView: EPUBFixedSpreadView,
+        resourceHREF: String = chapterHREF
+    ) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(30))
         while clock.now < deadline {
             let loaded = try await spreadView.webView.callAsyncJavaScript(
-                "const frame = document.querySelector('iframe'); return frame?.contentDocument?.URL.includes('chapter.html') === true && frame.contentDocument.readyState === 'complete';",
-                arguments: [:],
+                "const frame = document.querySelector('iframe'); return frame?.contentDocument?.URL.includes(resourceHREF) === true && frame.contentDocument.readyState === 'complete';",
+                arguments: ["resourceHREF": resourceHREF],
                 in: nil,
                 contentWorld: .page
             ) as? Bool
@@ -182,6 +194,8 @@ enum EPUBSpreadViewHosting {
     static func waitUntil(
         timeout: Duration = .seconds(30),
         reportingFailure: Bool = true,
+        file: StaticString = #filePath,
+        line: UInt = #line,
         _ predicate: @MainActor () -> Bool
     ) async throws {
         let clock = ContinuousClock()
@@ -193,7 +207,7 @@ enum EPUBSpreadViewHosting {
             try await clock.sleep(for: .milliseconds(20))
         }
         if reportingFailure {
-            XCTFail("Condition did not become true before timeout")
+            XCTFail("Condition did not become true before timeout", file: file, line: line)
         }
         throw Timeout()
     }

@@ -8,33 +8,6 @@
 @testable import ReadiumShared
 import XCTest
 
-/// Captures everything the framework logs so a test can assert on it.
-final class CapturingLogger: LoggerType {
-    private let lock = NSLock()
-    private var lines: [String] = []
-    private var levels: [SeverityLevel] = []
-
-    func log(level: SeverityLevel, value: Any?, file: String, line: Int) {
-        let rendered = "\(level.rawValue) \(file):\(line): \(String(describing: value))"
-        lock.lock()
-        lines.append(rendered)
-        levels.append(level)
-        lock.unlock()
-    }
-
-    var captured: [String] {
-        lock.lock()
-        defer { lock.unlock() }
-        return lines
-    }
-
-    var capturedLevels: [SeverityLevel] {
-        lock.lock()
-        defer { lock.unlock() }
-        return levels
-    }
-}
-
 /// Proves that the page-world log choke point emits a real log line while none
 /// of the payload it was handed survives into it.
 ///
