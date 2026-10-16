@@ -398,10 +398,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let page = try await openProgressionPage(.leftToRightPages, deadlineScheduler: deadlines.scheduler)
         let capability = EPUBSpreadFrameCapability()
         try await page.register(capability)
+        try await page.waitUntilTheSlotIsAvailable()
 
         deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
 
-        XCTAssertEqual(page.transportEvents, [], "A registered hand-off still reported a failure at its deadline")
+        XCTAssertEqual(page.transportEvents, [.slotAvailable], "A registered hand-off still reported a failure at its deadline")
     }
 
     /// A frame that echoes the capability but cannot be selected, here a main
@@ -417,11 +418,12 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let capability = EPUBSpreadFrameCapability()
         page.bridge.setFrameCapability(capability)
         try await page.waitUntilTheDocumentHolds(capability)
+        try await page.waitUntilTheSlotIsAvailable()
         try await Task.sleep(for: .milliseconds(300))
 
         XCTAssertEqual(page.registrations, [], "An unselectable frame was reported as registered")
         deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
-        XCTAssertEqual(page.transportEvents, [.handshakeFailed(capability, .registrationMissing)])
+        XCTAssertEqual(page.transportEvents, [.slotAvailable, .handshakeFailed(capability, .registrationMissing)])
     }
 
     /// A read WebKit failed is `.failed`. One unanswered by its deadline is
@@ -440,7 +442,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         held.scripts.complete(2, with: .success(NSNull()))
 
         XCTAssertEqual(expired.received, [.expired], "The expired read received its late answer")
-        XCTAssertEqual(held.page.transportEvents, [.lateCompletion])
+        XCTAssertEqual(
+            held.page.transportEvents,
+            [.slotAvailable, .slotAvailable, .lateCompletion, .slotAvailable],
+            "Expected the hand-off's, the failed read's and the expired read's freed slots"
+        )
     }
 
     /// Currency outranks the answer: a read answered after its document or
@@ -479,7 +485,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         held.scripts.complete(1, with: .success(NSNull()))
 
         XCTAssertEqual(outcomes.received, [])
-        XCTAssertEqual(held.page.transportEvents, [])
+        XCTAssertEqual(held.page.transportEvents, [.slotAvailable, .slotAvailable], "Expected only freed slots")
     }
 
     func test_bridgeReadPastItsDeadlineReachesNoScript() async throws {
@@ -1099,6 +1105,13 @@ private final class ProgressionPage {
                 throw SetupTimeout()
             }
             try await clock.sleep(for: .milliseconds(20))
+        }
+    }
+
+    /// Waits until the bridge reports a freed location slot.
+    func waitUntilTheSlotIsAvailable() async throws {
+        try await waitUntil("the location slot is reported available") {
+            self.transportEvents.contains(.slotAvailable)
         }
     }
 

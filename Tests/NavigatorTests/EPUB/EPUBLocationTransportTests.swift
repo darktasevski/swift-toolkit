@@ -36,7 +36,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.calls.complete(0, with: .success("answer"))
         fixture.deadlines.advance(by: .seconds(10))
 
-        XCTAssertEqual(fixture.log, ["slotFreed", "completed"])
+        XCTAssertEqual(fixture.log, ["slotFreed", "completed", "slotAvailable"])
         XCTAssertFalse(fixture.transport.isOccupied)
         XCTAssertEqual(fixture.deadlines.armedCount, 0, "The completed call's deadline is still armed")
         XCTAssertTrue(fixture.start(), "The freed slot refused the next call")
@@ -59,7 +59,7 @@ final class EPUBLocationTransportTests: XCTestCase {
 
         fixture.calls.complete(0, with: .success("late answer"))
 
-        XCTAssertEqual(fixture.log, ["expired", "slotFreed", "lateCompletion"])
+        XCTAssertEqual(fixture.log, ["expired", "slotFreed", "lateCompletion", "slotAvailable"])
         XCTAssertFalse(fixture.transport.isOccupied)
         XCTAssertTrue(fixture.start())
     }
@@ -75,7 +75,7 @@ final class EPUBLocationTransportTests: XCTestCase {
 
         fixture.calls.complete(0, with: .success("answer"))
 
-        XCTAssertEqual(fixture.log, ["slotFreed"], "A closed call reported to its caller")
+        XCTAssertEqual(fixture.log, ["slotFreed", "slotAvailable"], "A closed call reported to its caller")
         XCTAssertTrue(fixture.start())
     }
 
@@ -84,7 +84,7 @@ final class EPUBLocationTransportTests: XCTestCase {
 
         XCTAssertTrue(fixture.start(invocation: { $0(.success("answer")) }))
 
-        XCTAssertEqual(fixture.log, ["slotFreed", "completed"])
+        XCTAssertEqual(fixture.log, ["slotFreed", "completed", "slotAvailable"])
         XCTAssertFalse(fixture.transport.isOccupied)
         XCTAssertEqual(fixture.deadlines.armedCount, 0, "The answered call's deadline is still armed")
     }
@@ -97,7 +97,28 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.transport.close()
         fixture.calls.complete(0, with: .success("late answer"))
 
-        XCTAssertEqual(fixture.log, ["expired", "slotFreed"], "A closed call reported its late completion")
+        XCTAssertEqual(fixture.log, ["expired", "slotFreed", "slotAvailable"], "A closed call reported its late completion")
+    }
+
+    /// A slot refilled before the completion finishes reporting is not
+    /// available, whether the owner's queued work or the caller took it.
+    func test_aCompletionWhoseSlotIsRetakenReportsNoSlotAvailable() {
+        let queued = TransportFixture()
+        queued.start()
+        queued.transport.onSlotFreed = { [unowned queued] in
+            queued.log.append("slotFreed")
+            queued.start()
+        }
+        queued.calls.complete(0, with: .success("answer"))
+        XCTAssertEqual(queued.log, ["slotFreed", "completed"], "The owner's queued call took the slot")
+
+        let caller = TransportFixture()
+        caller.start(deliver: { [unowned caller] _ in
+            caller.log.append("completed")
+            caller.start()
+        })
+        caller.calls.complete(0, with: .success("answer"))
+        XCTAssertEqual(caller.log, ["slotFreed", "completed"], "The caller's next call took the slot")
     }
 
     func test_aSpentDeadlineStartsNothing() {
@@ -168,7 +189,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.scripts.complete(0, with: .failure(URLError(.cancelled)))
         fixture.deadlines.advance(by: fixture.budget)
 
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed)])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed), .slotAvailable])
     }
 
     /// A completed injection proves nothing on its own: the frame must still
@@ -179,10 +200,10 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.bridge.setFrameCapability(capability)
 
         fixture.scripts.complete(0, with: .success(NSNull()))
-        XCTAssertEqual(fixture.events, [], "A completed injection was reported before its deadline")
+        XCTAssertEqual(fixture.events, [.slotAvailable], "A completed injection reported more than the freed slot")
         fixture.deadlines.advance(by: fixture.budget)
 
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .registrationMissing)])
+        XCTAssertEqual(fixture.events, [.slotAvailable, .handshakeFailed(capability, .registrationMissing)])
     }
 
     func test_aHandshakeThatNeverGetsTheTransportReportsIt() throws {
@@ -239,11 +260,11 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.bridge.setFrameCapability(capability)
 
         XCTAssertEqual(fixture.scripts.count, 1, "The attempt injected again into the slot its own answer freed")
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed)])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed), .slotAvailable])
     }
 
     /// Clearing the spread drops a hand-off without a verdict, and its
-    /// injection's late answer reports nothing either.
+    /// injection's late answer reports only the slot it frees.
     func test_revokingTheCapabilityDropsAHandshakeWithoutAVerdict() throws {
         let fixture = try BridgeFixture()
         fixture.bridge.setFrameCapability(EPUBSpreadFrameCapability())
@@ -252,7 +273,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.deadlines.advance(by: fixture.budget)
         fixture.scripts.complete(0, with: .success(NSNull()))
 
-        XCTAssertEqual(fixture.events, [])
+        XCTAssertEqual(fixture.events, [.slotAvailable])
     }
 
     func test_aNewDocumentDropsAHandshakeWithoutAVerdict() throws {
@@ -504,23 +525,25 @@ private final class TransportFixture {
     let calls = HeldCalls()
     let transport: EPUBLocationTransport
     let budget: Duration = .seconds(5)
-    private(set) var log: [String] = []
+    var log: [String] = []
 
     init() {
         transport = EPUBLocationTransport(scheduler: deadlines.scheduler)
         transport.onSlotFreed = { [unowned self] in log.append("slotFreed") }
         transport.onLateCompletion = { [unowned self] in log.append("lateCompletion") }
+        transport.onSlotAvailable = { [unowned self] in log.append("slotAvailable") }
     }
 
     @discardableResult
     func start(
         until deadline: EPUBLocatorOperationDeadline? = nil,
-        invocation: EPUBLocationTransport.Invocation? = nil
+        invocation: EPUBLocationTransport.Invocation? = nil,
+        deliver: (@MainActor (EPUBLocationTransport.Delivery) -> Void)? = nil
     ) -> Bool {
         transport.start(
             until: deadline ?? EPUBLocatorOperationDeadline(startingAt: deadlines.now, budget: budget),
             invocation: invocation ?? calls.invocation,
-            deliver: { [unowned self] delivery in
+            deliver: deliver ?? { [unowned self] delivery in
                 switch delivery {
                 case .completed:
                     log.append("completed")

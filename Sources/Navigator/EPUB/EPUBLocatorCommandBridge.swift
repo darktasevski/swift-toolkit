@@ -452,6 +452,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         locationTransport.onLateCompletion = { [weak self] in
             self?.onLocationTransportEvent?(.lateCompletion)
         }
+        locationTransport.onSlotAvailable = { [weak self] in
+            self?.onLocationTransportEvent?(.slotAvailable)
+        }
     }
 
     func install(in configuration: WKWebViewConfiguration) {

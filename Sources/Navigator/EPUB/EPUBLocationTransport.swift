@@ -23,9 +23,12 @@ enum EPUBHandshakeFailure: Equatable, Sendable {
 enum EPUBLocationTransportEvent: Equatable, Sendable {
     /// The hand-off of `capability` ended without a registered frame.
     case handshakeFailed(EPUBSpreadFrameCapability, EPUBHandshakeFailure)
-    /// A call whose deadline had passed finally completed; its value was
-    /// discarded and the slot is free.
+    /// A call whose deadline had passed finally completed and its value was
+    /// discarded. The slot it freed may already hold a pending hand-off.
     case lateCompletion
+    /// An actual completion left the slot free: a wake-up for work waiting on
+    /// it, reported after everything else that completion reports.
+    case slotAvailable
 }
 
 /// A cancellable one-shot deadline armed by `EPUBDeadlineScheduler`.
@@ -99,9 +102,13 @@ final class EPUBLocationTransport {
     private var lastOperationID = 0
 
     /// Called when a call whose deadline had passed finally completes. Its value
-    /// has been discarded and the slot is free again. A deadline alone never
-    /// reports here: only an actual completion does.
+    /// has been discarded; `onSlotFreed` may already have refilled the slot. A
+    /// deadline alone never reports here: only an actual completion does.
     var onLateCompletion: (@MainActor () -> Void)?
+
+    /// Called last for an actual completion, and only if the slot is still
+    /// free after `onSlotFreed`, the caller and `onLateCompletion` ran.
+    var onSlotAvailable: (@MainActor () -> Void)?
 
     /// Called whenever an actual completion frees the slot, before the caller
     /// or `onLateCompletion` is told, so queued work the owner ranks first can
@@ -182,6 +189,9 @@ final class EPUBLocationTransport {
             deliver(.completed(result))
         } else if current.reportsLateCompletion {
             onLateCompletion?()
+        }
+        if operation == nil {
+            onSlotAvailable?()
         }
     }
 }
