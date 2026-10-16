@@ -424,6 +424,75 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(page.transportEvents, [.handshakeFailed(capability, .registrationMissing)])
     }
 
+    /// A read WebKit failed is `.failed`. One unanswered by its deadline is
+    /// `.expired`, and its late answer is discarded.
+    func test_bridgeReadReportsAFailedCallAndAnExpiredOne() async throws {
+        let held = try await openHeldRegisteredPage()
+        let failed = BridgeReadOutcomes()
+        XCTAssertEqual(try held.startRead(reportingTo: failed), .started)
+        held.scripts.complete(1, with: .failure(URLError(.cancelled)))
+        XCTAssertEqual(failed.received, [.failed])
+
+        let expired = BridgeReadOutcomes()
+        XCTAssertEqual(try held.startRead(reportingTo: expired), .started)
+        held.deadlines.advance(by: HeldProgressionPage.budget)
+        XCTAssertEqual(expired.received, [.expired])
+        held.scripts.complete(2, with: .success(NSNull()))
+
+        XCTAssertEqual(expired.received, [.expired], "The expired read received its late answer")
+        XCTAssertEqual(held.page.transportEvents, [.lateCompletion])
+    }
+
+    /// Currency outranks the answer: a read answered after its document or
+    /// capability changed is `.cancelled` even when WebKit failed it or the
+    /// page answered malformed.
+    func test_bridgeReadAnsweredStaleIsCancelledWhateverItsAnswer() async throws {
+        let held = try await openHeldRegisteredPage()
+        let failedAcrossDocuments = BridgeReadOutcomes()
+        XCTAssertEqual(try held.startRead(reportingTo: failedAcrossDocuments), .started)
+        held.page.bridge.beginDocument()
+        held.scripts.complete(1, with: .failure(URLError(.cancelled)))
+        XCTAssertEqual(failedAcrossDocuments.received, [.cancelled], "A failed read of the previous document counted")
+
+        try await held.register(EPUBSpreadFrameCapability())
+        let malformedAcrossCapabilities = BridgeReadOutcomes()
+        XCTAssertEqual(try held.startRead(reportingTo: malformedAcrossCapabilities), .started)
+        held.page.bridge.setFrameCapability(EPUBSpreadFrameCapability())
+        held.scripts.complete(3, with: .success(["first": "malformed"]))
+
+        XCTAssertEqual(
+            malformedAcrossCapabilities.received,
+            [.cancelled],
+            "A malformed answer under a superseded capability counted"
+        )
+    }
+
+    /// Clearing the spread silences a read in flight: neither its deadline nor
+    /// its late answer reaches the caller or the owner.
+    func test_revokingTheCapabilitySilencesAReadInFlight() async throws {
+        let held = try await openHeldRegisteredPage()
+        let outcomes = BridgeReadOutcomes()
+        XCTAssertEqual(try held.startRead(reportingTo: outcomes), .started)
+
+        held.page.bridge.revokeFrameCapability()
+        held.deadlines.advance(by: HeldProgressionPage.budget)
+        held.scripts.complete(1, with: .success(NSNull()))
+
+        XCTAssertEqual(outcomes.received, [])
+        XCTAssertEqual(held.page.transportEvents, [])
+    }
+
+    func test_bridgeReadPastItsDeadlineReachesNoScript() async throws {
+        let held = try await openHeldRegisteredPage()
+        let outcomes = BridgeReadOutcomes()
+        let spent = EPUBLocatorOperationDeadline(startingAt: held.deadlines.now, budget: .zero)
+
+        XCTAssertEqual(try held.startRead(until: spent, reportingTo: outcomes), .deadlinePassed)
+
+        XCTAssertEqual(held.scripts.count, 1, "A read past its deadline reached WebKit")
+        XCTAssertEqual(outcomes.received, [])
+    }
+
     func test_bridgeReadStartsNothingWithoutAFrameOrBesideAnotherCall() async throws {
         let page = try await openProgressionPage(.leftToRightPages)
         XCTAssertEqual(try page.startBridgeRead(reportingTo: BridgeReadOutcomes()), .frameUnavailable)
@@ -597,6 +666,21 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             try await page.waitForLoadHintsToSettle()
         }
         return page
+    }
+
+    /// A page whose location calls and deadlines the test controls, registered
+    /// through its real echo. Its hand-off was location call 0.
+    private func openHeldRegisteredPage() async throws -> HeldProgressionPage {
+        let scripts = HeldScripts()
+        let deadlines = ManualDeadlines()
+        let page = try await openProgressionPage(
+            .leftToRightPages,
+            invokeLocationScript: scripts.invocation,
+            deadlineScheduler: deadlines.scheduler
+        )
+        let held = HeldProgressionPage(page: page, scripts: scripts, deadlines: deadlines)
+        try await held.register(EPUBSpreadFrameCapability())
+        return held
     }
 
     private func makePublication() -> Publication {
@@ -969,13 +1053,15 @@ private final class ProgressionPage {
         }
     }
 
-    /// Starts a bridge read of this page's resource.
+    /// Starts a bridge read of this page's resource, by default with the full
+    /// budget from now.
     func startBridgeRead(
+        until deadline: EPUBLocatorOperationDeadline? = nil,
         reportingTo outcomes: BridgeReadOutcomes
     ) throws -> EPUBLocatorCommandBridge.ProgressionReadStart {
         try bridge.readProgression(
             targetHREF: XCTUnwrap(AnyURL(string: "chapter.xhtml")),
-            deadline: EPUBLocatorOperationDeadline(
+            deadline: deadline ?? EPUBLocatorOperationDeadline(
                 startingAt: ContinuousClock().now,
                 budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
             ),
@@ -1336,6 +1422,37 @@ private final class ProgressionPage {
             in: nil,
             contentWorld: .defaultClient
         ) as? Bool == true
+    }
+}
+
+/// A progression page whose bridge reaches no real location call: each one is
+/// held until the test answers it, and its deadlines pass only when the test
+/// advances them.
+@MainActor
+private struct HeldProgressionPage {
+    static let budget: Duration = .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+
+    let page: ProgressionPage
+    let scripts: HeldScripts
+    let deadlines: ManualDeadlines
+
+    /// Hands `capability` off with the slot free, answers the held injection,
+    /// and waits for the page's real echo to register it.
+    func register(_ capability: EPUBSpreadFrameCapability) async throws {
+        page.bridge.setFrameCapability(capability)
+        scripts.complete(scripts.count - 1, with: .success(NSNull()))
+        try await page.echo(capability)
+    }
+
+    /// Starts a bridge read, by default with the full budget from the held now.
+    func startRead(
+        until deadline: EPUBLocatorOperationDeadline? = nil,
+        reportingTo outcomes: BridgeReadOutcomes
+    ) throws -> EPUBLocatorCommandBridge.ProgressionReadStart {
+        try page.startBridgeRead(
+            until: deadline ?? EPUBLocatorOperationDeadline(startingAt: deadlines.now, budget: Self.budget),
+            reportingTo: outcomes
+        )
     }
 }
 

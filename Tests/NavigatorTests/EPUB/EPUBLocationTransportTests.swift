@@ -6,6 +6,7 @@
 
 @testable import ReadiumNavigator
 import ReadiumShared
+import Synchronization
 import WebKit
 import XCTest
 
@@ -76,6 +77,27 @@ final class EPUBLocationTransportTests: XCTestCase {
 
         XCTAssertEqual(fixture.log, ["slotFreed"], "A closed call reported to its caller")
         XCTAssertTrue(fixture.start())
+    }
+
+    func test_aCallAnsweredDuringItsInvocationIsDeliveredAndFreesTheSlot() {
+        let fixture = TransportFixture()
+
+        XCTAssertTrue(fixture.start(invocation: { $0(.success("answer")) }))
+
+        XCTAssertEqual(fixture.log, ["slotFreed", "completed"])
+        XCTAssertFalse(fixture.transport.isOccupied)
+        XCTAssertEqual(fixture.deadlines.armedCount, 0, "The answered call's deadline is still armed")
+    }
+
+    func test_closingAnExpiredCallSilencesItsLateCompletion() {
+        let fixture = TransportFixture()
+        fixture.start()
+        fixture.deadlines.advance(by: fixture.budget)
+
+        fixture.transport.close()
+        fixture.calls.complete(0, with: .success("late answer"))
+
+        XCTAssertEqual(fixture.log, ["expired", "slotFreed"], "A closed call reported its late completion")
     }
 
     func test_aSpentDeadlineStartsNothing() {
@@ -176,6 +198,73 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(fixture.scripts.count, 1)
     }
 
+    /// Re-issuing the capability starts a new attempt, and the superseded
+    /// injection's answer is not that attempt's verdict.
+    func test_aReissuedCapabilityIgnoresTheSupersededInjectionsAnswer() throws {
+        let fixture = try BridgeFixture()
+        let capability = EPUBSpreadFrameCapability()
+        fixture.bridge.setFrameCapability(capability)
+        fixture.bridge.setFrameCapability(capability)
+
+        fixture.scripts.complete(0, with: .failure(URLError(.cancelled)))
+
+        XCTAssertEqual(fixture.scripts.injectedCapabilities, [capability, capability])
+        XCTAssertEqual(fixture.events, [], "The superseded injection's failure ended the new attempt")
+        fixture.deadlines.advance(by: fixture.budget)
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionUnresponsive)])
+    }
+
+    func test_aNewCapabilityIgnoresTheSupersededInjectionsAnswer() throws {
+        let fixture = try BridgeFixture()
+        let first = EPUBSpreadFrameCapability()
+        let second = EPUBSpreadFrameCapability()
+        fixture.bridge.setFrameCapability(first)
+        fixture.bridge.setFrameCapability(second)
+
+        fixture.scripts.complete(0, with: .failure(URLError(.cancelled)))
+
+        XCTAssertEqual(fixture.scripts.injectedCapabilities, [first, second])
+        XCTAssertEqual(fixture.events, [], "The superseded injection's failure ended the new attempt")
+        fixture.deadlines.advance(by: fixture.budget)
+        XCTAssertEqual(fixture.events, [.handshakeFailed(second, .injectionUnresponsive)])
+    }
+
+    /// An injection answered before its invocation returns frees the slot
+    /// while the attempt is already injecting, so it is not injected again.
+    func test_anInjectionAnsweredDuringItsInvocationIsInjectedOnce() throws {
+        let fixture = try BridgeFixture()
+        let capability = EPUBSpreadFrameCapability()
+        fixture.scripts.answerNextCallSynchronously(with: .failure(URLError(.cancelled)))
+
+        fixture.bridge.setFrameCapability(capability)
+
+        XCTAssertEqual(fixture.scripts.count, 1, "The attempt injected again into the slot its own answer freed")
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed)])
+    }
+
+    /// Clearing the spread drops a hand-off without a verdict, and its
+    /// injection's late answer reports nothing either.
+    func test_revokingTheCapabilityDropsAHandshakeWithoutAVerdict() throws {
+        let fixture = try BridgeFixture()
+        fixture.bridge.setFrameCapability(EPUBSpreadFrameCapability())
+
+        fixture.bridge.revokeFrameCapability()
+        fixture.deadlines.advance(by: fixture.budget)
+        fixture.scripts.complete(0, with: .success(NSNull()))
+
+        XCTAssertEqual(fixture.events, [])
+    }
+
+    func test_aNewDocumentDropsAHandshakeWithoutAVerdict() throws {
+        let fixture = try BridgeFixture()
+        fixture.bridge.setFrameCapability(EPUBSpreadFrameCapability())
+
+        fixture.bridge.beginDocument()
+        fixture.deadlines.advance(by: fixture.budget)
+
+        XCTAssertEqual(fixture.events, [])
+    }
+
     func test_anOutstandingInjectionDoesNotKeepTheBridgeAlive() throws {
         var fixture: BridgeFixture? = try BridgeFixture()
         fixture?.bridge.setFrameCapability(EPUBSpreadFrameCapability())
@@ -242,6 +331,56 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(EPUBProgressionReadOutcome.decoding(NSNull(), expecting: capability), .unavailable)
         XCTAssertEqual(EPUBProgressionReadOutcome.decoding(undefined, expecting: capability), .invalid)
     }
+
+    // MARK: - Clock-driven deadlines
+
+    /// Long enough for a deadline the scheduler wrongly lets through to fire.
+    private static let silenceWindow: Duration = .milliseconds(200)
+
+    func test_aClockDeadlineFiresWhenItsSleepEnds() async throws {
+        let gate = GatedClock()
+        let instant = ContinuousClock().now.advanced(by: .seconds(5))
+        var fired = false
+        _ = EPUBDeadlineScheduler.clock(gate.clock).schedule(instant) { fired = true }
+        try await gate.waitForSleep()
+        XCTAssertEqual(gate.requestedInstants, [instant])
+
+        gate.open(.success(()))
+
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while !fired, ContinuousClock.now < deadline {
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        XCTAssertTrue(fired, "The deadline never fired after its sleep ended")
+    }
+
+    /// A sleep that ends after the deadline was cancelled, as one racing the
+    /// cancellation can, fires nothing.
+    func test_aCancelledClockDeadlineStaysSilentWhenItsSleepEnds() async throws {
+        let gate = GatedClock()
+        var fired = false
+        let scheduled = EPUBDeadlineScheduler.clock(gate.clock).schedule(ContinuousClock().now) { fired = true }
+        try await gate.waitForSleep()
+
+        scheduled.cancel()
+        gate.open(.success(()))
+        try await Task.sleep(for: Self.silenceWindow)
+
+        XCTAssertFalse(fired, "A cancelled deadline fired")
+    }
+
+    func test_aClockDeadlineStaysSilentWhenItsSleepThrows() async throws {
+        struct SleepFailed: Error {}
+        let gate = GatedClock()
+        var fired = false
+        _ = EPUBDeadlineScheduler.clock(gate.clock).schedule(ContinuousClock().now) { fired = true }
+        try await gate.waitForSleep()
+
+        gate.open(.failure(SleepFailed()))
+        try await Task.sleep(for: Self.silenceWindow)
+
+        XCTAssertFalse(fired, "A deadline whose sleep threw fired")
+    }
 }
 
 // MARK: - Fixtures
@@ -290,6 +429,57 @@ final class ManualDeadlines {
     }
 }
 
+/// A clock whose sleep ends only when the test opens it, returning or throwing
+/// as told whether or not the sleeping task was cancelled.
+private final class GatedClock: Sendable {
+    private struct State {
+        var requestedInstants: [ContinuousClock.Instant] = []
+        var sleeper: CheckedContinuation<Void, any Error>?
+    }
+
+    private let state = Mutex(State())
+
+    var clock: EPUBMonotonicClock {
+        EPUBMonotonicClock(
+            now: { ContinuousClock().now },
+            sleep: { instant in try await self.sleep(until: instant) }
+        )
+    }
+
+    var requestedInstants: [ContinuousClock.Instant] {
+        state.withLock { $0.requestedInstants }
+    }
+
+    /// Waits until a sleep is waiting for the gate.
+    func waitForSleep() async throws {
+        let deadline = ContinuousClock.now.advanced(by: .seconds(5))
+        while state.withLock({ $0.sleeper == nil }) {
+            guard ContinuousClock.now < deadline else {
+                XCTFail("Setup: the deadline never started its sleep")
+                return
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+    }
+
+    func open(_ outcome: Result<Void, any Error>) {
+        let sleeper = state.withLock { state in
+            defer { state.sleeper = nil }
+            return state.sleeper
+        }
+        sleeper?.resume(with: outcome)
+    }
+
+    private func sleep(until instant: ContinuousClock.Instant) async throws {
+        try await withCheckedThrowingContinuation { continuation in
+            state.withLock { state in
+                state.requestedInstants.append(instant)
+                state.sleeper = continuation
+            }
+        }
+    }
+}
+
 /// Physical calls held open until the test completes them.
 @MainActor
 private final class HeldCalls {
@@ -323,10 +513,13 @@ private final class TransportFixture {
     }
 
     @discardableResult
-    func start(until deadline: EPUBLocatorOperationDeadline? = nil) -> Bool {
+    func start(
+        until deadline: EPUBLocatorOperationDeadline? = nil,
+        invocation: EPUBLocationTransport.Invocation? = nil
+    ) -> Bool {
         transport.start(
             until: deadline ?? EPUBLocatorOperationDeadline(startingAt: deadlines.now, budget: budget),
-            invocation: calls.invocation,
+            invocation: invocation ?? calls.invocation,
             deliver: { [unowned self] delivery in
                 switch delivery {
                 case .completed:
@@ -349,9 +542,16 @@ final class HeldScripts {
     }
 
     private var calls: [Call] = []
+    private var synchronousAnswer: Result<Any, any Error>?
 
     var count: Int {
         calls.count
+    }
+
+    /// Answers the next call inside its invocation, before the invocation
+    /// returns; later calls are held as usual.
+    func answerNextCallSynchronously(with result: Result<Any, any Error>) {
+        synchronousAnswer = result
     }
 
     /// The capability each injection carried, in call order.
@@ -365,6 +565,10 @@ final class HeldScripts {
     var invocation: EPUBLocatorCommandBridge.LocationScriptInvocation {
         { _, script, arguments, _, completion in
             self.calls.append(Call(script: script, arguments: arguments, completion: completion))
+            if let answer = self.synchronousAnswer {
+                self.synchronousAnswer = nil
+                completion(answer)
+            }
         }
     }
 

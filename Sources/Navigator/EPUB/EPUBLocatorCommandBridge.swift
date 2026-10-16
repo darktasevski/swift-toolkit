@@ -400,6 +400,10 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             case awaitingRegistration
         }
 
+        /// What the attempt's injection and deadline answer to. The capability
+        /// cannot be the key: re-issuing it starts a new attempt while the
+        /// superseded injection may still be outstanding.
+        let id: Int
         let capability: EPUBSpreadFrameCapability
         let deadline: EPUBLocatorOperationDeadline
         let timer: EPUBScheduledDeadline
@@ -412,6 +416,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// this web view may have outstanding.
     private let locationTransport: EPUBLocationTransport
     private var handshake: HandshakeAttempt?
+    private var lastHandshakeID = 0
 
     /// Called after a frame registers under the current capability.
     var onFrameRegistered: (@MainActor (EPUBSpreadFrameCapability) -> Void)?
@@ -685,14 +690,17 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     @MainActor
     private func beginHandshake(for capability: EPUBSpreadFrameCapability) {
         endHandshake(reporting: nil)
+        lastHandshakeID += 1
+        let id = lastHandshakeID
         let deadline = EPUBLocatorOperationDeadline(
             startingAt: deadlineScheduler.now(),
             budget: .milliseconds(Self.totalCommandDeadlineMilliseconds)
         )
         let timer = deadlineScheduler.schedule(deadline.expiresAt) { [weak self] in
-            self?.handshakeDeadlineDidPass(for: capability)
+            self?.handshakeDeadlineDidPass(attempt: id)
         }
         handshake = HandshakeAttempt(
+            id: id,
             capability: capability,
             deadline: deadline,
             timer: timer,
@@ -710,8 +718,12 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         else {
             return
         }
+        let id = attempt.id
         let capability = attempt.capability
         let invoke = invokeLocationScript
+        // Injecting before the call starts: an answer delivered inside the
+        // invocation frees the slot, and this attempt must not take it again.
+        handshake?.phase = .injecting
         let started = locationTransport.start(
             until: attempt.deadline,
             invocation: { done in
@@ -724,11 +736,11 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                 )
             },
             deliver: { [weak self] delivery in
-                self?.handshakeInjectionDidFinish(delivery, for: capability)
+                self?.handshakeInjectionDidFinish(delivery, attempt: id)
             }
         )
-        if started {
-            handshake?.phase = .injecting
+        if !started {
+            handshake?.phase = .awaitingTransport
         }
     }
 
@@ -737,13 +749,11 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     @MainActor
     private func handshakeInjectionDidFinish(
         _ delivery: EPUBLocationTransport.Delivery,
-        for capability: EPUBSpreadFrameCapability
+        attempt id: Int
     ) {
         guard
             case let .completed(result) = delivery,
-            let attempt = handshake,
-            attempt.capability == capability,
-            attempt.phase == .injecting
+            handshake?.id == id
         else {
             return
         }
@@ -756,8 +766,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     }
 
     @MainActor
-    private func handshakeDeadlineDidPass(for capability: EPUBSpreadFrameCapability) {
-        guard let attempt = handshake, attempt.capability == capability else {
+    private func handshakeDeadlineDidPass(attempt id: Int) {
+        guard let attempt = handshake, attempt.id == id else {
             return
         }
         switch attempt.phase {
