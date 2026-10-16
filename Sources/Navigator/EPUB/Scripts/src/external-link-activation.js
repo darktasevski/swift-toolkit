@@ -9,24 +9,37 @@
 // so the reader would reach the host before the app has asked. The click is cancelled and the URL
 // handed to the navigator in an `externalLinkActivated` message instead.
 //
-// The listeners go on the window, in the capture phase, as this script runs at document start: no
-// publication script has run yet, so none of its handlers sees the click first. A link inside a
-// closed shadow root is hidden from them and falls back to the navigation delegate.
+// The script runs in its own content world (`EPUBExternalLinkActivationBridge`), so a publication
+// script can neither redefine what it calls here nor post its message. Its listeners go on the
+// window, in the capture phase, as it runs at document start: no publication script has run yet,
+// so none of its handlers sees the click first, and one that handles an outbound link itself finds
+// the click already cancelled. A link inside a closed shadow root, an SVG `<use>` instance or a
+// frame that may not run script is hidden from them and falls back to the navigation delegate.
+
+const SVG_NS = "http://www.w3.org/2000/svg";
+const XLINK_NS = "http://www.w3.org/1999/xlink";
+const MATHML_NS = "http://www.w3.org/1998/Math/MathML";
 
 window.addEventListener("click", onLinkActivation, true);
 window.addEventListener("auxclick", onLinkActivation, true);
 
 function onLinkActivation(event) {
-  // The buttons WebKit activates a link with (`isLinkClick`, `HTMLAnchorElement.cpp`).
-  if (event.button !== 0 && event.button !== 1) {
+  // WebKit activates a link on any click but a right-button one.
+  if (event instanceof MouseEvent && event.button === 2) {
     return;
   }
   const href = hrefLeavingPublication(event);
   if (href == null) {
     return;
   }
+  // Posted before the click is cancelled: if the message cannot be posted, the click keeps its
+  // default handling and the navigation delegate still asks, rather than doing nothing.
+  try {
+    webkit.messageHandlers.externalLinkActivated.postMessage({ href: href });
+  } catch {
+    return;
+  }
   event.preventDefault();
-  webkit.messageHandlers.externalLinkActivated.postMessage({ href: href });
 }
 
 /**
@@ -36,15 +49,13 @@ function onLinkActivation(event) {
 function hrefLeavingPublication(event) {
   // The composed path, not `event.target`: at the window, a link inside an open shadow root has
   // been retargeted to its host.
-  const link = event
-    .composedPath()
-    .find((node) => node instanceof Element && node.matches("a, area"));
-  if (link == null) {
-    return null;
+  let raw = null;
+  for (const node of event.composedPath()) {
+    raw = linkHref(node);
+    if (raw != null) {
+      break;
+    }
   }
-  const raw =
-    link.getAttribute("href") ??
-    link.getAttributeNS("http://www.w3.org/1999/xlink", "href");
   if (raw == null) {
     return null;
   }
@@ -62,6 +73,29 @@ function hrefLeavingPublication(event) {
     return null;
   }
   return url.href;
+}
+
+/**
+ * The URL `node` links to, when WebKit treats it as a link: an HTML `a` or `area` with an `href`,
+ * an SVG `a` with an `href` or `xlink:href`, or a MathML element with an `href`. An `a` without
+ * one is not a link, so the search goes on to an enclosing one, as WebKit's does.
+ */
+function linkHref(node) {
+  if (!(node instanceof Element)) {
+    return null;
+  }
+  switch (node.namespaceURI) {
+    case SVG_NS:
+      return node.localName === "a"
+        ? node.getAttribute("href") ?? node.getAttributeNS(XLINK_NS, "href")
+        : null;
+    case MATHML_NS:
+      return node.getAttribute("href");
+    default:
+      return node.localName === "a" || node.localName === "area"
+        ? node.getAttribute("href")
+        : null;
+  }
 }
 
 /**

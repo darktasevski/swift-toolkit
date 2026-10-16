@@ -7,7 +7,6 @@
 // Base script used by both reflowable and fixed layout resources.
 
 import "./gestures";
-import "./external-link-activation";
 import "./keyboard";
 import { findFirstVisibleLocator } from "./dom";
 import {
