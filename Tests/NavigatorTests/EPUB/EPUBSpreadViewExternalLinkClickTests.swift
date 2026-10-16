@@ -309,7 +309,7 @@ final class EPUBSpreadViewExternalLinkClickTests: XCTestCase {
             XCTAssertEqual(cancelledAtLink, click.cancelledAtLink, "cancelled at the link: \(click.name)", file: file, line: line)
         }
 
-        let barrierURL = try XCTUnwrap(URL(string: try XCTUnwrap(Self.barriers[0].leaves)))
+        let barrierURL = try XCTUnwrap(try URL(string: XCTUnwrap(Self.barriers[0].leaves)))
         let internalBarrier = try XCTUnwrap(Self.barriers[1].opensInside)
         try await EPUBSpreadViewHosting.waitUntil(file: file, line: line) {
             delegate.externalURLs.contains(barrierURL) && delegate.internalLinks.contains(internalBarrier)

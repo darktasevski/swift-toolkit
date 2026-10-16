@@ -67,7 +67,7 @@ final class EPUBSpreadViewExternalLinkActivationTests: XCTestCase {
 
         spreadView.didActivateExternalLink(["href": "https://example.com/a"])
 
-        XCTAssertEqual(delegate.externalURLs, [try XCTUnwrap(URL(string: "https://example.com/a"))])
+        XCTAssertEqual(delegate.externalURLs, try [XCTUnwrap(URL(string: "https://example.com/a"))])
         XCTAssertFalse(logger.captured.contains { $0.contains("reason=malformed_link_activation_body") })
     }
 
