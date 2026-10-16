@@ -27,6 +27,19 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(delegate.inputs, 1, "Selection dragging must not admit navigation")
     }
 
+    func testVoiceOverPageScrollAdmitsBeforeTurningPages() throws {
+        let fixture = makeFixture(layout: .reflowable)
+        let locator = Locator(href: RelativeURL(path: "chapter.html")!.anyURL, mediaType: .html)
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: locator)
+        let delegate = NavigationInputDelegate()
+        navigator.delegate = delegate
+        let directions: [UIAccessibilityScrollDirection] = [.next, .previous, .left, .right, .up, .down]
+        for (index, direction) in directions.enumerated() {
+            XCTAssertTrue(navigator.accessibilityScroll(direction))
+            XCTAssertEqual(delegate.inputs, index + 1, "VoiceOver scroll \(direction.rawValue) must admit")
+        }
+    }
+
     func testNativeDragAdmitsPaginatedAndContinuousNavigation() {
         for scrolling in [false, true] {
             let spread = makeReflowableSpreadView(scroll: scrolling)

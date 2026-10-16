@@ -14,8 +14,9 @@ import WebKit
 @MainActor public protocol EPUBNavigatorDelegate: VisualNavigatorDelegate, SelectableNavigatorDelegate,
     ViewportObservingNavigatorDelegate, VisibleAnchorObservingNavigatorDelegate
 {
-    /// Called synchronously when native scrolling accepts a user navigation input,
-    /// before its location reports. Programmatic moves and generic touches do not call this.
+    /// Called synchronously when native scrolling or a VoiceOver page scroll accepts a user
+    /// navigation input, before its location reports. Programmatic moves and generic touches do
+    /// not call this.
     func navigatorWillBeginUserNavigation(_ navigator: EPUBNavigatorViewController)
 
     // MARK: - WebView Customization
@@ -1360,6 +1361,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
 
         let options = NavigatorGoOptions(animated: false)
+        // A VoiceOver scroll is user input, admitted before the page command it starts.
+        delegate?.navigatorWillBeginUserNavigation(self)
 
         Task {
             switch direction {
