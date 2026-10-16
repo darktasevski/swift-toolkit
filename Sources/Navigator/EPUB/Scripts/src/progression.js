@@ -14,10 +14,12 @@
  *
  * Vertical scroll measures `scrollY` against `scrollHeight`. Paginated and
  * vertical-writing layouts measure the horizontal offset against
- * `scrollWidth`, by its absolute value when the inline direction runs right to
- * left. Missing roots and non-positive or non-finite dimensions or offsets
- * yield `null` rather than a fabricated position. The extent is positive, so
- * the range is ordered; a finite overscroll is clamped.
+ * `scrollWidth`. Content that progresses right to left (`direction: rtl` or
+ * `writing-mode: vertical-rl`) scrolls from 0 towards negative offsets, so the
+ * offset is negated. A missing root, a non-positive or non-finite dimension,
+ * or a non-finite offset yields `null` rather than a fabricated position. The
+ * extent is positive, so the range is ordered; every finite offset, including
+ * an overscroll past either end, is clamped into 0...1.
  */
 export function measureProgression() {
   const root = document.scrollingElement;
@@ -47,7 +49,7 @@ export function measureProgression() {
 
   const size = useY ? root.scrollHeight : root.scrollWidth;
   const extent = useY ? innerHeight : innerWidth;
-  const offset = useY ? scrollY : isRTL ? Math.abs(scrollX) : scrollX;
+  const offset = useY ? scrollY : isRTL ? -scrollX : scrollX;
   if (!Number.isFinite(offset)) {
     return null;
   }

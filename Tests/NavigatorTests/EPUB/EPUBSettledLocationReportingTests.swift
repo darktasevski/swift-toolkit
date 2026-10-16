@@ -15,7 +15,9 @@ import XCTest
 /// let it initialize on its own: readiness, frame registration and progression
 /// messages all come from the production lifecycle. The progression-read tests
 /// load documents of known geometry into a bare web view carrying the locator
-/// command script, and issue its frame capability directly.
+/// command script, and issue its frame capability directly; the isolation test
+/// checks that script leaves the page's layout alone. The scroll-hint tests add
+/// the page-world reflowable script to that web view and record what it posts.
 @MainActor
 final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_commandTurnReportsMeasuredProgressionWithinSameResource() async throws {
@@ -37,10 +39,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         await fulfillment(of: [report], timeout: Self.reportTimeout)
         _ = try XCTUnwrap(reader.spy.matchedLocation, "No advancing location was reported after the turn")
+        let atMatch = try await reader.requireGeometry()
 
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let settled = try await reader.requireGeometry()
-        assertEveryReport(reader.spy.locationsSinceArming, isIn: opening.href, at: settled.firstProgression)
+        assertSettledReports(reader.spy.locationsSinceArming, isIn: opening.href, matchedAt: atMatch, settled: settled)
     }
 
     func test_boundaryTurnWithoutMovementInventsNoAdvancement() async throws {
@@ -83,31 +86,39 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         await fulfillment(of: [report], timeout: Self.reportTimeout)
         _ = try XCTUnwrap(reader.spy.matchedLocation, "No destination location was reported")
+        let atMatch = try await reader.requireGeometry()
 
         // Turning back lands on the previous resource's last page, so a report
         // of its start would be a fabricated position, not the destination.
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let settled = try await reader.requireGeometry()
         XCTAssertGreaterThan(settled.firstProgression, 0)
-        assertEveryReport(
+        assertSettledReports(
             reader.spy.locationsSinceArming,
             isIn: Self.longChapterHREF.anyURL,
-            at: settled.firstProgression
+            matchedAt: atMatch,
+            settled: settled
         )
     }
 
     /// Checks every report since the action, not only the first match: once a
     /// navigation settles, only its final location may be delivered, so a
     /// stale or fabricated report arriving around the correct one is a defect.
-    private func assertEveryReport(
+    /// A geometry change after the match is a new observation that a later
+    /// report may replace the earlier ones with, so then only the last report
+    /// must describe the settled viewport.
+    private func assertSettledReports(
         _ reports: [Locator],
         isIn href: AnyURL,
-        at progression: Double,
+        matchedAt: PageGeometry,
+        settled: PageGeometry,
         file: StaticString = #filePath,
         line: UInt = #line
     ) {
         XCTAssertFalse(reports.isEmpty, "No report to check", file: file, line: line)
-        for (index, report) in reports.enumerated() {
+        let checked = settled == matchedAt ? reports : Array(reports.suffix(1))
+        let progression = settled.firstProgression
+        for (index, report) in checked.enumerated() {
             XCTAssertTrue(
                 report.href.isEquivalentTo(href),
                 "Report \(index) is for \(report.href), not \(href)",
@@ -135,7 +146,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         try await assertSample(page.read(ProgressionPage.capability), first: 1.0 / 3, last: 2.0 / 3)
     }
 
-    func test_progressionReadMeasuresRightToLeftPagesByTheirAbsoluteOffset() async throws {
+    func test_progressionReadMeasuresRightToLeftPagesByTheirNegatedOffset() async throws {
         let page = try await openProgressionPage(.rightToLeftPages)
         try await page.acceptCapability(ProgressionPage.capability)
         try await page.scroll(x: -600, y: 0)
@@ -160,32 +171,52 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         try await assertSample(page.read(ProgressionPage.capability), first: 1.0 / 3, last: 2.0 / 3)
     }
 
+    /// Every vertical writing mode advances horizontally, not only the
+    /// right-to-left one.
+    func test_progressionReadMeasuresLeftToRightVerticalWritingHorizontally() async throws {
+        let page = try await openProgressionPage(.verticalLeftToRightWritingScroll)
+        try await page.acceptCapability(ProgressionPage.capability)
+        try await page.scroll(x: 600, y: 0)
+
+        try await assertSample(page.read(ProgressionPage.capability), first: 1.0 / 3, last: 2.0 / 3)
+    }
+
     func test_progressionReadRejectsMalformedGeometry() async throws {
-        let stubs: [GeometryStub] = [
-            .window("innerWidth", "0"),
-            .window("innerHeight", "0"),
-            .window("innerWidth", "Infinity"),
-            .window("scrollX", "NaN"),
-            .root("scrollWidth", "0"),
-            .noRoot,
+        let cases: [(document: ProgressionDocument, stub: GeometryStub)] = [
+            (.leftToRightPages, .window("innerWidth", "0")),
+            (.leftToRightPages, .window("innerHeight", "0")),
+            (.leftToRightPages, .window("innerWidth", "Infinity")),
+            (.leftToRightPages, .window("scrollX", "NaN")),
+            (.leftToRightPages, .root("scrollWidth", "0")),
+            (.leftToRightPages, .noRoot),
+            (.verticalScroll, .window("scrollY", "NaN")),
+            (.verticalScroll, .root("scrollHeight", "0")),
         ]
-        for stub in stubs {
-            let page = try await openProgressionPage(.leftToRightPages)
+        for (document, stub) in cases {
+            let page = try await openProgressionPage(document)
             try await page.acceptCapability(ProgressionPage.capability)
+            // Control: the null below is the stub's doing only if the same
+            // document measures before it.
+            let unstubbed = try await page.read(ProgressionPage.capability)
+            XCTAssertNotNil(unstubbed, "Setup: \(document) produced no progression before \(stub)")
 
             let (observed, sample) = try await page.read(ProgressionPage.capability, stubbing: stub)
             XCTAssertEqual(observed, stub.value, "\(stub) did not take effect")
-            XCTAssertNil(sample, "\(stub) produced a progression")
+            XCTAssertNil(sample, "\(stub) on \(document) produced a progression")
         }
     }
 
     func test_progressionReadClampsFiniteOverscroll() async throws {
-        let cases: [(offset: String, first: Double, last: Double)] = [
-            ("1500", 5.0 / 6, 1),
-            ("-300", 0, 1.0 / 6),
+        let cases: [(document: ProgressionDocument, offset: String, first: Double, last: Double)] = [
+            (.leftToRightPages, "1500", 5.0 / 6, 1),
+            (.leftToRightPages, "-300", 0, 1.0 / 6),
+            (.rightToLeftPages, "-1500", 5.0 / 6, 1),
+            // A right-to-left start overscroll is a positive offset, before
+            // the first page rather than inside the resource.
+            (.rightToLeftPages, "300", 0, 1.0 / 6),
         ]
         for overscroll in cases {
-            let page = try await openProgressionPage(.leftToRightPages)
+            let page = try await openProgressionPage(overscroll.document)
             try await page.acceptCapability(ProgressionPage.capability)
 
             let stub = GeometryStub.window("scrollX", overscroll.offset)
@@ -193,6 +224,26 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             XCTAssertEqual(observed, stub.value, "\(stub) did not take effect")
             assertSample(sample, first: overscroll.first, last: overscroll.last)
         }
+    }
+
+    /// The read is an observation: it moves no viewport, announces no frame,
+    /// and leaves a command in flight to finish as it would have.
+    func test_progressionReadLeavesTheDocumentAndItsCommandsAlone() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.scroll(x: 600, y: 0)
+
+        let observed = try await page.readCountingFrameAnnouncements(ProgressionPage.capability)
+        XCTAssertEqual(observed.announcementsOnAccept, 1, "Setup: the announcement spy did not see the capability's")
+        XCTAssertEqual(observed.announcementsOnRead, 0, "The read announced the frame")
+        XCTAssertEqual(observed.offsetAfterRead, [600, 0], "The read moved the viewport")
+        assertSample(observed.sample, first: 1.0 / 3, last: 2.0 / 3)
+
+        let undisturbed = try await page.navigate(sequence: 1, alongside: .nothing)
+        XCTAssertNotEqual(undisturbed, "cancelled", "Setup: the command does not finish on its own")
+        let invalidated = try await page.navigate(sequence: 2, alongside: .invalidation)
+        XCTAssertEqual(invalidated, "cancelled", "Setup: this command's cancellation is not observable")
+        let alongsideRead = try await page.navigate(sequence: 3, alongside: .read(ProgressionPage.capability))
+        XCTAssertEqual(alongsideRead, undisturbed, "The read disturbed the command in flight")
     }
 
     func test_progressionReadAnswersOnlyTheCurrentCapability() async throws {
@@ -260,11 +311,67 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertFalse(inserted, "The isolated world inserted a virtual column into the page")
     }
 
-    /// The read returns exactly the capability it answered under and the
-    /// measured range; anything more or less is a malformed sample.
+    // MARK: - Page-world scroll hint
+
+    /// Scroll events within one frame coalesce into a single hint carrying the
+    /// latest measurement.
+    func test_scrollHintPostsTheLatestMeasurementOncePerFrame() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, carryingReflowableScript: true)
+
+        let hints = try await page.hintsPosted(running: """
+        scrollTo(300, 0);
+        dispatchEvent(new Event("scroll"));
+        scrollTo(600, 0);
+        dispatchEvent(new Event("scroll"));
+        """)
+
+        XCTAssertEqual(hints.count, 1, "Expected one hint for one frame, got \(hints)")
+        assertSample(hints.first, capability: nil, first: 1.0 / 3, last: 2.0 / 3)
+    }
+
+    /// Fixed layout posts no hint, and neither does geometry that cannot be
+    /// measured, including geometry that stops being measurable after a hint
+    /// was scheduled within the same frame.
+    func test_scrollHintPostsNothingForFixedLayoutOrUnmeasurableGeometry() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, carryingReflowableScript: true)
+        let control = try await page.hintsPosted(running: """
+        scrollTo(600, 0);
+        dispatchEvent(new Event("scroll"));
+        """)
+        XCTAssertFalse(control.isEmpty, "Setup: a measurable scroll posted no hint")
+
+        let fixedLayout = try await page.hintsPosted(running: """
+        readium.isFixedLayout = true;
+        scrollTo(300, 0);
+        dispatchEvent(new Event("scroll"));
+        """)
+        XCTAssertTrue(fixedLayout.isEmpty, "A fixed-layout scroll posted \(fixedLayout)")
+
+        let unmeasurableWithinFrame = try await page.hintsPosted(running: """
+        readium.isFixedLayout = false;
+        scrollTo(900, 0);
+        dispatchEvent(new Event("scroll"));
+        Object.defineProperty(window, "innerWidth", { value: 0, configurable: true });
+        dispatchEvent(new Event("scroll"));
+        """)
+        XCTAssertTrue(
+            unmeasurableWithinFrame.isEmpty,
+            "Geometry that became unmeasurable before the frame posted \(unmeasurableWithinFrame)"
+        )
+
+        let unmeasurable = try await page.hintsPosted(running: """
+        scrollTo(1200, 0);
+        dispatchEvent(new Event("scroll"));
+        """)
+        XCTAssertTrue(unmeasurable.isEmpty, "Unmeasurable geometry posted \(unmeasurable)")
+    }
+
+    /// A read returns exactly the capability it answered under and the
+    /// measured range, and a page-world hint (`capability` nil) the range
+    /// alone; anything more or less is malformed.
     private func assertSample(
         _ value: Any?,
-        capability: String = ProgressionPage.capability,
+        capability: String? = ProgressionPage.capability,
         first: Double,
         last: Double,
         file: StaticString = #filePath,
@@ -274,7 +381,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             XCTFail("Expected a progression sample, got \(String(describing: value))", file: file, line: line)
             return
         }
-        XCTAssertEqual(Set(sample.keys), ["capability", "first", "last"], file: file, line: line)
+        let expectedKeys: Set<String> = capability == nil ? ["first", "last"] : ["capability", "first", "last"]
+        XCTAssertEqual(Set(sample.keys), expectedKeys, file: file, line: line)
         XCTAssertEqual(sample["capability"] as? String, capability, file: file, line: line)
         XCTAssertEqual((sample["first"] as? NSNumber)?.doubleValue ?? -1, first, accuracy: 0.000_001, "first", file: file, line: line)
         XCTAssertEqual((sample["last"] as? NSNumber)?.doubleValue ?? -1, last, accuracy: 0.000_001, "last", file: file, line: line)
@@ -328,13 +436,19 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return reader
     }
 
-    private func openProgressionPage(_ document: ProgressionDocument) async throws -> ProgressionPage {
-        let page = try ProgressionPage()
+    private func openProgressionPage(
+        _ document: ProgressionDocument,
+        carryingReflowableScript: Bool = false
+    ) async throws -> ProgressionPage {
+        let page = try ProgressionPage(carryingReflowableScript: carryingReflowableScript)
         addTeardownBlock { @MainActor in
             page.window.isHidden = true
             page.window.rootViewController = nil
         }
         try await page.load(document)
+        if carryingReflowableScript {
+            try await page.waitForLoadHintsToSettle()
+        }
         return page
     }
 
@@ -413,10 +527,17 @@ private struct Reader {
 
         // Skip only on the #1693 signature: a WebContent process that stopped
         // answering mid-load leaves readiness `.loading` while WebKit still
-        // reports loading. Every other expiry is a navigator defect.
-        if let spread = currentSpread, case .loading = spread.readiness.state, spread.webView.isLoading {
+        // reports loading, and answers no script. A process that answers has a
+        // load the navigator left pending; that and every other expiry is a
+        // navigator defect.
+        if
+            let spread = currentSpread,
+            case .loading = spread.readiness.state,
+            spread.webView.isLoading,
+            try await !contentProcessAnswers(spread.webView)
+        {
             throw XCTSkip(
-                "Setup: WebContent process is not making progress (see #1693). \(diagnosis)"
+                "Setup: WebContent process is not answering (see #1693). \(diagnosis)"
             )
         }
         XCTFail("Setup: the reader never reached a usable paginated viewport with an opening report. \(diagnosis)")
@@ -504,15 +625,39 @@ private struct PageGeometry: Equatable, CustomStringConvertible {
 
 private struct SetupTimeout: Error {}
 
+/// Whether the web view's content process answers a trivial script within
+/// `timeout`. The #1693 hang leaves it unanswered; a live process answers at
+/// once even while a load is pending.
+@MainActor
+private func contentProcessAnswers(_ webView: WKWebView, within timeout: Duration = .seconds(5)) async throws -> Bool {
+    let answer = ScriptAnswer()
+    webView.evaluateJavaScript("1") { _, _ in
+        answer.isReceived = true
+    }
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: timeout)
+    while !answer.isReceived, clock.now < deadline {
+        try await clock.sleep(for: .milliseconds(20))
+    }
+    return answer.isReceived
+}
+
+@MainActor
+private final class ScriptAnswer {
+    var isReceived = false
+}
+
 /// Documents whose geometry is fixed by construction, so every expected
 /// progression is a constant rather than something read back from the page.
-/// The first four fill a 600×800 viewport three or four times over along one
-/// axis; the odd spread lays out three 300 px columns, one and a half screens.
+/// All but the odd spread fill a 600×800 viewport three or four times over
+/// along one axis; the odd spread lays out three 300 px columns, one and a
+/// half screens.
 private enum ProgressionDocument {
     case leftToRightPages
     case rightToLeftPages
     case verticalScroll
     case verticalWritingScroll
+    case verticalLeftToRightWritingScroll
     case oddTwoColumnSpread
 
     var html: String {
@@ -526,6 +671,12 @@ private enum ProgressionDocument {
         case .verticalWritingScroll:
             Self.page(
                 rootAttributes: #"style="writing-mode: vertical-rl; --USER__view: readium-scroll-on""#,
+                width: 1800,
+                height: 800
+            )
+        case .verticalLeftToRightWritingScroll:
+            Self.page(
+                rootAttributes: #"style="writing-mode: vertical-lr; --USER__view: readium-scroll-on""#,
                 width: 1800,
                 height: 800
             )
@@ -583,20 +734,28 @@ private enum GeometryStub: CustomStringConvertible {
     }
 }
 
-/// A bare web view carrying only the locator command script, hosted at the
+/// A bare web view carrying the locator command script, hosted at the
 /// navigator tests' 600×800 size. Nothing here mints readiness or registers a
-/// frame: the capability is issued straight to the document under test.
+/// frame: the capability is issued straight to the document under test. On
+/// request it also carries the page-world reflowable script, injected as a
+/// spread injects it, with every message that script posts recorded and none
+/// acted on.
 @MainActor
 private final class ProgressionPage {
     static let capability = "settled-location-test-capability"
     private static let url = URL(string: "https://readium.test/chapter.xhtml")!
     private static let setupTimeout: Duration = .seconds(30)
 
+    /// A hint is scheduled for the next animation frame, so a quarter second
+    /// without one means none is coming.
+    private static let hintQuietWindow: Duration = .milliseconds(250)
+
     let window: UIWindow
     let webView: WKWebView
     private let loads = LoadObserver()
+    private let pageMessages = PageMessageRecorder()
 
-    init() throws {
+    init(carryingReflowableScript: Bool = false) throws {
         let bridge = try EPUBLocatorCommandBridge(
             layout: .reflowable,
             publicationBaseURL: XCTUnwrap(HTTPURL(string: "https://readium.test/"))
@@ -606,6 +765,16 @@ private final class ProgressionPage {
         // would change the viewport the expected progressions are built on.
         configuration.defaultWebpagePreferences.preferredContentMode = .mobile
         bridge.install(in: configuration)
+        if carryingReflowableScript {
+            configuration.userContentController.addUserScript(WKUserScript(
+                source: EPUBSpreadView.loadScript(named: "readium-reflowable"),
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false
+            ))
+            for name in PageMessageRecorder.names {
+                configuration.userContentController.add(pageMessages, name: name)
+            }
+        }
         window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
         webView = WKWebView(frame: window.bounds, configuration: configuration)
         webView.scrollView.contentInsetAdjustmentBehavior = .never
@@ -627,10 +796,10 @@ private final class ProgressionPage {
         }
         guard loads.hasFinished(navigation) else {
             let diagnosis = "isLoading=\(webView.isLoading), progress=\(webView.estimatedProgress)"
-            // Same earned skip as the navigator setup: only a load WebKit still
-            // believes is in progress points at the #1693 WebContent hang.
-            if webView.isLoading {
-                throw XCTSkip("Setup: WebContent process is not making progress (see #1693). \(diagnosis)")
+            // Same earned skip as the navigator setup: only a pending load whose
+            // content process answers no script points at the #1693 hang.
+            if webView.isLoading, try await !contentProcessAnswers(webView) {
+                throw XCTSkip("Setup: WebContent process is not answering (see #1693). \(diagnosis)")
             }
             XCTFail("Setup: the document never finished loading. \(diagnosis)")
             throw SetupTimeout()
@@ -645,6 +814,34 @@ private final class ProgressionPage {
             XCTFail("Setup: the expected progressions assume a 600×800 viewport, got \(String(describing: viewport))")
             throw SetupTimeout()
         }
+        try await waitForCommittedContentSize()
+    }
+
+    /// Waits until the scroll view holds the document's content size. The
+    /// first commit that brings it sets the document's initial scroll origin,
+    /// which returns a right-to-left document scrolled before then to 0.
+    private func waitForCommittedContentSize() async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        var documentSize: [Double]?
+        while clock.now < deadline {
+            documentSize = try await (webView.callAsyncJavaScript(
+                "const root = document.scrollingElement; return [root.scrollWidth, root.scrollHeight];",
+                arguments: [:],
+                in: nil,
+                contentWorld: .defaultClient
+            ) as? [NSNumber])?.map(\.doubleValue)
+            let contentSize = webView.scrollView.contentSize
+            if documentSize == [contentSize.width, contentSize.height] {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail(
+            "Setup: the scroll view never took the document's size \(String(describing: documentSize)); " +
+                "it holds \(webView.scrollView.contentSize)"
+        )
+        throw SetupTimeout()
     }
 
     func acceptCapability(_ capability: String) async throws {
@@ -715,6 +912,123 @@ private final class ProgressionPage {
         return (value?["observed"] as? String, sample is NSNull ? nil : sample)
     }
 
+    /// Issues `capability`, then reads under it, counting the frame-ready
+    /// announcements each step posts and recording the offset the read leaves.
+    func readCountingFrameAnnouncements(_ capability: String) async throws -> FrameAnnouncementObservation {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            const handler = webkit.messageHandlers.readerLocatorFrameReady;
+            const post = handler.postMessage.bind(handler);
+            let announcements = 0;
+            handler.postMessage = (body) => {
+                announcements += 1;
+                return post(body);
+            };
+            readerLocatorCommands.acceptFrameCapability(capability);
+            const onAccept = announcements;
+            const sample = readerLocatorCommands.readProgression(capability);
+            return {
+                onAccept,
+                onRead: announcements - onAccept,
+                offset: [scrollX, scrollY],
+                sample,
+            };
+            """,
+            arguments: ["capability": capability],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        ) as? [String: Any]
+        let sample = value?["sample"]
+        return FrameAnnouncementObservation(
+            announcementsOnAccept: (value?["onAccept"] as? NSNumber)?.intValue,
+            announcementsOnRead: (value?["onRead"] as? NSNumber)?.intValue,
+            offsetAfterRead: (value?["offset"] as? [NSNumber])?.map(\.doubleValue),
+            sample: sample is NSNull ? nil : sample
+        )
+    }
+
+    enum CommandCompanion {
+        case nothing
+        case invalidation
+        case read(String)
+    }
+
+    /// Starts a navigation command to the document's only element and, in the
+    /// same turn, before the command can reach its first animation frame, does
+    /// `companion`. Returns the command's outcome.
+    func navigate(sequence: Int, alongside companion: CommandCompanion) async throws -> String? {
+        let (companionKind, capability): (String, String) = switch companion {
+        case .nothing: ("nothing", "")
+        case .invalidation: ("invalidation", "")
+        case let .read(capability): ("read", capability)
+        }
+        return try await webView.callAsyncJavaScript(
+            """
+            const token = {
+                webViewInstanceID: "settled-location-test",
+                documentEpoch: 0,
+                operationKind: "navigation",
+                sequence,
+                budgetMilliseconds: 10000,
+            };
+            const pending = readerLocatorCommands.execute(
+                { kind: "navigateLocator", payload: locator, animated: false },
+                token
+            );
+            if (companionKind === "invalidation") {
+                readerLocatorCommands.invalidate(token);
+            } else if (companionKind === "read") {
+                readerLocatorCommands.readProgression(capability);
+            }
+            return (await pending).outcome;
+            """,
+            arguments: [
+                "sequence": sequence,
+                "locator": #"{"href":"chapter.xhtml","locations":{"cssSelector":"body > div"}}"#,
+                "companionKind": companionKind,
+                "capability": capability,
+            ],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        ) as? String
+    }
+
+    /// Waits out the hint the load itself posts: the reflowable script
+    /// measures once its resize observer first fires.
+    func waitForLoadHintsToSettle() async throws {
+        try await waitForHintsToSettle(after: 0, requiringOne: true)
+    }
+
+    /// Runs `script` in the page world and returns every progression hint
+    /// posted from then until the hints go quiet.
+    func hintsPosted(running script: String) async throws -> [Any] {
+        let start = pageMessages.hints.count
+        _ = try await webView.callAsyncJavaScript(script, arguments: [:], in: nil, contentWorld: .page)
+        try await waitForHintsToSettle(after: start, requiringOne: false)
+        return Array(pageMessages.hints[start...])
+    }
+
+    private func waitForHintsToSettle(after start: Int, requiringOne: Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        var count = pageMessages.hints.count
+        var lastChange = clock.now
+        while clock.now < deadline {
+            if pageMessages.hints.count != count {
+                count = pageMessages.hints.count
+                lastChange = clock.now
+            } else if
+                lastChange.duration(to: clock.now) >= Self.hintQuietWindow,
+                !requiringOne || count > start
+            {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Setup: progression hints never settled; hints=\(pageMessages.hints.count - start)")
+        throw SetupTimeout()
+    }
+
     func columnLayout() async throws -> (columnCount: String, screens: Double)? {
         let value = try await webView.callAsyncJavaScript(
             """
@@ -766,6 +1080,42 @@ private final class ProgressionPage {
             in: nil,
             contentWorld: .defaultClient
         ) as? Bool == true
+    }
+}
+
+private struct FrameAnnouncementObservation {
+    let announcementsOnAccept: Int?
+    let announcementsOnRead: Int?
+    let offsetAfterRead: [Double]?
+    let sample: Any?
+}
+
+/// Records the page-world script's progression hints. Every message name the
+/// reflowable script posts to is registered, so no post throws for want of a
+/// handler.
+@MainActor
+private final class PageMessageRecorder: NSObject, WKScriptMessageHandler {
+    static let names = [
+        "decorationActivated",
+        "imageActivated",
+        "keyEventReceived",
+        "log",
+        "logError",
+        "pointerEventReceived",
+        "progressionChanged",
+        "selectionChanged",
+        "spreadLoadStarted",
+        "spreadLoaded",
+        "tap",
+        "visibleAnchorChanged",
+    ]
+
+    private(set) var hints: [Any] = []
+
+    func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
+        if message.name == "progressionChanged" {
+            hints.append(message.body)
+        }
     }
 }
 

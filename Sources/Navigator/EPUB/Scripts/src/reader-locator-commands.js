@@ -2121,10 +2121,12 @@ function acceptFrameCapability(token) {
 }
 
 // Measures the viewport of the document holding `expectedCapability`, as
-// exactly `{ capability, first, last }`, or null. Only the document that was
-// issued that capability and has not revoked it on pagehide can answer, so the
-// result carries its own provenance. Read-only: it never scrolls, registers a
-// frame, or touches a command.
+// exactly `{ capability, first, last }`, or null. A document answers only while
+// it holds that capability and has not revoked it on pagehide. That does not
+// identify the resource frame on its own: `acceptFrameCapability` forwards the
+// capability to direct same-origin child frames, which can then answer too, so
+// the native side must read in the main frame it selected. Read-only: it never
+// scrolls, registers a frame, or touches a command.
 function readProgression(expectedCapability) {
   if (frameCapability === null || expectedCapability !== frameCapability) {
     return null;
