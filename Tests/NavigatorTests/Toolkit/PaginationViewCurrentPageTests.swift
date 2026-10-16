@@ -10,6 +10,16 @@ import XCTest
 
 @MainActor
 final class PaginationViewCurrentPageTests: XCTestCase {
+    func testNativePaginationDragAdmitsBeforeChangingPages() throws {
+        let pagination = makePaginationView()
+        let delegate = TestPaginationDelegate(pages: [:])
+        pagination.delegate = delegate
+        let scrollView = try XCTUnwrap(pagination.subviews.compactMap { $0 as? UIScrollView }.first)
+        scrollView.delegate?.scrollViewWillBeginDragging?(scrollView)
+        XCTAssertEqual(delegate.navigationInputs, 1)
+        XCTAssertEqual(pagination.currentIndex, 0)
+    }
+
     func testCurrentPageIdentityResolvesBeforeItsGoAndNeighborPreloading() async {
         let current = TestPageView(blocksGo: true)
         let previous = TestPageView()
@@ -574,6 +584,11 @@ final class PaginationViewCurrentPageTests: XCTestCase {
 @MainActor
 private final class TestPaginationDelegate: PaginationViewDelegate {
     var onCreate: ((PaginationView, Int) -> Void)?
+    var navigationInputs = 0
+    func paginationViewWillBeginUserNavigation(_ paginationView: PaginationView) {
+        navigationInputs += 1
+    }
+
     private(set) var requestedIndices: [Int] = []
     private(set) var updateCount = 0
 

@@ -8,6 +8,9 @@ import ReadiumShared
 @preconcurrency import WebKit
 
 protocol EPUBSpreadViewDelegate: AnyObject {
+    /// Called before a recognized native drag changes the reading position.
+    func spreadViewWillBeginUserNavigation(_ spreadView: EPUBSpreadView)
+
     /// Returns the content inset the spread view should use.
     func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets
 
@@ -1154,6 +1157,7 @@ extension EPUBSpreadView: UIScrollViewDelegate {
     }
 
     func scrollViewWillBeginDragging(_ scrollView: UIScrollView) {
+        delegate?.spreadViewWillBeginUserNavigation(self)
         webView.clearSelection()
         cancelInFlightCommandForUserInteraction()
     }
