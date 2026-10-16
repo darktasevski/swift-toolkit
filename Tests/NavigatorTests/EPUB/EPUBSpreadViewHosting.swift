@@ -227,7 +227,10 @@ final class RecordingSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
         internalLinks.append(href)
     }
 
-    func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets { .zero }
+    func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets {
+        .zero
+    }
+
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?) {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}

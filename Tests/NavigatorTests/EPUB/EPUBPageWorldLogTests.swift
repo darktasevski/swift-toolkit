@@ -408,7 +408,7 @@ final class EPUBSpreadLogInterpolationTests: XCTestCase {
 
     /// The derived list can only grow past these; one that lost a file would scan it no more.
     func testTheScanCoversTheSpreadClassesAndTheirExtensions() throws {
-        let names = Set(try Self.spreadSourceNames())
+        let names = try Set(Self.spreadSourceNames())
         for name in [
             "EPUBSpreadView.swift",
             "EPUBReflowableSpreadView.swift",
