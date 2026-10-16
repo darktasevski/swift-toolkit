@@ -86,6 +86,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     let webView: WebView
     let locatorCommandBridge: EPUBLocatorCommandBridge
+    let externalLinkActivationBridge = EPUBExternalLinkActivationBridge()
 
     private var lastClick: ClickEvent?
 
@@ -154,6 +155,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         )
         locatorCommandBridge.install(in: config)
         self.locatorCommandBridge = locatorCommandBridge
+        externalLinkActivationBridge.install(in: config)
 
         // Disable the Apple Intelligence Writing tools in the web views.
         // See https://github.com/readium/swift-toolkit/issues/509#issuecomment-2577780749
@@ -167,6 +169,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         super.init(frame: .zero)
         locatorCommandBridge.onDecorationActivated = { [weak self] body in
             self?.decorationDidActivate(body)
+        }
+        externalLinkActivationBridge.onActivation = { [weak self] body in
+            self?.didActivateExternalLink(body)
         }
 
         isOpaque = false
@@ -212,6 +217,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         // Disable JS messages to break WKUserContentController reference.
         disableJSMessages()
         locatorCommandBridge.disableMessageHandler()
+        externalLinkActivationBridge.disableMessageHandler()
     }
 
     func setupWebView() {
@@ -256,6 +262,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         if superview != nil {
             enableJSMessages()
             locatorCommandBridge.enableMessageHandler()
+            externalLinkActivationBridge.enableMessageHandler()
             scrollView.delegate = self
         }
     }

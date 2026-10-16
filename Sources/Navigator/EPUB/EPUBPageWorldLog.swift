@@ -40,6 +40,8 @@ enum EPUBPageWorldLog: Loggable {
         case malformedDecorationActivationBody = "malformed_decoration_activation_body"
         /// An image activation body did not carry a usable `src`.
         case malformedImageActivationBody = "malformed_image_activation_body"
+        /// A link activation body did not carry a usable `href`.
+        case malformedLinkActivationBody = "malformed_link_activation_body"
         /// A scroll was requested to a progression outside `0...1`.
         case invalidScrollProgression = "invalid_scroll_progression"
 
@@ -56,6 +58,7 @@ enum EPUBPageWorldLog: Loggable {
             case .malformedSelectionBody,
                  .malformedDecorationActivationBody,
                  .malformedImageActivationBody,
+                 .malformedLinkActivationBody,
                  .invalidScrollProgression:
                 return .warning
             }
