@@ -4,6 +4,7 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getClientRectsNoOverlap } from "./rect";
+import { measureProgression } from "./progression";
 
 const LIMITS = Object.freeze({
   payloadBytes: 64 * 1024,
@@ -2119,6 +2120,22 @@ function acceptFrameCapability(token) {
   forwardCapabilityToChildFrames(token);
 }
 
+// Measures the viewport of the document holding `expectedCapability`, as
+// exactly `{ capability, first, last }`, or null. Only the document that was
+// issued that capability and has not revoked it on pagehide can answer, so the
+// result carries its own provenance. Read-only: it never scrolls, registers a
+// frame, or touches a command.
+function readProgression(expectedCapability) {
+  if (frameCapability === null || expectedCapability !== frameCapability) {
+    return null;
+  }
+  const range = measureProgression();
+  if (!range) {
+    return null;
+  }
+  return { capability: frameCapability, first: range.first, last: range.last };
+}
+
 // Receives a capability forwarded by the parent wrapper frame. Accepts it only
 // from a direct child of the top frame, over the same origin, and never
 // re-forwards it — so the resource frame registers while a nested grandchild or a
@@ -2176,5 +2193,10 @@ Object.defineProperty(globalThis, "readerLocatorCommands", {
   configurable: false,
   enumerable: false,
   writable: false,
-  value: Object.freeze({ execute, invalidate, acceptFrameCapability }),
+  value: Object.freeze({
+    execute,
+    invalidate,
+    acceptFrameCapability,
+    readProgression,
+  }),
 });

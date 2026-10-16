@@ -8,6 +8,7 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getCurrentSelection } from "./selection";
+import { measureProgression } from "./progression";
 
 window.addEventListener(
   "error",
@@ -94,37 +95,18 @@ function onScroll() {
     return;
   }
 
-  let root = document.scrollingElement;
-  if (isScrollModeEnabled() && !isVerticalWritingMode()) {
-    const scrollY = window.scrollY;
-    const viewportHeight = window.innerHeight;
-    const totalContentHeight = root.scrollHeight;
-    lastKnownProgressions = {
-      first: scrollY / totalContentHeight,
-      last: (scrollY + viewportHeight) / totalContentHeight,
-    };
-  } else {
-    let scrollX = window.scrollX;
-    const viewportWidth = window.innerWidth;
-    const totalContentWidth = root.scrollWidth;
-
-    if (isRTL()) {
-      scrollX = Math.abs(scrollX);
-    }
-    lastKnownProgressions = {
-      first: scrollX / totalContentWidth,
-      last: (scrollX + viewportWidth) / totalContentWidth,
-    };
-  }
-
-  // Window is hidden
-  if (root.scrollWidth === 0 || root.scrollHeight === 0) {
+  // Unmeasurable geometry, such as a hidden window, posts nothing.
+  lastKnownProgressions = measureProgression();
+  if (!lastKnownProgressions) {
     return;
   }
 
   if (!ticking) {
     window.requestAnimationFrame(function () {
-      notifyProgressions(lastKnownProgressions);
+      // A later event may have left the geometry unmeasurable since.
+      if (lastKnownProgressions) {
+        notifyProgressions(lastKnownProgressions);
+      }
       ticking = false;
     });
   }
