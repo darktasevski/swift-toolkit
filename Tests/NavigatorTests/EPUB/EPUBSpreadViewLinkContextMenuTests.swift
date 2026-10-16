@@ -36,11 +36,10 @@ final class EPUBSpreadViewLinkContextMenuTests: XCTestCase {
         XCTAssertNil(EPUBSpreadView.outboundLinkURL(for: nil, publicationBaseURL: base))
     }
 
-    /// Before the publication base exists, a link is treated as leaving, so the app's confirmation
-    /// sees it rather than WebKit's menu.
-    func testWithNoPublicationBaseALinkIsTreatedAsLeaving() throws {
-        let url = try XCTUnwrap(URL(string: "readium://publication/chapter2.xhtml"))
-        XCTAssertEqual(EPUBSpreadView.outboundLinkURL(for: url, publicationBaseURL: nil), url)
+    /// A `javascript:` link runs script rather than leaving; a tap on it is left alone too.
+    func testAJavascriptLinkHasNoMenu() throws {
+        let url = try XCTUnwrap(URL(string: "JavaScript:void(0)"))
+        XCTAssertNil(EPUBSpreadView.outboundLinkURL(for: url, publicationBaseURL: base))
     }
 
     func testTheOutboundMenuHasExactlyTheOneSuppliedItem() {
@@ -72,6 +71,19 @@ final class EPUBSpreadViewLinkContextMenuTests: XCTestCase {
 
     func testTheHookOffersNoConfigurationWithoutALink() {
         XCTAssertNil(makeSpreadView().linkContextMenuConfiguration(forLinkURL: nil))
+    }
+
+    /// The menu's item takes the tap path: the app's confirmation sees the link.
+    func testTheMenuItemHandsTheLinkOverAsATapWould() throws {
+        let spreadView = makeSpreadView()
+        let delegate = RecordingSpreadDelegate()
+        spreadView.delegate = delegate
+        let url = try XCTUnwrap(URL(string: "https://example.com/page"))
+
+        spreadView.openOutboundLink(url)
+
+        XCTAssertEqual(delegate.externalURLs, [url])
+        XCTAssertEqual(delegate.internalLinks, [])
     }
 
     /// The default an app sees when it does not override the key in its main bundle.

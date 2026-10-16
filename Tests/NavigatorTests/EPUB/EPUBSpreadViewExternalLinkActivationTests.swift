@@ -71,6 +71,20 @@ final class EPUBSpreadViewExternalLinkActivationTests: XCTestCase {
         XCTAssertFalse(logger.captured.contains { $0.contains("reason=malformed_link_activation_body") })
     }
 
+    /// The script judges "leaving" by scheme and host; the publication base has the last word, so a
+    /// URL inside the book that reaches here opens inside it rather than being handed over.
+    func testAnActivationInsideThePublicationOpensInsideIt() throws {
+        let spreadView = EPUBSpreadViewHosting.makeReflowableSpreadView(chapter: "<!doctype html><html><body>Chapter</body></html>")
+        let delegate = RecordingSpreadDelegate()
+        spreadView.delegate = delegate
+        let base = try XCTUnwrap(spreadView.viewModel.publicationBaseURL)
+
+        spreadView.didActivateExternalLink(["href": base.url.appendingPathComponent("chapter2.html").absoluteString])
+
+        XCTAssertEqual(delegate.internalLinks, ["chapter2.html"])
+        XCTAssertEqual(delegate.externalURLs, [])
+    }
+
     func testAMalformedActivationIsReportedAndHandsOverNothing() {
         let spreadView = EPUBSpreadViewHosting.makeReflowableSpreadView(chapter: "<!doctype html><html><body>Chapter</body></html>")
         let delegate = RecordingSpreadDelegate()

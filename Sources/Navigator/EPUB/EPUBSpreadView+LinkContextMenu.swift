@@ -10,15 +10,15 @@ import WebKit
 
 extension EPUBSpreadView {
     /// The link a long-press menu is offered for: one that leaves the publication. A URL the
-    /// publication base relativizes is internal and gets no menu — the navigation policy's test.
-    /// A tap is classified first in the page, by `external-link-activation.js`, against the
-    /// document's own scheme and host; the policy sees only what that script lets through. With no
-    /// base yet, the link is treated as leaving, which routes it to the app rather than to WebKit.
-    static func outboundLinkURL(for linkURL: URL?, publicationBaseURL: AbsoluteURL?) -> URL? {
-        guard let linkURL else {
-            return nil
-        }
-        if let publicationBaseURL, publicationBaseURL.relativize(linkURL) != nil {
+    /// publication base relativizes is internal and gets no menu — the test a tap ends in. A
+    /// `javascript:` link runs script rather than leaving, so it gets none either, as a tap on it
+    /// is left alone by `external-link-activation.js`.
+    static func outboundLinkURL(for linkURL: URL?, publicationBaseURL: AbsoluteURL) -> URL? {
+        guard
+            let linkURL,
+            linkURL.scheme?.lowercased() != "javascript",
+            publicationBaseURL.relativize(linkURL) == nil
+        else {
             return nil
         }
         return linkURL
@@ -49,12 +49,14 @@ extension EPUBSpreadView {
         }
         return UIContextMenuConfiguration(identifier: nil, previewProvider: nil) { [weak self] _ in
             Self.outboundLinkMenu(title: Self.outboundLinkMenuTitle) {
-                guard let self else {
-                    return
-                }
-                self.delegate?.spreadView(self, didTapOnExternalURL: url)
+                self?.openOutboundLink(url)
             }
         }
+    }
+
+    /// What the menu's one item does: the same as a tap on the link.
+    func openOutboundLink(_ url: URL) {
+        delegate?.spreadView(self, didTapOnExternalURL: url)
     }
 
     /// Replaces WebKit's link context menu. Returning `nil` would not suppress it for an `http(s)`
