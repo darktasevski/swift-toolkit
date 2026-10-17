@@ -27,7 +27,10 @@ final class EPUBSpreadReadinessTests: XCTestCase {
     func testEveryStateChangeIsReportedInOrder() throws {
         let readiness = EPUBSpreadReadiness()
         var reported: [EPUBSpreadReadiness.State] = []
-        readiness.onStateChange = { reported.append($0) }
+        readiness.onStateChange = { [unowned readiness] in
+            XCTAssertEqual(readiness.state, $0, "Reported before the change was made")
+            reported.append($0)
+        }
         let capability = EPUBSpreadFrameCapability(id: UUID())
 
         let generation = readiness.beginLoading()

@@ -410,8 +410,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         var phase: Phase
     }
 
-    /// Arms the location transport's deadlines. Location observation shares
-    /// it, so its read deadlines and the transport's run on one clock.
+    /// Arms the location transport's and the hand-off's deadlines. Location
+    /// observation shares it, so its deadlines and the transport's run on one
+    /// clock.
     let deadlineScheduler: EPUBDeadlineScheduler
     private let invokeLocationScript: LocationScriptInvocation
     /// The one physical reflowable capability injection or progression read
@@ -420,14 +421,15 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private var handshake: HandshakeAttempt?
     private var lastHandshakeID = 0
 
-    /// Called after a frame registers under the current capability.
+    /// Called after a frame registering under the current capability becomes
+    /// the selected one.
     var onFrameRegistered: (@MainActor (EPUBSpreadFrameCapability) -> Void)?
     /// Called with the location transport's closed, content-free outcomes.
     var onLocationTransportEvent: (@MainActor (EPUBLocationTransportEvent) -> Void)?
 
     /// - Parameters:
-    ///   - deadlineScheduler: arms the location transport's deadlines; derived
-    ///     from `clock` unless a test supplies its own.
+    ///   - deadlineScheduler: arms the location transport's and the hand-off's
+    ///     deadlines; derived from `clock` unless a test supplies its own.
     ///   - invokeLocationScript: reaches WebKit for location reporting; replaced
     ///     by a test to hold a call open and complete it on demand.
     @MainActor

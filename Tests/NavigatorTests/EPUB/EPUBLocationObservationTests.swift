@@ -528,14 +528,82 @@ final class EPUBLocationObservationTests: XCTestCase {
         fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
         XCTAssertEqual(fixture.reissued, [fixture.capability])
 
+        fixture.observation.hint()
         fixture.observation.handshakeDidFail(for: fixture.capability)
-        XCTAssertEqual(fixture.observation.unavailability, .registrationMissing)
+        XCTAssertTrue(fixture.observation.isRegistrationMissing)
+        XCTAssertEqual(fixture.deadlines.armedCount, 0, "The missing hand-off left the hint window armed")
+        fixture.observation.request()
+        fixture.observation.hint()
+        XCTAssertEqual(fixture.deadlines.armedCount, 0, "A hint armed a window while the hand-off was missing")
         fixture.deadlines.advance(by: .seconds(30))
         XCTAssertEqual(fixture.reissued, [fixture.capability])
+        XCTAssertEqual(fixture.reads.count, 0, "A read started while the hand-off was missing")
 
         fixture.nextStart = .frameUnavailable
         fixture.observation.grant(.visibility)
         XCTAssertEqual(fixture.reissued, [fixture.capability, fixture.capability])
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
+
+        // The grant restored the re-issue, so the next failure waits out the gap.
+        fixture.observation.handshakeDidFail(for: fixture.capability)
+        XCTAssertFalse(fixture.observation.isRegistrationMissing, "The grant left the re-issue spent")
+        fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
+        XCTAssertEqual(fixture.reissued, [fixture.capability, fixture.capability, fixture.capability])
+    }
+
+    /// A hand-off failing twice while a hung read holds the slot keeps that
+    /// read's reason: a grant re-issues the hand-off, and only the late
+    /// completion reads again.
+    func test_aMissingHandshakeKeepsAPendingOperation() {
+        let fixture = ObservationFixture()
+        fixture.observation.request()
+        fixture.answer(0, .expired)
+        failHandshakeTwice(fixture)
+        XCTAssertEqual(fixture.observation.unavailability, .operationPending)
+        XCTAssertTrue(fixture.observation.isRegistrationMissing)
+
+        fixture.observation.grant(.visibility)
+
+        XCTAssertEqual(fixture.reissued, [fixture.capability, fixture.capability])
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
+        XCTAssertEqual(fixture.observation.unavailability, .operationPending, "The hand-off's grant ended the hung read's wait")
+        XCTAssertEqual(fixture.startedReads, 1, "A read started beside the hung one")
+        fixture.observation.grant(.lateCompletion)
+        XCTAssertEqual(fixture.startedReads, 2)
+    }
+
+    /// A provenance failure outlives a missing hand-off's grant: only a
+    /// registration renews authority.
+    func test_aMissingHandshakeKeepsAProvenanceFailureForARegistration() {
+        let fixture = ObservationFixture()
+        fixture.observation.request()
+        fixture.answer(0, .invalid)
+        failHandshakeTwice(fixture)
+
+        fixture.observation.grant(.commandSettlement)
+
+        XCTAssertEqual(fixture.reissued, [fixture.capability, fixture.capability])
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
+        XCTAssertEqual(fixture.observation.unavailability, .invalidProvenance, "The hand-off's grant renewed provenance")
+        XCTAssertEqual(fixture.startedReads, 1)
+        fixture.observation.grant(.registration)
+        XCTAssertEqual(fixture.startedReads, 2)
+    }
+
+    /// A registration completes a missing hand-off and renews provenance at
+    /// once, with nothing left to re-issue.
+    func test_aRegistrationEndsAMissingHandshakeAndAProvenanceFailure() {
+        let fixture = ObservationFixture()
+        fixture.observation.request()
+        fixture.answer(0, .invalid)
+        failHandshakeTwice(fixture)
+
+        fixture.observation.grant(.registration)
+
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
+        XCTAssertNil(fixture.observation.unavailability)
+        XCTAssertEqual(fixture.reissued, [fixture.capability], "A registration re-issued the hand-off it completed")
+        XCTAssertEqual(fixture.startedReads, 2)
     }
 
     func test_aRegistrationRestoresTheHandshakeRetry() {
@@ -546,7 +614,7 @@ final class EPUBLocationObservationTests: XCTestCase {
         fixture.observation.grant(.registration)
         fixture.observation.handshakeDidFail(for: fixture.capability)
 
-        XCTAssertNil(fixture.observation.unavailability)
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
         fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
         XCTAssertEqual(fixture.reissued, [fixture.capability, fixture.capability])
     }
@@ -561,7 +629,7 @@ final class EPUBLocationObservationTests: XCTestCase {
         XCTAssertEqual(fixture.reissued, [])
 
         fixture.observation.handshakeDidFail(for: fixture.capability)
-        XCTAssertNil(fixture.observation.unavailability, "The other document's failure spent the re-issue")
+        XCTAssertFalse(fixture.observation.isRegistrationMissing, "The other document's failure spent the re-issue")
         fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
         XCTAssertEqual(fixture.reissued, [fixture.capability])
     }
@@ -661,7 +729,7 @@ final class EPUBLocationObservationTests: XCTestCase {
         fixture.documentCapability = next
         fixture.observation.handshakeDidFail(for: next)
 
-        XCTAssertNil(fixture.observation.unavailability, "The previous document's re-issue was counted")
+        XCTAssertFalse(fixture.observation.isRegistrationMissing, "The previous document's re-issue was counted")
         fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
         XCTAssertEqual(fixture.reissued, [fixture.capability, next])
     }
@@ -691,6 +759,15 @@ final class EPUBLocationObservationTests: XCTestCase {
 }
 
 // MARK: - Fixtures
+
+/// Fails the current document's hand-off, lets its one re-issue run, then
+/// fails that too.
+@MainActor
+private func failHandshakeTwice(_ fixture: ObservationFixture) {
+    fixture.observation.handshakeDidFail(for: fixture.capability)
+    fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
+    fixture.observation.handshakeDidFail(for: fixture.capability)
+}
 
 /// An observation whose eligibility, read starts and answers the test sets.
 @MainActor

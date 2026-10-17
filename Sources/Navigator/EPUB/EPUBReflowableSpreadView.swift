@@ -39,6 +39,20 @@ final class EPUBScrollAnimationCoordinator {
         pendingRequest != nil
     }
 
+    // Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`):
+    // lets a test tell the scroll-quiet signal from the fallback timer.
+    #if RENDER_FAITHFUL_NAV_TESTING
+        enum Settlement: Equatable {
+            /// `finish()` ended it: the scroll-quiet signal, or teardown.
+            case finished
+            /// The fallback timer ended it.
+            case fellBack
+        }
+
+        /// How the last wait that was still pending ended.
+        private(set) var lastSettlement: Settlement?
+    #endif
+
     func waitUntilSettled() async {
         let requestID = UUID()
         await withTaskCancellationHandler {
@@ -56,7 +70,7 @@ final class EPUBScrollAnimationCoordinator {
                 Task { @MainActor [weak self, weak request] in
                     try? await Task.sleep(seconds: 0.8)
                     guard let self, let request else { return }
-                    finish(request)
+                    fallBack(request)
                 }
             }
         } onCancel: {
@@ -82,8 +96,20 @@ final class EPUBScrollAnimationCoordinator {
         return pendingRequest
     }
 
-    func finish(_ request: Request? = nil) {
-        takePendingRequest(matching: request)?.resume()
+    func finish() {
+        guard let request = takePendingRequest() else { return }
+        #if RENDER_FAITHFUL_NAV_TESTING
+            lastSettlement = .finished
+        #endif
+        request.resume()
+    }
+
+    private func fallBack(_ request: Request) {
+        guard let request = takePendingRequest(matching: request) else { return }
+        #if RENDER_FAITHFUL_NAV_TESTING
+            lastSettlement = .fellBack
+        #endif
+        request.resume()
     }
 }
 
@@ -98,7 +124,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var bottomConstraint: NSLayoutConstraint!
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
-    private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
+    let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
     private final class PositionCommandOwnership {
         var isSupersessionAcknowledged = false
     }
@@ -111,8 +137,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var activePositionCommand: PositionCommandEntry?
 
     /// Built on first use: the base initializer's first load reports readiness
-    /// before this class could assign it. Teardown never builds it, since a
-    /// `deinit` cannot form the weak references its closures hold.
+    /// before this class could assign it. A `deinit` never builds it, since the
+    /// hooks reach the spread through weak references that are nil by then.
     private(set) var builtLocationObservation: EPUBLocationObservation?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
@@ -1027,8 +1053,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         }
     }
 
-    /// The page posts this on scroll. Its numbers are page-world claims, so
-    /// they are ignored: the message only asks for a measurement.
+    /// The page posts this on scroll and after a resize. Its numbers are
+    /// page-world claims, so they are ignored: the message only asks for a
+    /// measurement.
     private func progressionDidChange(_ body: Any) {
         locationObservation.hint()
         setNeedsScrollQuietSignal()

@@ -526,8 +526,6 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: 0 ... (1.0 / 3))))
     }
 
-    // MARK: - Page-world scroll hint
-
     // MARK: - Settlement signals in a real reader
 
     /// Any page script can post `progressionChanged`, with any numbers. They
@@ -547,7 +545,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         )
 
         await fulfillment(of: [forged], timeout: Self.quietWindow)
-        XCTAssertNotNil(observation.currentObservation, "The message did not ask for a measurement")
+        try await reader.waitFor("the measurement the message asked for") { observation.currentObservation != nil }
         XCTAssertEqual(
             spread.progression(in: spread.spread.first.index).lowerBound,
             settled.firstProgression,
@@ -557,7 +555,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     }
 
     /// Only the scene showing the reader measures again when it becomes
-    /// active; another scene's activation leaves it alone.
+    /// active; an activation from any other sender leaves it alone.
     func test_onlyTheOwningSceneBecomingActiveMeasuresAgain() async throws {
         let reader = try await openReader()
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
@@ -565,16 +563,19 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let scene = try XCTUnwrap(reader.window.windowScene, "Setup: the reader's window has no scene")
         observation.invalidate()
 
-        // Delivered by hand, not posted: a posted activation reaches every
-        // observer in the test host. A grant starts a read or retains an
+        // Delivered by hand: posting an activation whose object is not a
+        // scene aborted the test host. A grant starts a read or retains an
         // obligation at once.
         spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: NSObject()))
+        spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: nil))
         XCTAssertFalse(observation.isReading || observation.hasObligation, "Another sender's activation measured the reader")
 
         spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: scene))
         XCTAssertTrue(observation.isReading || observation.hasObligation, "The owning scene's activation asked for nothing")
         try await reader.waitFor("a fresh measurement") { observation.currentObservation != nil }
     }
+
+    // MARK: - Page-world scroll hint
 
     /// Scroll events within one frame coalesce into a single hint carrying the
     /// latest measurement.

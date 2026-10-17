@@ -279,7 +279,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     /// ownership, so the base does nothing.
     func readinessDidChange(_ state: EPUBSpreadReadiness.State) {}
 
-    /// Told when a frame registers under the current capability.
+    /// Told when a frame registering under the current capability becomes the
+    /// selected one.
     func frameDidRegister(_ capability: EPUBSpreadFrameCapability) {}
 
     /// Told of the location transport's outcomes.

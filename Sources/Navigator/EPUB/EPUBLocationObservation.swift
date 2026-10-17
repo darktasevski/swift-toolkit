@@ -74,7 +74,9 @@ enum EPUBProgressionReadOutcome: Equatable, Sendable {
     }
 }
 
-/// Why location observation waits for a recovery grant instead of reading.
+/// Why reads wait for a recovery grant. A missing hand-off is a separate fact
+/// (`EPUBLocationObservation.isRegistrationMissing`), so neither erases the
+/// other.
 enum EPUBObservationUnavailability: Equatable, Sendable {
     /// A read outlived its deadline and still holds the transport.
     case operationPending
@@ -84,8 +86,6 @@ enum EPUBObservationUnavailability: Equatable, Sendable {
     /// A read answered malformed or for a capability it was not dispatched
     /// under.
     case invalidProvenance
-    /// The capability hand-off failed, and so did its one re-issue.
-    case registrationMissing
 }
 
 /// What the spread's live state allows observation to do right now.
@@ -105,7 +105,8 @@ enum EPUBObservationGrant: Equatable, Sendable {
     case visibility
     /// The latest position command settled.
     case commandSettlement
-    /// A frame registered under the current capability.
+    /// A frame registered under the current capability and became the
+    /// selected one.
     case registration
     /// A transport call that outlived its deadline, a read or a hand-off
     /// injection, finally completed.
@@ -119,15 +120,15 @@ enum EPUBObservationGrant: Equatable, Sendable {
             self == .lateCompletion
         case .invalidProvenance:
             self == .registration
-        case .readFailed, .registrationMissing:
+        case .readFailed:
             true
         }
     }
 }
 
-/// An accepted sample and its geometry stamp. The stamp changes only when the
-/// measured range does, so an equal sample does not invalidate work already
-/// computed from it.
+/// An accepted sample and its geometry stamp. The stamp names the sample, its
+/// range and capability: an equal sample keeps it across any invalidation. It
+/// is identity, not currency.
 struct EPUBAcceptedObservation: Equatable, Sendable {
     let sample: EPUBProgressionSample
     let stamp: UInt64
@@ -142,9 +143,10 @@ struct EPUBAcceptedObservation: Equatable, Sendable {
 /// window. A returned transient failure gets one retry after 300 ms, within
 /// 10,300 ms of the first attempt; after that, or after a read outlives its
 /// deadline or answers with invalid provenance, observation waits unavailable,
-/// with no read timer and ignoring hints, for a grant. Physical occupancy
+/// with no read timer and ignoring hints, for a grant. A hand-off that fails
+/// twice waits the same way, apart from any read's reason. Physical occupancy
 /// stays the transport's: a refused start keeps the obligation until the slot
-/// or a registration frees.
+/// frees or a frame registers.
 @MainActor
 final class EPUBLocationObservation {
     typealias Read = @MainActor (
@@ -202,6 +204,9 @@ final class EPUBLocationObservation {
     }
 
     private(set) var unavailability: EPUBObservationUnavailability?
+    /// The capability hand-off failed, and so did its one re-issue. Reads wait
+    /// until a grant re-issues it or a frame registers.
+    private(set) var isRegistrationMissing = false
     /// The accepted sample, until an authoritative invalidation revokes it.
     private(set) var currentObservation: EPUBAcceptedObservation?
 
@@ -246,7 +251,7 @@ final class EPUBLocationObservation {
     /// A page hint asks for one measurement at the end of a fixed window that
     /// later hints neither extend nor restart. Ignored while unavailable.
     func hint() {
-        guard hintWindowDeadline == nil, unavailability == nil else {
+        guard hintWindowDeadline == nil, unavailability == nil, !isRegistrationMissing else {
             return
         }
         armHintWindow()
@@ -260,19 +265,16 @@ final class EPUBLocationObservation {
     /// Grants one recovery cycle and asks for a measurement. It never bypasses
     /// an occupied transport, and ends only an unavailability it can resolve.
     /// A read already outstanding becomes the granted cycle's first attempt,
-    /// so that cycle starts now. While the hand-off is `.registrationMissing`,
-    /// any grant but the registration itself re-issues it.
+    /// so that cycle starts now. A missing hand-off ends with any grant: the
+    /// registration completes it, and every other grant re-issues it.
     func grant(_ grant: EPUBObservationGrant) {
-        if unavailability == .registrationMissing, grant != .registration,
-           let capability = documentCapability()
-        {
-            handshakeRetryUsed = false
-            reissueHandshake(capability)
-        }
         if grant == .registration {
-            handshakeRetryUsed = false
-            handshakeRetryDeadline?.cancel()
-            handshakeRetryDeadline = nil
+            endHandshakeRecovery()
+        } else if isRegistrationMissing {
+            endHandshakeRecovery()
+            if let capability = documentCapability() {
+                reissueHandshake(capability)
+            }
         }
         if unavailability.map({ grant.ends($0) }) ?? true {
             unavailability = nil
@@ -282,14 +284,15 @@ final class EPUBLocationObservation {
     }
 
     /// The hand-off of `capability` ended without a registration. The current
-    /// document's gets one re-issue after the retry gap; a second failure waits
-    /// unavailable for a grant.
+    /// document's gets one re-issue after the retry gap; a second failure stops
+    /// reads until a grant, keeping any read's own reason.
     func handshakeDidFail(for capability: EPUBSpreadFrameCapability) {
         guard capability == documentCapability() else {
             return
         }
         guard !handshakeRetryUsed else {
-            becomeUnavailable(.registrationMissing)
+            isRegistrationMissing = true
+            cancelReadTimers()
             return
         }
         handshakeRetryUsed = true
@@ -309,13 +312,19 @@ final class EPUBLocationObservation {
         hasObligation = false
         active = nil
         cancelReadTimers()
-        handshakeRetryDeadline?.cancel()
-        handshakeRetryDeadline = nil
+        endHandshakeRecovery()
         cycle = RecoveryCycle()
-        handshakeRetryUsed = false
         unavailability = nil
         currentObservation = nil
         latestAccepted = nil
+    }
+
+    /// No re-issue pending and the re-issue allowance restored.
+    private func endHandshakeRecovery() {
+        handshakeRetryDeadline?.cancel()
+        handshakeRetryDeadline = nil
+        handshakeRetryUsed = false
+        isRegistrationMissing = false
     }
 
     // MARK: - Dispatch
@@ -334,6 +343,7 @@ final class EPUBLocationObservation {
             hasObligation,
             active == nil,
             unavailability == nil,
+            !isRegistrationMissing,
             retryDeadline == nil
         else {
             return
@@ -424,9 +434,10 @@ final class EPUBLocationObservation {
         }
     }
 
-    /// Authority changed under the read, so its answer, success or transient
-    /// failure, says nothing about what is shown now. That is not a failure:
-    /// the cycle restarts and the obligation is tried again when eligible.
+    /// Authority changed under the read, the bridge cancelled it, or the spread
+    /// stopped being eligible: its answer says nothing about what is shown now.
+    /// That is not a failure: the cycle restarts and the obligation is tried
+    /// again when eligible.
     private func restartAfterStaleRead() {
         hasObligation = true
         cycle = RecoveryCycle()

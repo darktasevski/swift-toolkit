@@ -174,6 +174,29 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertTrue(spreadView.readiness.isCommandReady)
     }
 
+    /// An animated turn's writer lease holds readiness in `.initializing`
+    /// while it waits, and the scroll-quiet signal, not the fallback timer,
+    /// ends that wait. The page scrolls instantly, so the signal's timing does
+    /// not depend on how long WebKit animates.
+    func testAnimatedReflowablePageTurnSettlesOnTheScrollQuietSignal() async throws {
+        let spreadView = makeReflowableSpreadView()
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await initializeReflowableSpread(spreadView)
+        try await makeSmoothScrollsInstant(in: spreadView)
+        let coordinator = spreadView.scrollAnimationCoordinator
+
+        let turn = Task { @MainActor in
+            await spreadView.go(to: .right, options: NavigatorGoOptions(animated: true))
+        }
+        try await waitUntil { coordinator.hasPendingRequest }
+        XCTAssertFalse(spreadView.readiness.isCommandReady, "The turn waited without holding readiness")
+        let outcome = await turn.value
+
+        XCTAssertEqual(outcome, .succeeded)
+        XCTAssertEqual(coordinator.lastSettlement, .finished, "The fallback timer ended the wait")
+    }
+
     func testReflowablePageTurnAtBoundaryReturnsBoundaryAndRemainsReady() async throws {
         let spreadView = makeReflowableSpreadView()
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
@@ -820,11 +843,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
     // MARK: - Location observation
 
-    // A spread outside a view hierarchy receives no page-world messages, so
-    // no page hint can stand in for the signal each test below exercises.
+    // These spreads stay out of a view hierarchy and are initialized by hand,
+    // so the bridge holds a capability only once a test hands one over. The
+    // page still posts its own hints when it scrolls or resizes; no test below
+    // relies on their absence.
 
     /// A spread ready before its frame registers keeps the obligation, and the
-    /// registration alone produces the report.
+    /// hand-off reports it: the freed transport slot or the registration,
+    /// whichever finds the frame selectable first, starts the read.
     func testARegistrationAfterReadinessReportsTheMeasuredViewport() async throws {
         let (spreadView, delegate) = try await loadObservedReflowableSpread()
         let capability = EPUBSpreadFrameCapability()
@@ -832,8 +858,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .succeeded)
         try await waitUntil { spreadView.readiness.isCommandReady }
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
-        XCTAssertEqual(delegate.pageChanges, 0, "A read answered before the frame registered")
-        XCTAssertTrue(observation.hasObligation)
+        XCTAssertTrue(observation.hasObligation, "A read refused for an unregistered frame dropped its obligation")
+        XCTAssertFalse(observation.isReading)
 
         spreadView.locatorCommandBridge.setFrameCapability(capability)
 
@@ -842,18 +868,24 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     }
 
     /// A frame that registers while initialization still holds readiness is
-    /// read once the spread becomes ready.
+    /// not read, even once the hand-off frees the transport, until the spread
+    /// becomes ready.
     func testARegistrationBeforeReadinessReportsOnceTheSpreadIsReady() async throws {
         let (spreadView, delegate) = try await loadObservedReflowableSpread()
         let registrations = RegistrationRecorder(spreadView.locatorCommandBridge)
+        let freedSlots = FreedSlotRecorder(spreadView.locatorCommandBridge)
         let capability = EPUBSpreadFrameCapability()
         let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
             for: spreadView.readiness.generation,
             frameCapability: capability
         ))
         spreadView.locatorCommandBridge.setFrameCapability(capability)
-        try await waitUntil { registrations.capabilities == [capability] }
-        XCTAssertEqual(delegate.pageChanges, 0, "A read answered while initialization held readiness")
+        try await waitUntil { registrations.capabilities == [capability] && freedSlots.count > 0 }
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        XCTAssertTrue(observation.hasObligation, "The registration asked for no measurement")
+        XCTAssertFalse(observation.isReading, "A read started while initialization held readiness")
+        XCTAssertNil(observation.currentObservation, "A read was accepted while initialization held readiness")
+        XCTAssertEqual(delegate.pageChanges, 0)
 
         spreadView.applySettings()
         let outcome = await spreadView.initializeSpread()
@@ -869,12 +901,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     func testACommandThatDoesNotMoveStillReportsItsSettledViewport() async throws {
         let (spreadView, delegate) = try await openObservedReflowableSpread()
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let before = try XCTUnwrap(observation.currentObservation)
         let reports = delegate.pageChanges
 
         let outcome = await spreadView.go(to: .start, animated: false)
 
         XCTAssertEqual(outcome, .succeeded)
         try await waitUntil { observation.currentObservation != nil }
+        XCTAssertEqual(observation.currentObservation, before, "The command moved the viewport")
         XCTAssertGreaterThan(delegate.pageChanges, reports)
     }
 
@@ -906,11 +940,11 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
         report(.handshakeFailed(capability, .registrationMissing))
         report(.handshakeFailed(capability, .registrationMissing))
-        XCTAssertEqual(observation.unavailability, .registrationMissing)
+        XCTAssertTrue(observation.isRegistrationMissing)
 
         spreadView.locatorCommandBridge.setFrameCapability(capability)
 
-        try await waitUntil { observation.unavailability == nil }
+        try await waitUntil { !observation.isRegistrationMissing }
     }
 
     /// A new document's hand-off gets a re-issue of its own, whatever the
@@ -927,7 +961,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         _ = try XCTUnwrap(spreadView.readiness.beginInitialization(for: generation, frameCapability: next))
         report(.handshakeFailed(next, .registrationMissing))
 
-        XCTAssertNil(observation.unavailability, "The previous document's re-issue was counted")
+        XCTAssertFalse(observation.isRegistrationMissing, "The previous document's re-issue was counted")
     }
 
     /// A same-document mutation revokes the sample while it runs, and the
@@ -955,10 +989,10 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
         report(.handshakeFailed(capability, .registrationMissing))
         report(.handshakeFailed(capability, .registrationMissing))
-        XCTAssertEqual(observation.unavailability, .registrationMissing)
+        XCTAssertTrue(observation.isRegistrationMissing)
 
         report(.lateCompletion)
-        XCTAssertNil(observation.unavailability, "The grant left the hand-off unavailable")
+        XCTAssertFalse(observation.isRegistrationMissing, "The grant left the hand-off missing")
         try await waitUntil { registrations.capabilities.contains(capability) }
     }
 
@@ -1281,6 +1315,21 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     private func enableAnimationFrames(in spreadView: EPUBSpreadView) async throws {
         _ = try await spreadView.webView.callAsyncJavaScript(
             "window.requestAnimationFrame = callback => setTimeout(() => callback(performance.now()), 0); return true;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+    }
+
+    /// Page turns ask for a smooth scroll; this makes the page perform it at
+    /// once, keeping the request itself.
+    private func makeSmoothScrollsInstant(in spreadView: EPUBSpreadView) async throws {
+        _ = try await spreadView.webView.callAsyncJavaScript(
+            """
+            const scrollBy = window.scrollBy.bind(window);
+            window.scrollBy = options => scrollBy({ ...options, behavior: 'instant' });
+            return true;
+            """,
             arguments: [:],
             in: nil,
             contentWorld: .page
@@ -1656,6 +1705,23 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: KeyEvent) {}
     func spreadViewDidTerminate() {}
+}
+
+/// Counts the freed-slot wake-ups a bridge reports, then hands every transport
+/// event to the hook the spread installed, so the spread still hears them.
+@MainActor
+private final class FreedSlotRecorder {
+    private(set) var count = 0
+
+    init(_ bridge: EPUBLocatorCommandBridge) {
+        let installed = bridge.onLocationTransportEvent
+        bridge.onLocationTransportEvent = { [weak self] event in
+            if event == .slotAvailable {
+                self?.count += 1
+            }
+            installed?(event)
+        }
+    }
 }
 
 /// Records the capabilities a bridge reports registered, then hands each to
