@@ -122,7 +122,15 @@ final class EPUBSpreadReadiness {
         let continuation: CheckedContinuation<WaitOutcome, Never>
     }
 
-    private(set) var state: State = .unavailable(generation: 0)
+    /// Told of every state change once it is made. A consumer must not mutate
+    /// readiness from it.
+    var onStateChange: (@MainActor (State) -> Void)?
+
+    private(set) var state: State = .unavailable(generation: 0) {
+        didSet {
+            onStateChange?(state)
+        }
+    }
 
     private var activeWriterLeaseIDs: Set<UUID> = []
     private var initializingFrameCapability: EPUBSpreadFrameCapability?

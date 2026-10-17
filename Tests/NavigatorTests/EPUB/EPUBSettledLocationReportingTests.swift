@@ -528,6 +528,54 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     // MARK: - Page-world scroll hint
 
+    // MARK: - Settlement signals in a real reader
+
+    /// Any page script can post `progressionChanged`, with any numbers. They
+    /// are never reported: the message only asks the spread to measure.
+    func test_aPageWorldProgressionMessageIsMeasuredNotTrusted() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        let settled = try await reader.requireGeometry()
+        observation.invalidate()
+        let forged = reader.spy.expectNoLocation("report of the page world's numbers") {
+            ($0.locations.progression ?? 0) > 0.5
+        }
+
+        _ = try await spread.webView.evaluateJavaScript(
+            "webkit.messageHandlers.progressionChanged.postMessage({first: 0.9, last: 0.95}); true"
+        )
+
+        await fulfillment(of: [forged], timeout: Self.quietWindow)
+        XCTAssertNotNil(observation.currentObservation, "The message did not ask for a measurement")
+        XCTAssertEqual(
+            spread.progression(in: spread.spread.first.index).lowerBound,
+            settled.firstProgression,
+            accuracy: 0.000_001,
+            "The spread reported the page world's numbers"
+        )
+    }
+
+    /// Only the scene showing the reader measures again when it becomes
+    /// active; another scene's activation leaves it alone.
+    func test_onlyTheOwningSceneBecomingActiveMeasuresAgain() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        let scene = try XCTUnwrap(reader.window.windowScene, "Setup: the reader's window has no scene")
+        observation.invalidate()
+
+        // Delivered by hand, not posted: a posted activation reaches every
+        // observer in the test host. A grant starts a read or retains an
+        // obligation at once.
+        spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: NSObject()))
+        XCTAssertFalse(observation.isReading || observation.hasObligation, "Another sender's activation measured the reader")
+
+        spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: scene))
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "The owning scene's activation asked for nothing")
+        try await reader.waitFor("a fresh measurement") { observation.currentObservation != nil }
+    }
+
     /// Scroll events within one frame coalesce into a single hint carrying the
     /// latest measurement.
     func test_scrollHintPostsTheLatestMeasurementOncePerFrame() async throws {
@@ -805,6 +853,20 @@ private struct Reader {
     func requireGeometry() async throws -> PageGeometry {
         let measured = try await geometry()
         return try XCTUnwrap(measured, "Setup: the current spread's geometry is not measurable")
+    }
+
+    /// Polls until `condition` holds, failing with `description` otherwise.
+    func waitFor(_ description: String, until condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while clock.now < deadline {
+            if condition() {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Timed out waiting for \(description)")
+        throw SetupTimeout()
     }
 
     /// Waits for the DOM to show the turn actually moved the viewport, so a

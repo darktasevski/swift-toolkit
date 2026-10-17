@@ -168,6 +168,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         locatorCommandBridge.onDecorationActivated = { [weak self] body in
             self?.decorationDidActivate(body)
         }
+        // Installed before the first load, so a subclass hears every readiness
+        // change and registration of its first document.
+        readiness.onStateChange = { [weak self] state in
+            self?.readinessDidChange(state)
+        }
+        locatorCommandBridge.onFrameRegistered = { [weak self] capability in
+            self?.frameDidRegister(capability)
+        }
+        locatorCommandBridge.onLocationTransportEvent = { [weak self] event in
+            self?.locationTransportDidReport(event)
+        }
 
         isOpaque = false
         backgroundColor = .clear
@@ -263,6 +274,16 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     func loadSpread() {
         fatalError("loadSpread() must be implemented in subclasses")
     }
+
+    /// Told of each readiness change. Fixed layout keeps its own geometry
+    /// ownership, so the base does nothing.
+    func readinessDidChange(_ state: EPUBSpreadReadiness.State) {}
+
+    /// Told when a frame registers under the current capability.
+    func frameDidRegister(_ capability: EPUBSpreadFrameCapability) {}
+
+    /// Told of the location transport's outcomes.
+    func locationTransportDidReport(_ event: EPUBLocationTransportEvent) {}
 
     /// Starts the generation before issuing an owned main-frame load. WebKit's
     /// provisional-navigation callback then validates and associates the
@@ -1163,6 +1184,14 @@ extension EPUBSpreadView: UIScrollViewDelegate {
     }
 
     func scrollViewDidScroll(_ scrollView: UIScrollView) {
+        // Do not remove, overridden in subclasses.
+    }
+
+    func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
+        // Do not remove, overridden in subclasses.
+    }
+
+    func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
         // Do not remove, overridden in subclasses.
     }
 }

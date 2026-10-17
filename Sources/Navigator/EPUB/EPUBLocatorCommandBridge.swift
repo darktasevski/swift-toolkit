@@ -410,7 +410,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         var phase: Phase
     }
 
-    private let deadlineScheduler: EPUBDeadlineScheduler
+    /// Arms the location transport's deadlines. Location observation shares
+    /// it, so its read deadlines and the transport's run on one clock.
+    let deadlineScheduler: EPUBDeadlineScheduler
     private let invokeLocationScript: LocationScriptInvocation
     /// The one physical reflowable capability injection or progression read
     /// this web view may have outstanding.

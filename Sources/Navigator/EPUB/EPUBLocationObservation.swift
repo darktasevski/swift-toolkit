@@ -196,6 +196,11 @@ final class EPUBLocationObservation {
     private var lastStamp: UInt64 = 0
     private var latestAccepted: EPUBAcceptedObservation?
 
+    /// Whether a read this observation started is still awaiting its answer.
+    var isReading: Bool {
+        active != nil
+    }
+
     private(set) var unavailability: EPUBObservationUnavailability?
     /// The accepted sample, until an authoritative invalidation revokes it.
     private(set) var currentObservation: EPUBAcceptedObservation?

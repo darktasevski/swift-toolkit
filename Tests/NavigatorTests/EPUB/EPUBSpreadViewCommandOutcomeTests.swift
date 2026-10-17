@@ -818,6 +818,208 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .cancelled)
     }
 
+    // MARK: - Location observation
+
+    // A spread outside a view hierarchy receives no page-world messages, so
+    // no page hint can stand in for the signal each test below exercises.
+
+    /// A spread ready before its frame registers keeps the obligation, and the
+    /// registration alone produces the report.
+    func testARegistrationAfterReadinessReportsTheMeasuredViewport() async throws {
+        let (spreadView, delegate) = try await loadObservedReflowableSpread()
+        let capability = EPUBSpreadFrameCapability()
+        let outcome = try await initializeLoadedReflowableSpread(spreadView, frameCapability: capability)
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { spreadView.readiness.isCommandReady }
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        XCTAssertEqual(delegate.pageChanges, 0, "A read answered before the frame registered")
+        XCTAssertTrue(observation.hasObligation)
+
+        spreadView.locatorCommandBridge.setFrameCapability(capability)
+
+        try await waitUntil { delegate.pageChanges > 0 }
+        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
+    }
+
+    /// A frame that registers while initialization still holds readiness is
+    /// read once the spread becomes ready.
+    func testARegistrationBeforeReadinessReportsOnceTheSpreadIsReady() async throws {
+        let (spreadView, delegate) = try await loadObservedReflowableSpread()
+        let registrations = RegistrationRecorder(spreadView.locatorCommandBridge)
+        let capability = EPUBSpreadFrameCapability()
+        let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
+            for: spreadView.readiness.generation,
+            frameCapability: capability
+        ))
+        spreadView.locatorCommandBridge.setFrameCapability(capability)
+        try await waitUntil { registrations.capabilities == [capability] }
+        XCTAssertEqual(delegate.pageChanges, 0, "A read answered while initialization held readiness")
+
+        spreadView.applySettings()
+        let outcome = await spreadView.initializeSpread()
+        spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
+        XCTAssertEqual(outcome, .succeeded)
+
+        try await waitUntil { delegate.pageChanges > 0 }
+        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
+    }
+
+    /// A command that leaves the viewport where it was moves nothing a hint
+    /// could report, yet its settlement alone measures the viewport again.
+    func testACommandThatDoesNotMoveStillReportsItsSettledViewport() async throws {
+        let (spreadView, delegate) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let reports = delegate.pageChanges
+
+        let outcome = await spreadView.go(to: .start, animated: false)
+
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { observation.currentObservation != nil }
+        XCTAssertGreaterThan(delegate.pageChanges, reports)
+    }
+
+    /// Admission revokes the accepted sample at once, before the command's
+    /// writer moves readiness.
+    func testACommandRevokesTheAcceptedSampleOnAdmission() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+
+        let command = Task { @MainActor in
+            await spreadView.go(to: .start, animated: false)
+        }
+        await Task.yield()
+
+        XCTAssertTrue(spreadView.readiness.isCommandReady, "The command's writer had already moved readiness")
+        XCTAssertNil(observation.currentObservation, "Admission kept the accepted sample")
+        // Readiness is still ready, but the command has not taken its writer.
+        observation.request()
+        XCTAssertFalse(observation.isReading, "A read started while a command was pending")
+        _ = await command.value
+    }
+
+    /// Only a registration ends a hand-off that failed twice; its re-issue
+    /// alone does not.
+    func testARegistrationEndsAMissingHandshake() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
+        let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
+        report(.handshakeFailed(capability, .registrationMissing))
+        report(.handshakeFailed(capability, .registrationMissing))
+        XCTAssertEqual(observation.unavailability, .registrationMissing)
+
+        spreadView.locatorCommandBridge.setFrameCapability(capability)
+
+        try await waitUntil { observation.unavailability == nil }
+    }
+
+    /// A new document's hand-off gets a re-issue of its own, whatever the
+    /// previous document spent.
+    func testANewDocumentStartsWithItsOwnHandshakeReissue() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
+        let first = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
+        report(.handshakeFailed(first, .registrationMissing))
+
+        let generation = spreadView.readiness.beginLoading()
+        let next = EPUBSpreadFrameCapability()
+        _ = try XCTUnwrap(spreadView.readiness.beginInitialization(for: generation, frameCapability: next))
+        report(.handshakeFailed(next, .registrationMissing))
+
+        XCTAssertNil(observation.unavailability, "The previous document's re-issue was counted")
+    }
+
+    /// A same-document mutation revokes the sample while it runs, and the
+    /// spread measures again once it is ready.
+    func testAReadinessMutationRevokesTheSampleAndMeasuresOnceReady() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+
+        let lease = try XCTUnwrap(spreadView.readiness.beginMutation())
+        XCTAssertNil(observation.currentObservation, "A mutation kept the accepted sample")
+        spreadView.readiness.finishMutation(lease, outcome: .succeeded)
+
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "Readiness asked for no measurement")
+        try await waitUntil { observation.currentObservation != nil }
+    }
+
+    /// A hand-off that fails twice waits for a grant, and the grant re-issues
+    /// it to the page.
+    func testAHandshakeThatFailsTwiceWaitsForAGrantThatReissuesIt() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
+        let registrations = RegistrationRecorder(spreadView.locatorCommandBridge)
+        let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
+
+        report(.handshakeFailed(capability, .registrationMissing))
+        report(.handshakeFailed(capability, .registrationMissing))
+        XCTAssertEqual(observation.unavailability, .registrationMissing)
+
+        report(.lateCompletion)
+        XCTAssertNil(observation.unavailability, "The grant left the hand-off unavailable")
+        try await waitUntil { registrations.capabilities.contains(capability) }
+    }
+
+    /// A read refused because another call holds the transport runs as soon as
+    /// that call completes and frees it.
+    func testAReadRefusedForAnOccupiedTransportRunsWhenTheSlotFrees() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let bridge = spreadView.locatorCommandBridge
+        let holder = bridge.readProgression(
+            targetHREF: spreadView.viewModel.url(to: spreadView.spread.first.link),
+            deadline: EPUBLocatorOperationDeadline(startingAt: bridge.deadlineScheduler.now(), budget: .seconds(5)),
+            completion: { _ in }
+        )
+        XCTAssertEqual(holder, .started)
+
+        observation.invalidate()
+        observation.request()
+        XCTAssertFalse(observation.isReading, "A read started beside the outstanding call")
+        XCTAssertTrue(observation.hasObligation)
+
+        try await waitUntil { observation.currentObservation != nil }
+    }
+
+    /// Native motion revokes the sample at once, whoever moved the content.
+    func testANativeScrollRevokesTheAcceptedSample() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let scrollView = spreadView.scrollView
+        XCTAssertGreaterThan(scrollView.contentSize.width, scrollView.bounds.width * 2, "Setup: one page only")
+
+        scrollView.contentOffset = CGPoint(x: scrollView.bounds.width, y: 0)
+
+        XCTAssertNil(observation.currentObservation, "A scroll kept the accepted sample")
+    }
+
+    /// Native motion settles when a drag ends without deceleration, when the
+    /// deceleration ends, or when a scrolling animation ends; a drag that will
+    /// still decelerate has not settled.
+    func testScrollEndCallbacksAskForAMeasurement() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let scrollView = spreadView.scrollView
+
+        observation.invalidate()
+        spreadView.scrollViewDidEndDragging(scrollView, willDecelerate: true)
+        XCTAssertFalse(observation.isReading || observation.hasObligation, "A decelerating drag asked before it settled")
+        spreadView.scrollViewDidEndDecelerating(scrollView)
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "The deceleration's end asked for nothing")
+        try await waitUntil { observation.currentObservation != nil && !observation.isReading }
+
+        observation.invalidate()
+        spreadView.scrollViewDidEndDragging(scrollView, willDecelerate: false)
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "A drag's end asked for nothing")
+        try await waitUntil { observation.currentObservation != nil && !observation.isReading }
+
+        observation.invalidate()
+        spreadView.scrollViewDidEndScrollingAnimation(scrollView)
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "An animation's end asked for nothing")
+    }
+
     /// The stability allowance these tests build spread views with.
     ///
     /// Deliberately far wider than production's 5 s. The budget is a product
@@ -1203,13 +1405,59 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         try await waitUntil { spreadView.readiness.isCommandReady }
     }
 
+    /// A reflowable spread whose document has loaded, reporting to a delegate
+    /// that counts its page changes.
+    private func loadObservedReflowableSpread() async throws -> (EPUBReflowableSpreadView, TestSpreadDelegate) {
+        let spreadView = makeReflowableSpreadView()
+        let delegate = TestSpreadDelegate()
+        spreadView.delegate = delegate
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        try await enableAnimationFrames(in: spreadView)
+        return (spreadView, delegate)
+    }
+
+    /// A ready, registered spread whose observation has accepted a sample and
+    /// has no read or obligation left.
+    private func openObservedReflowableSpread() async throws -> (EPUBReflowableSpreadView, TestSpreadDelegate) {
+        let (spreadView, delegate) = try await loadObservedReflowableSpread()
+        let capability = EPUBSpreadFrameCapability()
+        let outcome = try await initializeLoadedReflowableSpread(spreadView, frameCapability: capability)
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { spreadView.readiness.isCommandReady }
+        spreadView.locatorCommandBridge.setFrameCapability(capability)
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        try await waitUntil {
+            observation.currentObservation != nil && !observation.hasObligation && !observation.isReading
+        }
+        return (spreadView, delegate)
+    }
+
+    /// The fixture opens at its start, on the first of several pages.
+    private func assertReportsTheMeasuredStart(
+        of spreadView: EPUBReflowableSpreadView,
+        under capability: EPUBSpreadFrameCapability,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) throws {
+        let accepted = try XCTUnwrap(spreadView.builtLocationObservation?.currentObservation, file: file, line: line)
+        XCTAssertEqual(accepted.sample.capability, capability, file: file, line: line)
+        let reported = spreadView.progression(in: spreadView.spread.first.index)
+        XCTAssertEqual(reported, accepted.sample.range, "The spread reports something it did not measure", file: file, line: line)
+        XCTAssertEqual(reported.lowerBound, 0, file: file, line: line)
+        XCTAssertGreaterThan(reported.upperBound, 0, file: file, line: line)
+        XCTAssertLessThan(reported.upperBound, 1, file: file, line: line)
+    }
+
     private func initializeLoadedReflowableSpread(
-        _ spreadView: EPUBReflowableSpreadView
+        _ spreadView: EPUBReflowableSpreadView,
+        frameCapability: EPUBSpreadFrameCapability = EPUBSpreadFrameCapability()
     ) async throws -> EPUBSpreadReadiness.InitializationOutcome {
         let generation = spreadView.readiness.generation
         let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
             for: generation,
-            frameCapability: EPUBSpreadFrameCapability()
+            frameCapability: frameCapability
         ))
         spreadView.applySettings()
         let outcome = await spreadView.initializeSpread()
@@ -1399,11 +1647,30 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?) {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {}
-    func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {}
+    var pageChanges = 0
+    func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
+        pageChanges += 1
+    }
+
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: KeyEvent) {}
     func spreadViewDidTerminate() {}
+}
+
+/// Records the capabilities a bridge reports registered, then hands each to
+/// the hook the spread installed, so the spread still hears them.
+@MainActor
+private final class RegistrationRecorder {
+    private(set) var capabilities: [EPUBSpreadFrameCapability] = []
+
+    init(_ bridge: EPUBLocatorCommandBridge) {
+        let installed = bridge.onFrameRegistered
+        bridge.onFrameRegistered = { [weak self] capability in
+            self?.capabilities.append(capability)
+            installed?(capability)
+        }
+    }
 }
 
 @MainActor
