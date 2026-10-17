@@ -282,6 +282,72 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         try await assertOnlyTheNewGeometryIsReported(by: reader, once: contents)
     }
 
+    /// A turn into another resource replaces the current spread. A calculation
+    /// still waiting on the table of contents then delivers neither the
+    /// replaced resource's page nor anything the reader did not settle on.
+    func test_aCalculationOutlivedByASpreadChangeDeliversOnlyTheNewResource() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1, tableOfContents: contents)
+        let opening = try XCTUnwrap(reader.currentSpread)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+
+        let moved = await reader.navigator.goBackward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        try await reader.waitFor("the previous resource's spread") {
+            reader.currentSpread.map { $0 !== opening } == true
+        }
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("the previous resource's measurement") {
+            (spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound ?? 0) > 0
+        }
+
+        try await assertOnlyTheNewGeometryIsReported(by: reader, once: contents)
+        XCTAssertTrue(
+            reader.spy.locations.allSatisfy { $0.href.isEquivalentTo(Self.longChapterHREF.anyURL) },
+            "The outlived calculation delivered the replaced resource: \(reader.spy.locations.map(\.href))"
+        )
+    }
+
+    /// Page hints arriving faster than the hint window neither extend nor
+    /// restart it, so a native scroll that only hints can measure is still
+    /// reported, and the equal re-measures around it report nothing.
+    func test_aFloodOfEqualHintsStillReportsANativeScroll() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        _ = try await spread.webView.callAsyncJavaScript(
+            """
+            window.__hintPosts = 0;
+            window.__hintFlood = setInterval(() => {
+                window.__hintPosts += 1;
+                webkit.messageHandlers.\(progressionMessageName).postMessage({ first: 0, last: 0 });
+            }, 5);
+            return true;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .page
+        )
+        addTeardownBlock { @MainActor in
+            _ = try? await spread.webView.callAsyncJavaScript(
+                "clearInterval(window.__hintFlood); return true;", arguments: [:], in: nil, contentWorld: .page
+            )
+        }
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: Self.longChapterHREF.anyURL,
+            as: "report of the scrolled page",
+            where: { ($0.locations.progression ?? opening) > opening }
+        ) {
+            spread.scrollView.contentOffset = CGPoint(x: spread.scrollView.bounds.width, y: 0)
+        }
+        let posts = try await spread.webView.callAsyncJavaScript(
+            "return window.__hintPosts;", arguments: [:], in: nil, contentWorld: .page
+        ) as? NSNumber
+        XCTAssertGreaterThan(posts?.intValue ?? 0, 100, "Setup: the page did not flood hints")
+    }
+
     /// An equal re-measure of the page already reported reports nothing new.
     func test_anEqualReMeasureReportsNothingNew() async throws {
         let reader = try await openReader()
@@ -546,6 +612,22 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let capability = EPUBSpreadFrameCapability()
         try await page.register(capability)
         try await page.scroll(x: 600, y: 0)
+
+        let outcome = try await page.readThroughBridge()
+
+        XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: (1.0 / 3) ... (2.0 / 3))))
+    }
+
+    /// A direct same-origin child frame receives the forwarded capability and
+    /// answers a read with its own geometry; the bridge still reads the main
+    /// frame it selected.
+    func test_bridgeReadIgnoresAChildFrameHoldingTheCapability() async throws {
+        let page = try await openServedProgressionPage(.leftToRightPagesWithChildFrame)
+        let capability = EPUBSpreadFrameCapability()
+        try await page.register(capability)
+        try await page.scroll(x: 600, y: 0)
+        let child = try await page.waitForChildFrameSample(capability)
+        XCTAssertNotEqual(child.first, 1.0 / 3, "Setup: the child frame's geometry matches the main frame's")
 
         let outcome = try await page.readThroughBridge()
 
@@ -979,6 +1061,29 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return page
     }
 
+    /// A page served from its own `readium://` route through the navigator's
+    /// `WebViewServer`, so a child frame can load a sibling resource of the
+    /// same origin.
+    private func openServedProgressionPage(_ document: ProgressionDocument) async throws -> ProgressionPage {
+        let server = WebViewServer(scheme: "readium", formatSniffer: DefaultFormatSniffer())
+        let baseURL = server.serve(at: UUID().uuidString) { href -> (Resource, MediaType)? in
+            let html: String
+            switch href.string {
+            case "chapter.xhtml": html = document.html
+            case "child.xhtml": html = ProgressionDocument.childFrame
+            default: return nil
+            }
+            return (DataResource(string: html), .html)
+        }
+        let page = try ProgressionPage(publicationBaseURL: baseURL.string, server: server)
+        addTeardownBlock { @MainActor in
+            page.window.isHidden = true
+            page.window.rootViewController = nil
+        }
+        try await page.load(servedFrom: baseURL)
+        return page
+    }
+
     /// A page whose location calls and deadlines the test controls, registered
     /// through its real echo. Its hand-off was location call 0.
     private func openHeldRegisteredPage() async throws -> HeldProgressionPage {
@@ -1220,6 +1325,14 @@ private enum ProgressionDocument {
     case verticalWritingScroll
     case verticalLeftToRightWritingScroll
     case oddTwoColumnSpread
+    /// Left-to-right pages with a direct child frame loading the sibling
+    /// `child.xhtml`, 300 wide and fixed over the first page. Only a served page
+    /// can load it.
+    case leftToRightPagesWithChildFrame
+
+    /// The child frame's document: 1800 wide, so the 300-wide frame measures
+    /// a range of its own.
+    static let childFrame = page(rootAttributes: "", width: 1800, height: 200)
 
     var html: String {
         switch self {
@@ -1247,15 +1360,20 @@ private enum ProgressionDocument {
                 width: 600,
                 height: 2400
             )
+        case .leftToRightPagesWithChildFrame:
+            Self.page(rootAttributes: "", width: 1800, height: 800, childFrameSource: "child.xhtml")
         }
     }
 
-    private static func page(rootAttributes: String, width: Int, height: Int) -> String {
-        """
+    private static func page(rootAttributes: String, width: Int, height: Int, childFrameSource: String? = nil) -> String {
+        let childFrame = childFrameSource.map {
+            #"<iframe src="\#($0)" style="position: fixed; left: 0; top: 0; width: 300px; height: 200px; border: 0"></iframe>"#
+        } ?? ""
+        return """
         <!doctype html><html \(rootAttributes)><head>\
         <meta name="viewport" content="width=device-width, initial-scale=1, minimum-scale=1, maximum-scale=1, user-scalable=no, shrink-to-fit=no">\
         <style>html, body { margin: 0; padding: 0; }</style>\
-        </head><body><div style="width: \(width)px; height: \(height)px"></div></body></html>
+        </head><body><div style="width: \(width)px; height: \(height)px"></div>\(childFrame)</body></html>
         """
     }
 }
@@ -1329,15 +1447,18 @@ private final class ProgressionPage {
     ///     must pass one without waiting it out.
     ///   - publicationBaseURL: the bridge's publication origin; another origin
     ///     makes the page's main frame register as cross-origin.
+    ///   - server: serves the page's resources, as the navigator serves a
+    ///     publication, for a page loaded with `load(servedFrom:)`.
     init(
         carryingReflowableScript: Bool = false,
         invokeLocationScript: EPUBLocatorCommandBridge.LocationScriptInvocation? = nil,
         deadlineScheduler: EPUBDeadlineScheduler? = nil,
-        publicationBaseURL: String = "https://readium.test/"
+        publicationBaseURL: String = "https://readium.test/",
+        server: WebViewServer? = nil
     ) throws {
         bridge = try EPUBLocatorCommandBridge(
             layout: .reflowable,
-            publicationBaseURL: XCTUnwrap(HTTPURL(string: publicationBaseURL)),
+            publicationBaseURL: XCTUnwrap(AnyURL(string: publicationBaseURL)?.absoluteURL),
             deadlineScheduler: deadlineScheduler,
             invokeLocationScript: invokeLocationScript
         )
@@ -1345,6 +1466,9 @@ private final class ProgressionPage {
         // iPad's desktop-class default scales wide content down to fit, which
         // would change the viewport the expected progressions are built on.
         configuration.defaultWebpagePreferences.preferredContentMode = .mobile
+        if let server {
+            configuration.setURLSchemeHandler(server, forURLScheme: server.scheme)
+        }
         bridge.install(in: configuration)
         if carryingReflowableScript {
             configuration.userContentController.addUserScript(WKUserScript(
@@ -1418,6 +1542,33 @@ private final class ProgressionPage {
         )
     }
 
+    /// Waits until the direct child frame answers a read under `capability`,
+    /// in the locator command world reached through its same-origin window,
+    /// and returns its range.
+    func waitForChildFrameSample(_ capability: EPUBSpreadFrameCapability) async throws -> (first: Double, last: Double) {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while clock.now < deadline {
+            let sample = try await webView.callAsyncJavaScript(
+                "return document.querySelector('iframe').contentWindow.readerLocatorCommands.readProgression(expectedCapability);",
+                arguments: ["expectedCapability": capability.id.uuidString],
+                in: nil,
+                contentWorld: EPUBLocatorCommandBridge.contentWorld
+            ) as? [String: Any]
+            if
+                let sample,
+                sample["capability"] as? String == capability.id.uuidString,
+                let first = (sample["first"] as? NSNumber)?.doubleValue,
+                let last = (sample["last"] as? NSNumber)?.doubleValue
+            {
+                return (first, last)
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Setup: the child frame never answered under the forwarded capability")
+        throw SetupTimeout()
+    }
+
     /// Waits until the document answers a read under `capability`, which it
     /// can do only once the hand-off has reached it.
     func waitUntilTheDocumentHolds(_ capability: EPUBSpreadFrameCapability) async throws {
@@ -1467,7 +1618,16 @@ private final class ProgressionPage {
     /// Loads `document` at the same URL every time, so a second load is a
     /// same-URL replacement of the first document.
     func load(_ document: ProgressionDocument) async throws {
-        let navigation = webView.loadHTMLString(document.html, baseURL: Self.url)
+        try await finishLoading(webView.loadHTMLString(document.html, baseURL: Self.url))
+    }
+
+    /// Loads `chapter.xhtml` from the server the page was built with.
+    func load(servedFrom baseURL: AbsoluteURL) async throws {
+        let url = try XCTUnwrap(baseURL.resolve(XCTUnwrap(RelativeURL(path: "chapter.xhtml")))?.url)
+        try await finishLoading(webView.load(URLRequest(url: url)))
+    }
+
+    private func finishLoading(_ navigation: WKNavigation?) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.setupTimeout)
         while clock.now < deadline, !loads.hasFinished(navigation) {

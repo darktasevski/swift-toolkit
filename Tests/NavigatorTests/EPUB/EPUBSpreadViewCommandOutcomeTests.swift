@@ -362,6 +362,43 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(spreadView.scrollView.contentOffset.x, 0, accuracy: 1)
     }
 
+    /// A turn superseded mid-settlement leaves nothing of its own, and the
+    /// hand-off between the two reads nothing: the superseding turn's
+    /// settlement measures its landing, and that is the one report.
+    func testASupersedingTurnReportsOnlyWhereItLands() async throws {
+        let (spreadView, delegate) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let pageChanges = delegate.pageChanges
+        try await blockAnimationFrames(in: spreadView)
+
+        let superseded = Task { @MainActor in
+            await spreadView.go(to: .right, options: NavigatorGoOptions(animated: false))
+        }
+        try await waitUntil {
+            spreadView.scrollView.contentOffset.x > 0 && !spreadView.readiness.isCommandReady
+        }
+        let secondPage = spreadView.scrollView.contentOffset.x
+        let latest = Task { @MainActor in
+            await spreadView.go(to: .right, options: NavigatorGoOptions(animated: false))
+        }
+        await Task.yield()
+        try await releaseAnimationFrames(in: spreadView)
+        let supersededOutcome = await superseded.value
+        let latestOutcome = await latest.value
+        XCTAssertEqual(supersededOutcome, .cancelled)
+        XCTAssertEqual(latestOutcome, .succeeded)
+
+        try await waitUntil {
+            observation.currentObservation != nil && !observation.hasObligation && !observation.isReading
+        }
+        let scrollView = spreadView.scrollView
+        XCTAssertGreaterThan(scrollView.contentOffset.x, secondPage, "Setup: the superseding turn did not move past the superseded one")
+        let landing = scrollView.contentOffset.x / scrollView.contentSize.width
+        let accepted = try XCTUnwrap(observation.currentObservation)
+        XCTAssertEqual(accepted.sample.range.lowerBound, landing, accuracy: 0.001, "The accepted sample is not where the superseding turn landed")
+        XCTAssertEqual(delegate.pageChanges, pageChanges + 1, "The supersession reported something besides the landing")
+    }
+
     func testRapidReflowableLocationsSupersedeAndSerializePositionWriters() async throws {
         let spreadView = makeReflowableSpreadView(scroll: true)
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
