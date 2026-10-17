@@ -13,6 +13,43 @@ import XCTest
 /// The message the page-world reflowable script posts its progression hints to.
 private let progressionMessageName = "progressionChanged"
 
+/// Makes every smooth scroll `world` asks for land at once after `delay`, and
+/// counts the scroll writes it asks for. The test host never advances a scroll
+/// animation, so a smooth scroll would otherwise never move.
+@MainActor
+private func landSmoothScrolls(after delay: Duration, in webView: WKWebView, world: WKContentWorld) async throws {
+    _ = try await webView.callAsyncJavaScript(
+        """
+        globalThis.__scrollWrites = 0;
+        const landing = original => function (options) {
+            globalThis.__scrollWrites += 1;
+            if (options?.behavior !== 'smooth') {
+                return original.call(this, options);
+            }
+            setTimeout(() => original.call(this, { ...options, behavior: 'instant' }), delayMilliseconds);
+        };
+        window.scrollBy = landing(window.scrollBy).bind(window);
+        Element.prototype.scrollTo = landing(Element.prototype.scrollTo);
+        return true;
+        """,
+        arguments: ["delayMilliseconds": Double(delay.components.seconds * 1000) + Double(delay.components.attoseconds) / 1e15],
+        in: nil,
+        contentWorld: world
+    )
+}
+
+/// The scroll writes `world` asked for since `landSmoothScrolls(after:in:world:)`.
+@MainActor
+private func countedScrollWrites(in webView: WKWebView, world: WKContentWorld) async throws -> Int {
+    let value = try await webView.callAsyncJavaScript(
+        "return globalThis.__scrollWrites;",
+        arguments: [:],
+        in: nil,
+        contentWorld: world
+    )
+    return try XCTUnwrap(value as? Int, "Setup: the scroll writes of a world were not counted")
+}
+
 /// Regressions for the location a reflowable spread reports once a navigation
 /// settles. The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
@@ -51,6 +88,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: progressionMessageName)
         try await makeSmoothScrollsLand(after: .milliseconds(200), in: spread)
         let href = Self.longChapterHREF.anyURL
+        XCTAssertNil(spread.scrollAnimationCoordinator.lastSettlementForTesting, "Setup: a scroll animation settled before the turn")
 
         try await assertATurnReportsTheMeasuredProgression(in: reader, animated: true)
         XCTAssertEqual(
@@ -85,11 +123,6 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             let jumped = await reader.navigator.go(to: target, options: NavigatorGoOptions(animated: true))
             XCTAssertTrue(jumped)
         }
-        XCTAssertEqual(
-            spread.scrollAnimationCoordinator.lastSettlementForTesting,
-            .finished,
-            "The animated jump waited out the fallback timer instead of its scroll-quiet signal"
-        )
     }
 
     private func assertATurnReportsTheMeasuredProgression(
@@ -150,6 +183,89 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             file: file,
             line: line
         )
+    }
+
+    /// An animated jump to the page already showing writes nothing and returns
+    /// at once. No scroll starts, so nothing could end a wait for one before
+    /// the scroll-animation fallback, which holds the navigator meanwhile.
+    func test_anAnimatedJumpToTheShowingPageReturnsWithoutWriting() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await makeSmoothScrollsLand(after: .milliseconds(200), in: spread)
+        let opening = try await reader.requireGeometry()
+        let turned = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(turned, "Setup: the turn to the second page failed")
+        let showing = try await reader.waitForOffset(differentFrom: opening)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        let writesBefore = try await scrollWrites(in: spread)
+
+        let clock = ContinuousClock()
+        let started = clock.now
+        let jumped = await reader.navigator.go(
+            to: Locator(
+                href: Self.longChapterHREF.anyURL,
+                mediaType: .html,
+                locations: Locator.Locations(progression: showing.firstProgression)
+            ),
+            options: NavigatorGoOptions(animated: true)
+        )
+        let elapsed = started.duration(to: clock.now)
+
+        XCTAssertTrue(jumped)
+        XCTAssertLessThan(elapsed, Self.scrollAnimationFallback, "The jump waited for a scroll that never started")
+        let writes = try await scrollWrites(in: spread)
+        XCTAssertEqual(writes, writesBefore, "The jump wrote the offset it was already at")
+        let settled = try await reader.requireGeometry()
+        XCTAssertEqual(settled, showing)
+    }
+
+    /// A smooth scroll that outlasts the scroll-animation fallback still
+    /// settles where it lands. With the page's hints silenced, a jump that
+    /// settled on the fallback would measure the page it left and report
+    /// nothing, or report a page the scroll was passing.
+    func test_aJumpWhoseScrollOutlastsTheAnimationFallbackReportsWhereItLands() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: progressionMessageName)
+        try await makeSmoothScrollsLand(after: Self.scrollAnimationFallback + .milliseconds(300), in: spread)
+        let href = Self.longChapterHREF.anyURL
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: href,
+            as: "report of the page the jump landed on",
+            where: { ($0.locations.progression ?? opening) > opening }
+        ) {
+            let jumped = await reader.navigator.go(
+                to: Locator(href: href, mediaType: .html, locations: Locator.Locations(progression: 0.5)),
+                options: NavigatorGoOptions(animated: true)
+            )
+            XCTAssertTrue(jumped)
+        }
+    }
+
+    /// A jump still moves the page when no frame of the current document is
+    /// registered: before the frame hand-off finishes, or once it has failed.
+    /// The bridge's frames are emptied here as an unfinished hand-off leaves
+    /// them, and with smooth scrolls never landing, only an instant page-world
+    /// jump can move the page.
+    func test_aJumpWithNoRegisteredFrameStillMovesThePage() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await makeSmoothScrollsLand(after: .seconds(60), in: spread)
+        let opening = try await reader.requireGeometry()
+        spread.locatorCommandBridge.revokeFrameCapability()
+
+        let jumped = await reader.navigator.go(
+            to: Locator(href: Self.longChapterHREF.anyURL, mediaType: .html, locations: Locator.Locations(progression: 0.5)),
+            options: NavigatorGoOptions(animated: true)
+        )
+
+        XCTAssertTrue(jumped)
+        let moved = try await reader.requireGeometry()
+        XCTAssertNotEqual(moved.scrollX, opening.scrollX, "The jump returned success without moving the page")
+        XCTAssertEqual(moved.scrollX.truncatingRemainder(dividingBy: moved.innerWidth), 0, "The jump did not land on a page start")
     }
 
     func test_boundaryTurnWithoutMovementInventsNoAdvancement() async throws {
@@ -310,7 +426,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     /// Page hints arriving faster than the hint window neither extend nor
     /// restart it, so a native scroll that only hints can measure is still
-    /// reported, and the equal re-measures around it report nothing.
+    /// reported. That an equal re-measure reports nothing new is
+    /// `test_anEqualReMeasureReportsNothingNew`'s claim.
     func test_aFloodOfEqualHintsStillReportsANativeScroll() async throws {
         let reader = try await openReader()
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
@@ -426,6 +543,197 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let settled = try await reader.requireGeometry()
         let last = try XCTUnwrap(reader.spy.locations.last?.locations.progression, file: file, line: line)
         XCTAssertEqual(last, settled.firstProgression, accuracy: 0.000_001, file: file, line: line)
+    }
+
+    // MARK: - Isolated-world progression jump
+
+    /// A jump lands on the start of the page holding its progression, in the
+    /// geometry the progression read measures: right-to-left content scrolls
+    /// to a negated offset, vertical writing advances horizontally in either
+    /// direction, scroll mode does not snap to pages, and a progression past
+    /// the last full viewport lands on it.
+    func test_progressionJumpLandsOnThePageHoldingTheProgression() async throws {
+        let cases: [(document: ProgressionDocument, progression: Double, offset: [Double])] = [
+            (.leftToRightPages, 0.5, [600, 0]),
+            (.rightToLeftPages, 0.5, [-600, 0]),
+            (.verticalScroll, 0.4, [0, 1280]),
+            (.verticalWritingScroll, 0.5, [-900, 0]),
+            (.verticalLeftToRightWritingScroll, 0.5, [900, 0]),
+            (.leftToRightPages, 1, [1200, 0]),
+        ]
+        for testCase in cases {
+            let label = "\(testCase.document) to \(testCase.progression)"
+            let page = try await openProgressionPage(testCase.document)
+            try await page.register(EPUBSpreadFrameCapability())
+
+            let result = try await page.jump(to: testCase.progression)
+
+            assertApplied(result, label)
+            let offset = try await page.offset()
+            XCTAssertEqual(offset, testCase.offset, label)
+        }
+    }
+
+    /// A jump to the page already showing writes nothing, so it never waits
+    /// for a scroll that would not start.
+    func test_progressionJumpToTheShowingPageWritesNothing() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        try await page.scroll(x: 600, y: 0)
+        try await page.landCommandWorldSmoothScrolls(after: .seconds(2))
+
+        let result = try await page.jump(to: 0.4, animated: true)
+
+        assertApplied(result)
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 0, "The jump wrote the offset it was already at")
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [600, 0])
+    }
+
+    /// A smooth jump answers once its scroll lands, not when it asks for it.
+    func test_progressionJumpAnswersOnceItsSmoothScrollLands() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        let landing: Duration = .milliseconds(400)
+        try await page.landCommandWorldSmoothScrolls(after: landing)
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let result = try await page.jump(to: 0.5, animated: true)
+
+        let elapsed = started.duration(to: clock.now)
+        assertApplied(result)
+        XCTAssertGreaterThanOrEqual(elapsed, landing, "The jump answered before its scroll landed")
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 1)
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [600, 0])
+    }
+
+    /// Until the document's frame registers, a jump runs no script and says
+    /// so, leaving the caller free to move the page another way.
+    func test_progressionJumpWithNoRegisteredFrameRunsNothing() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.landCommandWorldSmoothScrolls(after: .zero)
+
+        let result = try await page.jump(to: 0.5)
+
+        guard case .frameUnavailable(.frameMissing) = result else {
+            return XCTFail("Expected the jump to find no frame, got \(result)")
+        }
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 0)
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [0, 0])
+    }
+
+    /// A jump past the last full viewport answers on it. The web process
+    /// reports an overscrolled write's offset unclamped until the UI process
+    /// clamps it, so a target past the end would read as reached at an offset
+    /// the page then leaves; the offset is read in the task the jump answers in.
+    func test_progressionJumpToTheEndAnswersWhereThePageStays() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+
+        let answer = try await page.executeProgressionJump(to: 1)
+
+        XCTAssertEqual(answer.outcome, "applied")
+        XCTAssertEqual(answer.scrollX, 1200, "The jump answered at an offset the page does not keep")
+    }
+
+    /// A frame later than one frame's wait does not end a jump waiting for its
+    /// landing: only the command's deadline does, because a failed position
+    /// command fails its document.
+    func test_aLateFrameDoesNotEndAJumpWaitingToLand() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, holdingCommandWorldFrames: true)
+        try await page.register(EPUBSpreadFrameCapability())
+        try await page.landCommandWorldSmoothScrolls(after: .milliseconds(400))
+        try await page.holdCommandWorldFrames()
+
+        let result = try await page.jump(to: 0.5, animated: true)
+
+        let held = try await page.heldCommandWorldFrames()
+        XCTAssertGreaterThan(held, 0, "Setup: no frame of the jump's wait was held")
+        assertApplied(result)
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [600, 0])
+    }
+
+    /// A newer navigation supersedes a jump still waiting for its landing.
+    func test_aNewerNavigationSupersedesAJumpWaitingToLand() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        let landing: Duration = .seconds(3)
+        try await page.landCommandWorldSmoothScrolls(after: landing)
+        let clock = ContinuousClock()
+
+        let superseded = Task { try await page.jump(to: 0.5, animated: true) }
+        try await waitUntil("the superseded jump asks for its scroll") {
+            try await page.commandWorldScrollWrites() == 1
+        }
+        let started = clock.now
+        let newer = try await page.jump(to: 1)
+        let supersededResult = try await superseded.value
+
+        assertApplied(newer, "the newer jump")
+        assertCancelled(supersededResult, "the superseded jump")
+        XCTAssertLessThan(started.duration(to: clock.now), .seconds(1), "The superseded jump waited for its landing")
+    }
+
+    /// Cancelling the task of a jump waiting for its landing ends the wait.
+    func test_cancellingAJumpWaitingToLandEndsItsWait() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        let landing: Duration = .seconds(3)
+        try await page.landCommandWorldSmoothScrolls(after: landing)
+        let clock = ContinuousClock()
+
+        let jump = Task { try await page.jump(to: 0.5, animated: true) }
+        try await waitUntil("the jump asks for its scroll") {
+            try await page.commandWorldScrollWrites() == 1
+        }
+        let cancelledAt = clock.now
+        jump.cancel()
+        let result = try await jump.value
+
+        assertCancelled(result, "the cancelled jump")
+        XCTAssertLessThan(cancelledAt.duration(to: clock.now), .seconds(1), "The cancelled jump waited for its landing")
+    }
+
+    private func assertApplied(
+        _ result: EPUBLocatorCommandBridge.ProgressionNavigationResult,
+        _ label: String = "the jump",
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .completed(completed) = result, completed.outcome == .applied else {
+            return XCTFail("Expected \(label) to apply, got \(result)", file: file, line: line)
+        }
+    }
+
+    private func assertCancelled(
+        _ result: EPUBLocatorCommandBridge.ProgressionNavigationResult,
+        _ label: String,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard case let .completed(completed) = result, completed.outcome == .cancelled else {
+            return XCTFail("Expected \(label) to be cancelled, got \(result)", file: file, line: line)
+        }
+    }
+
+    /// Polls `condition` until it holds, failing with `description` otherwise.
+    private func waitUntil(_ description: String, _ condition: () async throws -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(10))
+        while clock.now < deadline {
+            if try await condition() {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(10))
+        }
+        XCTFail("Timed out waiting until \(description)")
+        throw SetupTimeout()
     }
 
     // MARK: - Isolated-world progression read
@@ -627,7 +935,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         try await page.register(capability)
         try await page.scroll(x: 600, y: 0)
         let child = try await page.waitForChildFrameSample(capability)
-        XCTAssertNotEqual(child.first, 1.0 / 3, "Setup: the child frame's geometry matches the main frame's")
+        XCTAssertEqual(child.first, 0, accuracy: 0.000_001, "Setup: the child frame did not measure its own geometry")
+        XCTAssertEqual(child.last, 1.0 / 6, accuracy: 0.000_001, "Setup: the child frame did not measure its own geometry")
 
         let outcome = try await page.readThroughBridge()
 
@@ -849,7 +1158,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
 
         _ = try await spread.webView.evaluateJavaScript(
-            "webkit.messageHandlers.progressionChanged.postMessage({first: 0.9, last: 0.95}); true"
+            "webkit.messageHandlers.\(progressionMessageName).postMessage({first: 0.9, last: 0.95}); true"
         )
 
         await fulfillment(of: [forged], timeout: Self.quietWindow)
@@ -974,6 +1283,10 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// window is many times that.
     private static let isolationWatchWindow: Duration = .seconds(1)
 
+    /// How long `EPUBScrollAnimationCoordinator` waits for a smooth scroll's
+    /// quiet signal before it gives up.
+    private static let scrollAnimationFallback: Duration = .milliseconds(800)
+
     private static let longChapterHREF = RelativeURL(path: "long.html")!
     private static let nextChapterHREF = RelativeURL(path: "next.html")!
 
@@ -1017,24 +1330,27 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// This host never advances an animation: a UIKit or WebKit smooth scroll
     /// leaves the offset where it was. So a smooth scroll the page asks for
     /// lands at once after `delay`, as an animation lands after its duration;
-    /// an instant one lands immediately.
+    /// an instant one lands immediately. Each content world has its own
+    /// prototypes, so both scrolling worlds are patched, and each counts the
+    /// scroll writes it is asked for (`scrollWrites(in:)`).
     private func makeSmoothScrollsLand(after delay: Duration, in spread: EPUBSpreadView) async throws {
-        _ = try await spread.webView.callAsyncJavaScript(
-            """
-            const landing = original => function (options) {
-                if (options?.behavior !== 'smooth') {
-                    return original.call(this, options);
-                }
-                setTimeout(() => original.call(this, { ...options, behavior: 'instant' }), delayMilliseconds);
-            };
-            window.scrollBy = landing(window.scrollBy).bind(window);
-            Element.prototype.scrollTo = landing(Element.prototype.scrollTo);
-            return true;
-            """,
-            arguments: ["delayMilliseconds": Double(delay.components.seconds * 1000) + Double(delay.components.attoseconds) / 1e15],
-            in: nil,
-            contentWorld: .page
-        )
+        for world in Self.scrollingWorlds {
+            try await landSmoothScrolls(after: delay, in: spread.webView, world: world)
+        }
+    }
+
+    /// The page world, where page turns scroll, and the locator command world,
+    /// where progression jumps scroll.
+    private static let scrollingWorlds: [WKContentWorld] = [.page, EPUBLocatorCommandBridge.contentWorld]
+
+    /// The scroll writes both scrolling worlds were asked for since
+    /// `makeSmoothScrollsLand(after:in:)`.
+    private func scrollWrites(in spread: EPUBSpreadView) async throws -> Int {
+        var writes = 0
+        for world in Self.scrollingWorlds {
+            writes += try await countedScrollWrites(in: spread.webView, world: world)
+        }
+        return writes
     }
 
     private func openProgressionPage(
@@ -1042,13 +1358,15 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         carryingReflowableScript: Bool = false,
         invokeLocationScript: EPUBLocatorCommandBridge.LocationScriptInvocation? = nil,
         deadlineScheduler: EPUBDeadlineScheduler? = nil,
-        publicationBaseURL: String = "https://readium.test/"
+        publicationBaseURL: String = "https://readium.test/",
+        holdingCommandWorldFrames: Bool = false
     ) async throws -> ProgressionPage {
         let page = try ProgressionPage(
             carryingReflowableScript: carryingReflowableScript,
             invokeLocationScript: invokeLocationScript,
             deadlineScheduler: deadlineScheduler,
-            publicationBaseURL: publicationBaseURL
+            publicationBaseURL: publicationBaseURL,
+            holdingCommandWorldFrames: holdingCommandWorldFrames
         )
         addTeardownBlock { @MainActor in
             page.window.isHidden = true
@@ -1422,6 +1740,17 @@ private enum GeometryStub: CustomStringConvertible {
 @MainActor
 private final class ProgressionPage {
     static let capability = "settled-location-test-capability"
+    private static let frameHoldingScript = """
+    globalThis.__deliverFrame = globalThis.requestAnimationFrame.bind(globalThis);
+    globalThis.__heldFrames = null;
+    globalThis.requestAnimationFrame = (callback) => {
+        if (globalThis.__heldFrames) {
+            globalThis.__heldFrames.push(callback);
+            return 0;
+        }
+        return globalThis.__deliverFrame(callback);
+    };
+    """
     private static let url = URL(string: "https://readium.test/chapter.xhtml")!
     private static let setupTimeout: Duration = .seconds(30)
 
@@ -1449,12 +1778,15 @@ private final class ProgressionPage {
     ///     makes the page's main frame register as cross-origin.
     ///   - server: serves the page's resources, as the navigator serves a
     ///     publication, for a page loaded with `load(servedFrom:)`.
+    ///   - holdingCommandWorldFrames: installs, ahead of the command script, an
+    ///     animation-frame request the test can hold (`holdCommandWorldFrames()`).
     init(
         carryingReflowableScript: Bool = false,
         invokeLocationScript: EPUBLocatorCommandBridge.LocationScriptInvocation? = nil,
         deadlineScheduler: EPUBDeadlineScheduler? = nil,
         publicationBaseURL: String = "https://readium.test/",
-        server: WebViewServer? = nil
+        server: WebViewServer? = nil,
+        holdingCommandWorldFrames: Bool = false
     ) throws {
         bridge = try EPUBLocatorCommandBridge(
             layout: .reflowable,
@@ -1468,6 +1800,15 @@ private final class ProgressionPage {
         configuration.defaultWebpagePreferences.preferredContentMode = .mobile
         if let server {
             configuration.setURLSchemeHandler(server, forURLScheme: server.scheme)
+        }
+        if holdingCommandWorldFrames {
+            // Added first, so the command script binds this request when it loads.
+            configuration.userContentController.addUserScript(WKUserScript(
+                source: Self.frameHoldingScript,
+                injectionTime: .atDocumentStart,
+                forMainFrameOnly: false,
+                in: EPUBLocatorCommandBridge.contentWorld
+            ))
         }
         bridge.install(in: configuration)
         if carryingReflowableScript {
@@ -1710,6 +2051,89 @@ private final class ProgressionPage {
         }
         XCTFail("Setup: the page never scrolled to (\(x), \(y)); offset=\(String(describing: offset))")
         throw SetupTimeout()
+    }
+
+    /// `[scrollX, scrollY]`.
+    func offset() async throws -> [Double] {
+        let value = try await webView.callAsyncJavaScript(
+            "return [scrollX, scrollY];",
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+        return try XCTUnwrap(value as? [NSNumber], "Setup: the page offset was unreadable").map(\.doubleValue)
+    }
+
+    /// Jumps this page's resource to `progression` through the bridge, with
+    /// the full budget from now.
+    func jump(
+        to progression: Double,
+        animated: Bool = false
+    ) async throws -> EPUBLocatorCommandBridge.ProgressionNavigationResult {
+        try await bridge.navigate(
+            toProgression: progression,
+            targetHREF: XCTUnwrap(AnyURL(string: "chapter.xhtml")),
+            animated: animated,
+            deadline: EPUBLocatorOperationDeadline(
+                startingAt: ContinuousClock().now,
+                budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
+            )
+        )
+    }
+
+    /// Makes the command world's smooth scrolls land after `delay` and starts
+    /// counting its scroll writes.
+    func landCommandWorldSmoothScrolls(after delay: Duration) async throws {
+        try await landSmoothScrolls(after: delay, in: webView, world: EPUBLocatorCommandBridge.contentWorld)
+    }
+
+    /// The command world's scroll writes since `landCommandWorldSmoothScrolls(after:)`.
+    func commandWorldScrollWrites() async throws -> Int {
+        try await countedScrollWrites(in: webView, world: EPUBLocatorCommandBridge.contentWorld)
+    }
+
+    /// Holds every animation frame the command world asks for from now on.
+    /// Needs a page opened `holdingCommandWorldFrames`.
+    func holdCommandWorldFrames() async throws {
+        try await runInCommandWorld("globalThis.__heldFrames = [];")
+    }
+
+    /// How many animation frames the command world has been held from.
+    func heldCommandWorldFrames() async throws -> Int {
+        let value = try await webView.callAsyncJavaScript(
+            "return globalThis.__heldFrames?.length ?? 0;",
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? Int, "Setup: the held frames were not counted")
+    }
+
+    /// Runs an instant progression jump straight through the command world and
+    /// reads `scrollX` in the task the jump answers in, before a later task can
+    /// move it.
+    func executeProgressionJump(to progression: Double) async throws -> (outcome: String, scrollX: Double) {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            const result = await readerLocatorCommands.execute(
+                { kind: "navigateProgression", progression, animated: false },
+                {
+                    webViewInstanceID: "settled-location-test",
+                    documentEpoch: 0,
+                    operationKind: "navigation",
+                    sequence: 1,
+                    budgetMilliseconds: 10000,
+                }
+            );
+            return [result.outcome, scrollX];
+            """,
+            arguments: ["progression": progression],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        ) as? [Any]
+        let outcome = try XCTUnwrap(value?.first as? String, "Setup: the jump's outcome was unreadable")
+        let scrollX = try XCTUnwrap((value?.last as? NSNumber)?.doubleValue, "Setup: the jump's offset was unreadable")
+        return (outcome, scrollX)
     }
 
     func read(_ capability: Any) async throws -> Any? {

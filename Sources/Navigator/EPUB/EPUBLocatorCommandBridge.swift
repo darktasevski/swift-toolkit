@@ -855,32 +855,111 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField)
         }
 
-        let selectedID: String
-        switch registry.select(href: targetKey, capability: currentFrameCapability) {
-        case let .selected(id):
-            selectedID = id
-        case let .miss(reason):
-            return EPUBLocatorCommandResult(
+        switch selectNavigationFrame(for: targetKey) {
+        case let .unavailable(reason):
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: reason)
+        case let .selected(storedFrame, webView):
+            return await runNavigationCommand(
+                [
+                    "kind": "navigateLocator",
+                    "payload": locatorJSON,
+                    "animated": animated,
+                ],
                 token: token,
-                outcome: .miss,
-                reason: EPUBLocatorCommandReason(rawValue: reason.rawValue) ?? .invalidResult
+                in: storedFrame,
+                of: webView,
+                until: deadline
             )
         }
+    }
 
+    /// What a progression jump did.
+    enum ProgressionNavigationResult: Sendable {
+        /// No frame of the current document could take the command, so no
+        /// script ran and the caller may move the page another way.
+        case frameUnavailable(EPUBLocatorCommandReason)
+        /// The command's outcome, including a refusal before it was sent.
+        case completed(EPUBLocatorCommandResult)
+    }
+
+    /// Scrolls the document to the page holding `progression` and answers
+    /// once its offset is there (`navigateProgression` in
+    /// `reader-locator-commands.js`). It is a navigation, so it supersedes,
+    /// and is superseded by, any other.
+    ///
+    /// - Parameter deadline: the position command's deadline; the jump spends
+    ///   what remains of it.
+    func navigate(
+        toProgression progression: Double,
+        targetHREF: AnyURL,
+        animated: Bool,
+        deadline: EPUBLocatorOperationDeadline
+    ) async -> ProgressionNavigationResult {
+        let token = nextToken(
+            for: .navigation,
+            budgetMilliseconds: deadline.remainingMilliseconds(at: clock.now())
+        )
+
+        guard !Task.isCancelled else {
+            return .completed(EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken))
+        }
+        guard progression.isFinite, (0 ... 1).contains(progression) else {
+            return .completed(EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidNumber))
+        }
         guard
-            let storedFrame = framesByID[selectedID],
-            storedFrame.capability == currentFrameCapability,
-            let webView
+            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
+            let targetKey = frameKey(for: targetURL)
         else {
-            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .staleDocument)
+            return .completed(EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField))
         }
 
-        let command: [String: Any] = [
-            "kind": "navigateLocator",
-            "payload": locatorJSON,
-            "animated": animated,
-        ]
+        switch selectNavigationFrame(for: targetKey) {
+        case let .unavailable(reason):
+            return .frameUnavailable(reason)
+        case let .selected(storedFrame, webView):
+            return await .completed(runNavigationCommand(
+                [
+                    "kind": "navigateProgression",
+                    "progression": progression,
+                    "animated": animated,
+                ],
+                token: token,
+                in: storedFrame,
+                of: webView,
+                until: deadline
+            ))
+        }
+    }
 
+    private enum NavigationFrameSelection {
+        case selected(StoredFrame, WKWebView)
+        case unavailable(EPUBLocatorCommandReason)
+    }
+
+    /// The current document's registered frame for `targetKey`.
+    private func selectNavigationFrame(for targetKey: String) -> NavigationFrameSelection {
+        switch registry.select(href: targetKey, capability: currentFrameCapability) {
+        case let .selected(id):
+            guard
+                let storedFrame = framesByID[id],
+                storedFrame.capability == currentFrameCapability,
+                let webView
+            else {
+                return .unavailable(.staleDocument)
+            }
+            return .selected(storedFrame, webView)
+        case let .miss(reason):
+            return .unavailable(EPUBLocatorCommandReason(rawValue: reason.rawValue) ?? .invalidResult)
+        }
+    }
+
+    private func runNavigationCommand(
+        _ command: [String: Any],
+        token: EPUBLocatorCommandToken,
+        in storedFrame: StoredFrame,
+        of webView: WKWebView,
+        until deadline: EPUBLocatorOperationDeadline
+    ) async -> EPUBLocatorCommandResult {
         // Record the suspended command so a superseding request's relay can
         // abort it in the exact frame it is running in. Cleared on every exit,
         // but only if a newer navigation has not already replaced it.

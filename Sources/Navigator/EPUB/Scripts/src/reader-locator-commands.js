@@ -4,7 +4,7 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getClientRectsNoOverlap } from "./rect";
-import { measureProgression } from "./progression";
+import { measureProgression, progressionScrollTarget } from "./progression";
 
 const LIMITS = Object.freeze({
   payloadBytes: 64 * 1024,
@@ -42,6 +42,7 @@ const TEXT_KEYS = new Set(["before", "highlight", "after"]);
 const DOM_RANGE_KEYS = new Set(["start", "end"]);
 const DOM_POINT_KEYS = new Set(["cssSelector", "textNodeIndex", "charOffset"]);
 const NAVIGATE_KEYS = new Set(["kind", "payload", "animated"]);
+const NAVIGATE_PROGRESSION_KEYS = new Set(["kind", "progression", "animated"]);
 const VALIDATE_UNIQUE_TEXT_KEYS = new Set(["kind", "payload", "cssSelector"]);
 const REPLACE_DECORATIONS_KEYS = new Set([
   "kind",
@@ -1836,6 +1837,78 @@ async function navigateLocator(command, token, signal, deadlineAt) {
   return commandResult(token, "applied", "none");
 }
 
+// How far from its target a progression jump's offset may be and still count as
+// there. Scroll offsets can be fractional; a page start is not.
+const PROGRESSION_LANDING_TOLERANCE = 1;
+
+// Scrolls to the page holding a progression and answers once the offset is there,
+// so a smooth scroll is answered when it lands, never while it is still moving. A
+// jump to where the viewport already is writes nothing: no scroll would start, so
+// nothing would end a wait for one. The landing is the target the scroll was asked
+// for, not a stable offset, which a smooth scroll that has not started yet also
+// has. The target must lie within the scrollport: the web process reports an
+// overscrolled write's offset unclamped until the UI process clamps it. Only the
+// command's deadline ends the wait, as `paintTimeout`: a frame later than one
+// frame's wait does not, because a failed position command fails its document.
+async function navigateProgression(command, token, signal, deadlineAt) {
+  requireOnlyKeys(command, NAVIGATE_PROGRESSION_KEYS);
+  if (
+    command.kind !== "navigateProgression" ||
+    typeof command.animated !== "boolean"
+  ) {
+    reject("invalidCommand");
+  }
+  if (token.operationKind !== "navigation") {
+    reject("invalidToken");
+  }
+  requireProgression(command.progression);
+  if (signal?.aborted || !isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt);
+  if (viewportStatus === "stale") {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  if (viewportStatus === "timeout") {
+    return commandResult(token, "miss", "paintTimeout");
+  }
+  if (viewportStatus === "notReady") {
+    return commandResult(token, "miss", "viewportNotReady");
+  }
+
+  const start = progressionScrollTarget(command.progression);
+  if (!start) {
+    return commandResult(token, "miss", "geometryUnverifiable");
+  }
+  const reached = (geometry) =>
+    Math.abs(geometry.offset - start.target) <= PROGRESSION_LANDING_TOLERANCE;
+  if (reached(start)) {
+    return commandResult(token, "applied", "none");
+  }
+  const position = start.isRTL && !start.useY ? -start.target : start.target;
+  const behavior = command.animated ? "smooth" : "instant";
+  document.scrollingElement.scrollTo(
+    start.useY ? { top: position, behavior } : { left: position, behavior }
+  );
+
+  for (;;) {
+    const current = progressionScrollTarget(command.progression);
+    if (!current) {
+      return commandResult(token, "miss", "geometryUnverifiable");
+    }
+    if (reached(current)) {
+      return commandResult(token, "applied", "none");
+    }
+    const frameStatus = await nextFrame(token, signal, deadlineAt);
+    if (frameStatus === "stale" || signal?.aborted || !isCurrent(token)) {
+      return commandResult(token, "cancelled", "staleToken");
+    }
+    if (frameStatus === "timeout" && !(deadlineAt - performance.now() > 0)) {
+      return commandResult(token, "miss", "paintTimeout");
+    }
+  }
+}
+
 async function replaceDecorationGroup(command, token, signal, deadlineAt) {
   const value = validateReplaceDecorations(command, token);
   if (signal?.aborted || !isCurrent(token)) {
@@ -1917,6 +1990,13 @@ async function execute(commandValue, tokenValue) {
     switch (commandValue.kind) {
       case "navigateLocator":
         return await navigateLocator(
+          commandValue,
+          token,
+          controller.signal,
+          deadlineAt
+        );
+      case "navigateProgression":
+        return await navigateProgression(
           commandValue,
           token,
           controller.signal,

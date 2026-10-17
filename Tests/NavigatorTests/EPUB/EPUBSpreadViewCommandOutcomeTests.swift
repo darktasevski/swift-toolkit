@@ -368,7 +368,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     func testASupersedingTurnReportsOnlyWhereItLands() async throws {
         let (spreadView, delegate) = try await openObservedReflowableSpread()
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
-        let pageChanges = delegate.pageChanges
+        let reportsBefore = delegate.reportedRanges.count
         try await blockAnimationFrames(in: spreadView)
 
         let superseded = Task { @MainActor in
@@ -396,7 +396,13 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let landing = scrollView.contentOffset.x / scrollView.contentSize.width
         let accepted = try XCTUnwrap(observation.currentObservation)
         XCTAssertEqual(accepted.sample.range.lowerBound, landing, accuracy: 0.001, "The accepted sample is not where the superseding turn landed")
-        XCTAssertEqual(delegate.pageChanges, pageChanges + 1, "The supersession reported something besides the landing")
+        // The count is what tells a read accepted in the hand-off gap from the
+        // landing's own report: both measure the landing.
+        let reported = delegate.reportedRanges.dropFirst(reportsBefore)
+        XCTAssertEqual(reported.count, 1, "The supersession reported something besides the landing")
+        for range in reported {
+            XCTAssertEqual(range.lowerBound, landing, accuracy: 0.001, "The supersession reported \(range), not the landing")
+        }
     }
 
     func testRapidReflowableLocationsSupersedeAndSerializePositionWriters() async throws {
@@ -1841,8 +1847,11 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {}
     var pageChanges = 0
+    /// The first resource's range at each page change, in order.
+    private(set) var reportedRanges: [ClosedRange<Double>] = []
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
         pageChanges += 1
+        reportedRanges.append(spreadView.progression(in: spreadView.spread.first.index))
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {}

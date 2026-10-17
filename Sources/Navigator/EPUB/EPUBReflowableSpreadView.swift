@@ -905,20 +905,26 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             scrollView.contentOffset = contentOffset
             return true
         } else {
-            let dir = viewModel.readingProgression.rawValue
-            guard await evaluateDocumentScriptBounded(
-                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))",
-                until: deadline
-            ) else {
-                return false
+            let result = await locatorCommandBridge.navigate(
+                toProgression: progression,
+                targetHREF: viewModel.url(to: spread.first.link),
+                animated: animated,
+                deadline: EPUBLocatorOperationDeadline(expiringAt: deadline)
+            )
+            switch result {
+            case let .completed(result):
+                return result.outcome == .applied
+            case .frameUnavailable:
+                // Command readiness does not wait for the frame hand-off, so a
+                // placement can run before this document's frame registers, or
+                // after its hand-off failed. Nothing ran, so nothing can fight
+                // this jump, and an instant one has landed once its script returns.
+                let dir = viewModel.readingProgression.rawValue
+                return await evaluateDocumentScriptBounded(
+                    "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', false)",
+                    until: deadline
+                )
             }
-            // The script only starts a smooth scroll. The command settles once
-            // it lands, as a page turn does, so its settlement measures the
-            // destination rather than the page it left.
-            if animated {
-                await scrollAnimationCoordinator.waitUntilSettled()
-            }
-            return true
         }
     }
 
