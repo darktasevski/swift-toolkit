@@ -10,6 +10,9 @@ import UIKit
 import WebKit
 import XCTest
 
+/// The message the page-world reflowable script posts its progression hints to.
+private let progressionMessageName = "progressionChanged"
+
 /// Regressions for the location a reflowable spread reports once a navigation
 /// settles. The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
@@ -30,39 +33,118 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_commandTurnWithHintsSilencedReportsTheMeasuredProgression() async throws {
         let reader = try await openReader()
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: "progressionChanged")
+        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: progressionMessageName)
         try await assertATurnReportsTheMeasuredProgression(in: reader)
+    }
+
+    /// The host animates page turns when the reader picks the animated
+    /// transition. An animated turn, the end of a native scroll animation and
+    /// a locator jump each report the range they settle on; with the page's
+    /// hints silenced, only those settlements measure.
+    ///
+    /// This test host never advances an animation, so a smooth scroll lands
+    /// after a delay instead of moving, and the native scroll ends with the
+    /// callback UIKit sends when an animation finishes.
+    func test_animatedTurnScrollAndJumpEachReportTheSettledRange() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: progressionMessageName)
+        try await makeSmoothScrollsLand(after: .milliseconds(200), in: spread)
+        let href = Self.longChapterHREF.anyURL
+
+        try await assertATurnReportsTheMeasuredProgression(in: reader, animated: true)
+        XCTAssertEqual(
+            spread.scrollAnimationCoordinator.lastSettlementForTesting,
+            .finished,
+            "The animated turn waited out the fallback timer instead of its scroll-quiet signal"
+        )
+        let turned = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: href,
+            as: "report of the scrolled page",
+            where: { ($0.locations.progression ?? 0) > turned }
+        ) {
+            let scrollView = spread.scrollView
+            let start = try await reader.requireGeometry()
+            scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x + scrollView.bounds.width, y: 0), animated: false)
+            // An animation ends only once the page has moved.
+            _ = try await reader.waitForOffset(differentFrom: start)
+            spread.scrollViewDidEndScrollingAnimation(scrollView)
+        }
+        let scrolled = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: href,
+            as: "report of the jump back to the turned page",
+            where: { ($0.locations.progression ?? scrolled) < scrolled }
+        ) {
+            let target = Locator(href: href, mediaType: .html, locations: Locator.Locations(progression: turned))
+            let jumped = await reader.navigator.go(to: target, options: NavigatorGoOptions(animated: true))
+            XCTAssertTrue(jumped)
+        }
+        XCTAssertEqual(
+            spread.scrollAnimationCoordinator.lastSettlementForTesting,
+            .finished,
+            "The animated jump waited out the fallback timer instead of its scroll-quiet signal"
+        )
     }
 
     private func assertATurnReportsTheMeasuredProgression(
         in reader: Reader,
+        animated: Bool = false,
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
         let opening = try XCTUnwrap(reader.spy.locations.last, file: file, line: line)
         let openingProgression = try XCTUnwrap(opening.locations.progression, file: file, line: line)
-        let before = try await reader.requireGeometry()
 
         // Only an advancing report can stand for the turn: a late repeat of
         // the opening position would otherwise satisfy a correct fix's test
         // with the wrong report.
-        let report = reader.spy.expectLocation("advancing report in the same resource") {
-            $0.href.isEquivalentTo(opening.href)
-                && $0.locations.progression.map { $0 > openingProgression } == true
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: opening.href,
+            as: "advancing report in the same resource",
+            where: { ($0.locations.progression ?? openingProgression) > openingProgression },
+            file: file,
+            line: line
+        ) {
+            let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: animated))
+            XCTAssertTrue(moved, file: file, line: line)
         }
-        let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
-        XCTAssertTrue(moved, file: file, line: line)
+    }
+
+    /// Runs `action`, waits for the viewport to move, and checks that a report
+    /// matching `isTheMove` arrives and every report since describes the
+    /// settled viewport.
+    private func assertTheSettledRangeIsReported(
+        by reader: Reader,
+        in href: AnyURL,
+        as description: String,
+        where isTheMove: @escaping (Locator) -> Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line,
+        after action: () async throws -> Void
+    ) async throws {
+        let before = try await reader.requireGeometry()
+        let report = reader.spy.expectLocation(description) {
+            $0.href.isEquivalentTo(href) && isTheMove($0)
+        }
+        try await action()
         _ = try await reader.waitForOffset(differentFrom: before)
 
         await fulfillment(of: [report], timeout: Self.reportTimeout)
-        _ = try XCTUnwrap(reader.spy.matchedLocation, "No advancing location was reported after the turn", file: file, line: line)
+        _ = try XCTUnwrap(reader.spy.matchedLocation, "No \(description) arrived", file: file, line: line)
         let atMatch = try await reader.requireGeometry()
 
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let settled = try await reader.requireGeometry()
         assertSettledReports(
             reader.spy.locationsSinceArming,
-            isIn: opening.href,
+            isIn: href,
             matchedAt: atMatch,
             settled: settled,
             file: file,
@@ -848,6 +930,29 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         }
         return reader
+    }
+
+    /// This host never advances an animation: a UIKit or WebKit smooth scroll
+    /// leaves the offset where it was. So a smooth scroll the page asks for
+    /// lands at once after `delay`, as an animation lands after its duration;
+    /// an instant one lands immediately.
+    private func makeSmoothScrollsLand(after delay: Duration, in spread: EPUBSpreadView) async throws {
+        _ = try await spread.webView.callAsyncJavaScript(
+            """
+            const landing = original => function (options) {
+                if (options?.behavior !== 'smooth') {
+                    return original.call(this, options);
+                }
+                setTimeout(() => original.call(this, { ...options, behavior: 'instant' }), delayMilliseconds);
+            };
+            window.scrollBy = landing(window.scrollBy).bind(window);
+            Element.prototype.scrollTo = landing(Element.prototype.scrollTo);
+            return true;
+            """,
+            arguments: ["delayMilliseconds": Double(delay.components.seconds * 1000) + Double(delay.components.attoseconds) / 1e15],
+            in: nil,
+            contentWorld: .page
+        )
     }
 
     private func openProgressionPage(
@@ -1730,7 +1835,7 @@ private final class PageMessageRecorder: NSObject, WKScriptMessageHandler {
         "log",
         "logError",
         "pointerEventReceived",
-        "progressionChanged",
+        progressionMessageName,
         "selectionChanged",
         "spreadLoadStarted",
         "spreadLoaded",
@@ -1741,7 +1846,7 @@ private final class PageMessageRecorder: NSObject, WKScriptMessageHandler {
     private(set) var hints: [Any] = []
 
     func userContentController(_ userContentController: WKUserContentController, didReceive message: WKScriptMessage) {
-        if message.name == "progressionChanged" {
+        if message.name == progressionMessageName {
             hints.append(message.body)
         }
     }

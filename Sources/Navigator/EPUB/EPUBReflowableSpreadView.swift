@@ -906,10 +906,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             return true
         } else {
             let dir = viewModel.readingProgression.rawValue
-            return await evaluateDocumentScriptBounded(
+            guard await evaluateDocumentScriptBounded(
                 "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))",
                 until: deadline
-            )
+            ) else {
+                return false
+            }
+            // The script only starts a smooth scroll. The command settles once
+            // it lands, as a page turn does, so its settlement measures the
+            // destination rather than the page it left.
+            if animated {
+                await scrollAnimationCoordinator.waitUntilSettled()
+            }
+            return true
         }
     }
 
