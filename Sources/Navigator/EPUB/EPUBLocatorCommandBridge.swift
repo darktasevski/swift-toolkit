@@ -724,8 +724,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         let id = attempt.id
         let capability = attempt.capability
         let invoke = invokeLocationScript
-        // Injecting before the call starts: an answer delivered inside the
-        // invocation frees the slot, and this attempt must not take it again.
+        // The attempt is marked injecting before the call starts: an answer
+        // delivered inside the invocation frees the slot, and this attempt
+        // must not take it again.
         handshake?.phase = .injecting
         let started = locationTransport.start(
             until: attempt.deadline,

@@ -474,7 +474,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     }
 
     /// Clearing the spread silences a read in flight: neither its deadline nor
-    /// its late answer reaches the caller or the owner.
+    /// its late answer reaches the caller, and the owner hears only that the
+    /// slot is free.
     func test_revokingTheCapabilitySilencesAReadInFlight() async throws {
         let held = try await openHeldRegisteredPage()
         let outcomes = BridgeReadOutcomes()
