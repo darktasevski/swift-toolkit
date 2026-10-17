@@ -253,7 +253,7 @@ import WebKit
             case let .success(data):
                 await respond(urlSchemeTask, with: data, range: range, totalLength: totalLength, mediaType: mediaType, url: requestURL, allowCrossOrigin: allowCrossOrigin)
             case let .failure(error):
-                log(.error, "Failed to read resource \(requestURL.path) range \(range): \(error)")
+                EPUBPageWorldLog.report(.resourceRangeReadFailed, withholding: (requestURL, range, error))
                 await fail(urlSchemeTask, with: URLError(.resourceUnavailable))
             }
             return
@@ -265,7 +265,7 @@ import WebKit
         case let .success(data):
             await respond(urlSchemeTask, with: data, range: nil, totalLength: UInt64(data.count), mediaType: mediaType, url: requestURL, allowCrossOrigin: allowCrossOrigin)
         case let .failure(error):
-            log(.error, "Failed to read resource \(requestURL.path): \(error)")
+            EPUBPageWorldLog.report(.resourceReadFailed, withholding: (requestURL, error))
             await fail(urlSchemeTask, with: URLError(.resourceUnavailable))
         }
     }

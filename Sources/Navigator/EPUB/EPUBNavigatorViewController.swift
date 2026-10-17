@@ -315,6 +315,17 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// Turning the page in the given `direction`.
         case moving(direction: EPUBSpreadView.Direction)
 
+        /// Closed diagnostic identity; associated locators and directions are never rendered.
+        var logName: String {
+            switch self {
+            case .initializing: return "initializing"
+            case .loading: return "loading"
+            case .idle: return "idle"
+            case .jumping: return "jumping"
+            case .moving: return "moving"
+            }
+        }
+
         var pendingLocator: Locator? {
             switch self {
             case let .loading(pendingLocator: locator):
@@ -363,7 +374,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
                 return false
 
             default:
-                log(.error, "Invalid event \(event) for state \(self)")
+                log(.error, "Invalid event \(event.logName) for state \(logName)")
                 return false
             }
 
@@ -386,13 +397,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         case move(EPUBSpreadView.Direction)
         /// Finished turning the page.
         case moved
+
+        /// Closed diagnostic identity; associated locators and directions are never rendered.
+        var logName: String {
+            switch self {
+            case .load: return "load"
+            case .loaded: return "loaded"
+            case .jump: return "jump"
+            case .jumped: return "jumped"
+            case .move: return "move"
+            case .moved: return "moved"
+            }
+        }
     }
 
     /// Current navigation state.
     private var state: State = .initializing {
         didSet {
             if config.debugState {
-                log(.debug, "* \(state)")
+                log(.debug, "* \(state.logName)")
             }
 
             // Disable user interaction while transitioning, to avoid UX issues.
@@ -580,7 +603,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         do {
             positionsByReadingOrder = try await loadPositionsByReadingOrder().get()
         } catch {
-            log(.error, DebugError("Failed to load positions.", cause: error))
+            EPUBPageWorldLog.report(.positionsLoadFailed, withholding: error)
         }
 
         paginationView = makePaginationView(
@@ -639,7 +662,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         assert(Thread.isMainThread, "Raising navigation events must be done from the main thread")
 
         if config.debugState {
-            log(.debug, "-> on \(event)")
+            log(.debug, "-> on \(event.logName)")
         }
 
         return state.transition(event)
@@ -1513,7 +1536,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
             let url = AnyURL(string: href),
             var link = publication.linkWithHREF(url)
         else {
-            log(.warning, "Cannot find link with HREF: \(href)")
+            EPUBPageWorldLog.report(.internalLinkNotFound, withholding: href)
             return
         }
         link.href = href
@@ -1567,27 +1590,27 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
                 let url = AnyURL(string: href),
                 let id = url.fragment
             else {
-                log(.warning, "Could not find hash in link \(href)")
+                EPUBPageWorldLog.report(.noteFragmentMissing, withholding: href)
                 return nil
             }
 
             // Read the note's resource through the publication's resource API.
             guard let resource = publication.get(url.removingFragment()) else {
-                log(.warning, "Could not open note resource: \(href)")
+                EPUBPageWorldLog.report(.noteResourceUnavailable, withholding: href)
                 return nil
             }
             let contents = try await resource.read().asString().get()
             let document = try parse(contents)
 
             guard let aside = try document.select("#\(id)").first() else {
-                log(.warning, "Could not find the element '#\(id)' in document \(href)")
+                EPUBPageWorldLog.report(.noteElementMissing, withholding: (id, href))
                 return nil
             }
 
             return try (aside.html(), link.html())
 
         } catch {
-            log(.warning, "Caught error while getting note content: \(error)")
+            EPUBPageWorldLog.report(.noteContentFailed, withholding: error)
             return nil
         }
     }

@@ -45,6 +45,15 @@ enum EPUBPageWorldLog: Loggable {
         /// A scroll was requested to a progression outside `0...1`.
         case invalidScrollProgression = "invalid_scroll_progression"
 
+        case positionsLoadFailed = "positions_load_failed"
+        case internalLinkNotFound = "internal_link_not_found"
+        case noteFragmentMissing = "note_fragment_missing"
+        case noteResourceUnavailable = "note_resource_unavailable"
+        case noteElementMissing = "note_element_missing"
+        case noteContentFailed = "note_content_failed"
+        case resourceRangeReadFailed = "resource_range_read_failed"
+        case resourceReadFailed = "resource_read_failed"
+
         /// The severity this reason is reported at.
         ///
         /// Owned by the reason rather than passed per call, so the level is part
@@ -53,13 +62,18 @@ enum EPUBPageWorldLog: Loggable {
             switch self {
             case .javaScriptConsoleMessage, .malformedDOMRange:
                 return .debug
-            case .javaScriptUncaughtError:
+            case .javaScriptUncaughtError, .positionsLoadFailed, .resourceRangeReadFailed, .resourceReadFailed:
                 return .error
             case .malformedSelectionBody,
                  .malformedDecorationActivationBody,
                  .malformedImageActivationBody,
                  .malformedLinkActivationBody,
-                 .invalidScrollProgression:
+                 .invalidScrollProgression,
+                 .internalLinkNotFound,
+                 .noteFragmentMissing,
+                 .noteResourceUnavailable,
+                 .noteElementMissing,
+                 .noteContentFailed:
                 return .warning
             }
         }
