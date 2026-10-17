@@ -220,27 +220,24 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     }
 
     /// Closing the reader while a calculation waits on the table of contents
-    /// releases it, and the calculation reports nothing once it answers.
+    /// releases it before the contents answer.
     func test_aClosedReaderIsReleasedDespiteAHeldCalculation() async throws {
         let contents = HeldTableOfContents()
+        defer { contents.release() }
         var reader: Reader? = try await openReader(tableOfContents: contents)
         try await reader?.waitFor("a calculation of the opening page") { contents.wasAsked }
-        let spy = try XCTUnwrap(reader?.spy)
         weak let weakNavigator = reader?.navigator
         // A visible window keeps its former root controller until hidden.
         reader?.window.isHidden = true
         reader?.window.rootViewController = nil
         reader = nil
 
-        // The table of contents task holds the navigator until it answers.
-        contents.release()
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: .seconds(Self.reportTimeout))
         while weakNavigator != nil, clock.now < deadline {
             try await clock.sleep(for: .milliseconds(20))
         }
         XCTAssertNil(weakNavigator, "A held calculation kept the closed reader alive")
-        XCTAssertEqual(spy.locations.count, 0, "The closed reader reported the held calculation")
     }
 
     // MARK: - Fixed layout

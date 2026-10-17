@@ -646,7 +646,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         get async { await tableOfContentsTitleByHrefTask.value }
     }
 
-    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task {
+    /// Captures the publication, not `self`: a closed reader must not stay
+    /// alive until the table of contents answers, which it may never do.
+    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task { [publication] in
         func fulfill(linkList: [Link]) -> [AnyURL: String] {
             var result = [AnyURL: String]()
 
