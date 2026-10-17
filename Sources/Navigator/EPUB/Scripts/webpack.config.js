@@ -8,6 +8,7 @@ module.exports = {
     reflowable: "./src/index-reflowable.js",
     fixed: "./src/index-fixed.js",
     "reader-locator-commands": "./src/reader-locator-commands.js",
+    "external-link-activation": "./src/external-link-activation.js",
     "fixed-wrapper-one": "./src/index-fixed-wrapper-one.js",
     "fixed-wrapper-two": "./src/index-fixed-wrapper-two.js",
   },

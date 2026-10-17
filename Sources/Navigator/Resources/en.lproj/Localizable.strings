@@ -5,3 +5,4 @@
 */
 
 "ReadiumNavigator.EditingAction.share" = "Share…";
+"ReadiumNavigator.LinkContextMenu.openLink" = "Open Link…";

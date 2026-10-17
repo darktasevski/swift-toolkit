@@ -64,6 +64,68 @@ Carried since the v3.9.0 sync. Upstream #792 added the official `PDFResourceCont
 | `Tests/StreamerTests/Parser/PDF/PDFTextNormalizerTests.swift` | 6 tests: within-paragraph join, paragraph-break preservation, hyphenation, multiple blank lines, empty, single-line. |
 | `Tests/StreamerTests/Parser/PDF/NormalizingPDFContentIteratorTests.swift` | 6 tests: segment+highlight rejoin, hyphenation, locator preservation, end-of-iteration nil, non-text pass-through, `previous()` normalization. |
 
+## Owned link context menu
+
+A long-press on a link that leaves the publication showed WebKit's link menu, whose preview fetched the destination and whose "Open Link" went to Safari without consulting the navigation policy, so a host app that confirms outbound links (Reader app #3016) was bypassed. Returning `nil` from the UI delegate does not suppress it for an `http(s)` link: WebKit falls back to DataDetectors' URL menu. The spread view returns its own configuration instead: no preview, and one item that takes the tap path (`spreadView(_:didTapOnExternalURL:)`). Links inside the publication and `javascript:` links get `nil`. An image keeps WebKit's menu unless it is inside an outbound link, where it gets this one, without Save, Copy or Share. Design record: [ADR-0186 in the host repository](../../docs/ADR/0186-converted-container-link-disposition.md).
+
+For an upstream PR, three things would surprise: the item reads "Open Link…" with a `safari` image although upstream's default hand-off opens at once (and `mailto:` opens Mail); WebKit's Copy Link and Share are gone; and for a publication served over `http(s)` every internal link is `http(s)`, so returning `nil` for it still gets DataDetectors' menu — unreachable for a publication served from the custom scheme, as the host app's are.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBSpreadView+LinkContextMenu.swift` | `EPUBSpreadView` answers `WKUIDelegate`'s `webView(_:contextMenuConfigurationForElement:completionHandler:)` through `linkContextMenuConfiguration(forLinkURL:)`. A link the publication base (`relativize`) does not hold, and that is not `javascript:`, gets the menu; its item calls `openOutboundLink(_:)`. The title is `ReadiumNavigator.LinkContextMenu.openLink`, which a host overrides from its main bundle. | Yes — upstream has the same bypass. |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/Resources/en.lproj/Localizable.strings` | Adds `ReadiumNavigator.LinkContextMenu.openLink` = "Open Link…". | Yes. |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewLinkContextMenuTests.swift` | 12 tests: internal, outbound, `mailto:`, `javascript:` and no-link classification; the one-item menu, its default title, and its item taking the tap path; the spread view answering WebKit's selector; and the hook's configuration for an outbound, an internal and no link. That the menu replaces WebKit's on a device, with no preview request, is measured in the host app. |
+
+## Outbound link clicks open no connection
+
+A click on a link in a reflowable EPUB started a main-frame navigation, and WebKit connected to the target's host while it handled the click, before `webView(_:decidePolicyFor:decisionHandler:)` could cancel the navigation: the reader reached the host before a host app that confirms outbound links (Reader app #3016) had asked. Measured with a loopback listener: an accept at the tap, no bytes, the real request only on Open. A fixed-layout EPUB (its page is an iframe) and the PDF navigator did not connect.
+
+`external-link-activation.js` now cancels the click of a link whose scheme or host differs from the document's, after posting its URL. It runs in its own content world, so a publication script can neither redefine what it calls nor post its message, and its listeners go on the window in the capture phase as it runs at document start, before any publication script. Two consequences follow, accepted: a publication script that handles an outbound link itself (cancels the click and shows something) now also raises the host's confirmation, and its handlers find the click already cancelled, so one that ignores cancelled clicks never runs for an outbound link. If the message cannot be posted the click is left to WebKit, so the navigation policy still asks. The policy also stays the path for what the script cannot see — a link inside a closed shadow root, a link an SVG `<use>` instances, a frame that may not run script — and for scripted navigation; those connect before the policy asks. The Swift side has the last word on "internal": a posted URL the publication base holds opens inside the book. Design record: [ADR-0186 in the host repository](../../docs/ADR/0186-converted-container-link-disposition.md).
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/external-link-activation.js` | Built into its own bundle, `readium-external-link-activation.js`. Cancels a click or `auxclick` — any button but the right one, as WebKit activates links with — on a link leaving the publication, after posting `externalLinkActivated` with its URL. A link is what WebKit treats as one: an HTML `a`/`area` with an `href`, an SVG `a` with `href` or `xlink:href`, a MathML element with `href`; the search walks `composedPath()` outward past an `a` with no `href`, so a link in an open shadow root counts. Leaves alone a `javascript:` link and one on the document's own scheme and host; "own" is the document's `location`, never a `<base href>`, and for an `about:srcdoc` or `about:blank` frame its embedder's. | Yes. |
+| `Sources/Navigator/EPUB/EPUBExternalLinkActivationBridge.swift` | Installs the bundle as a document-start user script in the `ReadiumExternalLinkActivation` content world and registers `externalLinkActivated` in that world only. | Yes. |
+| `Sources/Navigator/EPUB/EPUBSpreadView+ExternalLinkActivation.swift` | Handles the message: a URL the publication base holds goes to `spreadView(_:didTapOnInternalLink:clickEvent:)`, any other to `spreadView(_:didTapOnExternalURL:)`; a body without a usable `href` is reported as `malformedLinkActivationBody` to `EPUBPageWorldLog`. | No — it reports to the fork-only `EPUBPageWorldLog`; upstream would need its own logging in its place. |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBSpreadView.swift` | Holds the bridge and installs it with the configuration; wires its activations to `didActivateExternalLink(_:)`; enables and disables its handler beside the locator bridge's. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/webpack.config.js` | One entry, `external-link-activation`. `index.js`, `gestures.js` and the reflowable and fixed bundles are unchanged. | Yes. |
+
+### Modified fork files
+
+| Path | Change |
+| --- | --- |
+| `Sources/Navigator/EPUB/EPUBPageWorldLog.swift` | Adds the `malformedLinkActivationBody` reason, at `.warning`. The file is fork-only (absent from `3.11.0`). |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewExternalLinkClickTests.swift` | 4 hosted tests in a loaded web view. Reflowable and fixed layout's iframe: which clicks are already cancelled when they reach the link and are handed over exactly once (`https`, an element inside a link, an `a` without `href` inside an outbound link, `mailto:`, SVG `href` and `xlink:href`, MathML `href`, an image-map `area`, an open shadow root, a `srcdoc` frame, middle- and fourth-button `auxclick`s, a link the publication's own capture listener stops, a `<base href>` on the link's host, a page that replaced `URL` and `composedPath`), and which are left to WebKit and opened inside the book by its policy (another resource, a fragment, a MathML `href` in the book, another resource from a `srcdoc` frame) or do nothing (`javascript:`, no `href`, an HTML `a` with only `xlink:href`, a right-button `auxclick`). A page-world script cannot see the handler; a click the script cannot post is left to the policy. That no connection opens on a device is measured in the host app. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewExternalLinkActivationTests.swift` | 7 tests: a body's `href` becomes the URL, including a `|` the web parser leaves unescaped and punycode and IPv6 hosts; a body without a usable `href` yields none; an activation reaches the delegate, one inside the publication opens inside it; a malformed one is reported and hands over nothing. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewHosting.swift` | Test support: builds (with a frame), hosts and waits for real spread views. The load waits and their #1693 earned-skip rule moved here from `EPUBSpreadViewCommandOutcomeTests`, which now calls them; `waitUntil` reports at its caller. |
+| `Tests/NavigatorTests/EPUB/CapturingLogger.swift` | Test support: the capturing logger, moved out of `EPUBPageWorldLogTests.swift`. |
+| `Tests/NavigatorTests/EPUB/EPUBPageWorldLogTests.swift` | The new reason joins the level table and the warning-floor count. The log-interpolation scan covers every `*SpreadView*.swift` source, listed from the directory, so both `EPUBSpreadView+*.swift` extensions are in it. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewCommandOutcomeTests.swift` | Calls the shared helpers instead of its private copies. |
+
 ## Upstream-rebase guidance
 
 When merging upstream `develop` into `fork-extensions`:
@@ -74,5 +136,8 @@ When merging upstream `develop` into `fork-extensions`:
 4. After merge, regenerate the JS bundle (`pnpm run bundle` from `Sources/Navigator/EPUB/Scripts/`) — all four `Assets/Static/scripts/*.js` files will need re-staging due to the chunk-id shift.
 5. Run the fork-side test suite: `xcodebuild test -scheme Readium-Package -destination 'platform=iOS Simulator,name=iPhone 17' -only-testing:ReadiumNavigatorTests/EPUBReflowableSpreadViewVisibleAnchorTests` should pass 9/9.
 6. In `PDFParser.swift`, preserve the `NormalizingPDFContentIterator.Factory(wrapping:)` wrapper around the content-iterator factory; the two `Sources/Streamer/Parser/PDF/` files (`PDFTextNormalizer.swift`, `NormalizingPDFContentIterator.swift`) are fork-only — keep both. If upstream adopts a normalizing pass on `PDFResourceContentIterator` directly, the decorator + `PDFTextNormalizer` can be deleted and the host app's `DatabaseRebuilder+PDF` reuse re-pointed at upstream's symbol.
+
+7. `EPUBSpreadView.swift` keeps its empty `extension EPUBSpreadView: WKUIDelegate {}` and `webView.uiDelegate = self`; `EPUBSpreadView+LinkContextMenu.swift` relies on both. If upstream implements the context-menu delegate method itself, delete the fork's file rather than merging two implementations.
+8. Keep the bridge wiring in `EPUBSpreadView.swift` (the stored bridge, its install, and its enable and disable beside the locator bridge's) and the `external-link-activation` webpack entry, then rebuild the bundles. If upstream starts cancelling outbound clicks itself, keep one path: two would report the link twice.
 
 If upstream introduces a `VisibleAnchorObservingNavigator`-equivalent API, this fork's protocol can be deleted and the class conformance can switch to upstream's. The host app's `Coordinator` already speaks via `(@MainActor @Sendable (String, String) -> Void)?` closures so the wire shape is upstream-agnostic.
