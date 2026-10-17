@@ -1019,6 +1019,21 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         return .eligible(capability)
     }
 
+    override func publicationInput() -> EPUBSpreadPublicationInput? {
+        guard
+            let accepted = builtLocationObservation?.currentObservation,
+            case let .ready(_, capability) = readiness.state,
+            capability == accepted.sample.capability
+        else {
+            return nil
+        }
+        return EPUBSpreadPublicationInput(
+            capability: capability,
+            stamp: accepted.stamp,
+            progressions: [spread.first.index: accepted.sample.range]
+        )
+    }
+
     private func observationDidAccept(_ observation: EPUBAcceptedObservation) {
         progression = observation.sample.range
         // An equal range is reported too: pending navigator work may be

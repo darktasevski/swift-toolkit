@@ -46,9 +46,9 @@ final class EPUBLocatorCommandState {
 ///
 /// Only the stored state stays behind: Swift extensions cannot declare stored
 /// properties, so `locatorCommandState`, `activeLocatorOperationSlot`,
-/// `locatorNavigationTaskQueue`, `idleNotificationGate` and `locatorClock`
-/// remain in the class. The command state's mutable payload stays private to
-/// this file behind owner-only transitions and reads.
+/// `locatorNavigationTaskQueue` and `locatorClock` remain in the class. The
+/// command state's mutable payload stays private to this file behind
+/// owner-only transitions and reads.
 extension EPUBNavigatorViewController {
     /// Whether the bridge locator command may animate its scroll. After a
     /// resource hop the document was already positioned at the FULL target

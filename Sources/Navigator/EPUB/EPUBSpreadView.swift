@@ -856,6 +856,20 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         0 ... 1
     }
 
+    /// What the navigator may publish from this spread now, or `nil` while
+    /// nothing current can be read. A ready spread publishes its resources'
+    /// progressions; a reflowable one requires an accepted observation.
+    func publicationInput() -> EPUBSpreadPublicationInput? {
+        guard case let .ready(_, capability) = readiness.state else {
+            return nil
+        }
+        var progressions: [ReadingOrder.Index: ClosedRange<Double>] = [:]
+        for index in spread.readingOrderIndices {
+            progressions[index] = progression(in: index)
+        }
+        return EPUBSpreadPublicationInput(capability: capability, stamp: nil, progressions: progressions)
+    }
+
     func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {
         fatalError("go(to:) must be implemented in subclasses")
     }

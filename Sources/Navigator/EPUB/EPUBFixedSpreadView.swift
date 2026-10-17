@@ -101,6 +101,14 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         super.clear()
     }
 
+    /// A fixed spread's pages are publishable once it is ready, and nothing
+    /// else tells the navigator so.
+    override func readinessDidChange(_ state: EPUBSpreadReadiness.State) {
+        if case .ready = state {
+            delegate?.spreadViewPagesDidChange(self)
+        }
+    }
+
     override func layoutSubviews() {
         super.layoutSubviews()
         layoutSpread()

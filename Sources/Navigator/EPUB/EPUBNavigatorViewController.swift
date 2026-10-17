@@ -399,15 +399,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             switch state {
             case .initializing, .loading, .jumping, .moving:
                 paginationView?.isUserInteractionEnabled = false
-                _ = idleNotificationGate.setIdle(false)
+                locationPublication.setIdle(false)
             case .idle:
                 paginationView?.isUserInteractionEnabled = true
-                // Drain a request coalesced mid-navigation the instant we settle.
-                if idleNotificationGate.setIdle(true) {
-                    Task { @MainActor [weak self] in
-                        await self?.notifyCurrentLocation()
-                    }
-                }
+                // Publication retained mid-navigation runs the instant we settle.
+                locationPublication.setIdle(true)
             }
         }
     }
@@ -848,33 +844,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         )
     }
 
-    private func computeCurrentLocationAndViewport() async -> (Locator?, NavigatorViewport?) {
-        if case .initializing = state {
-            assertionFailure("Cannot update current location when initializing the navigator")
-            return (nil, nil)
-        }
-
-        // Returns any pending locator to prevent returning invalid locations
-        // while loading it.
-        if let pendingLocator = state.pendingLocator {
-            return (pendingLocator, nil)
-        }
-
-        guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
-            return (nil, nil)
-        }
-
-        let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
-            readingOrderIndices: spreadView.spread.readingOrderIndices,
-            progression: { spreadView.progression(in: $0) },
-            readingOrder: readingOrder,
-            positionsByReadingOrder: positionsByReadingOrder,
-            tableOfContentsTitleByHref: tableOfContentsTitleByHref,
-            fallbackLocator: { [publication] in await publication.locate($0) }
-        )
-        return (locator, viewport)
-    }
-
     public func firstVisibleElementLocator() async -> Locator? {
         guard let spreadView = paginationView?.currentView as? EPUBSpreadView else {
             return nil
@@ -886,23 +855,69 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// Used to avoid sending twice the same location.
     private var notifiedCurrentLocation: Locator?
 
-    /// Postpones the location notification until the navigator settles into
-    /// its `idle` state. An edge-triggered gate coalesces requests made
-    /// mid-navigation and drains them on the `busy → idle` transition (see the
-    /// `state` observer) instead of polling every fixed interval.
-    let idleNotificationGate = EPUBIdleNotificationGate(isIdle: false)
+    /// Publishes the current location only from inputs that are still current
+    /// when the calculation ends. Requests made while navigating are retained
+    /// and run once the navigator is idle.
+    private lazy var locationPublication = EPUBLocationPublication(
+        scheduler: .clock(locatorClock),
+        capture: { [weak self] in self?.capturePublication() },
+        commit: { [weak self] in self?.commitPublication($0) }
+    )
 
-    private func updateCurrentLocation() {
-        guard idleNotificationGate.request() else {
-            return
+    /// What the navigator could publish now: its current spread and that
+    /// spread's current input. The publication tracks idleness itself.
+    private func livePublication() -> (key: EPUBPublicationKey, spreadView: EPUBSpreadView, input: EPUBSpreadPublicationInput)? {
+        guard
+            let paginationView = paginationView,
+            let spreadView = paginationView.currentView as? EPUBSpreadView,
+            let input = spreadView.publicationInput()
+        else {
+            return nil
         }
-        Task { @MainActor [weak self] in
-            await self?.notifyCurrentLocation()
-        }
+        let key = EPUBPublicationKey(
+            spread: ObjectIdentifier(spreadView),
+            spreadIndex: paginationView.currentIndex,
+            capability: input.capability,
+            stamp: input.stamp
+        )
+        return (key, spreadView, input)
     }
 
-    private func notifyCurrentLocation() async {
-        (currentLocation, viewport) = await computeCurrentLocationAndViewport()
+    private func capturePublication() -> EPUBPublicationCapture? {
+        guard let live = livePublication() else {
+            return nil
+        }
+        let key = live.key
+        let readingOrderIndices = live.spreadView.spread.readingOrderIndices
+        let progressions = live.input.progressions
+        let readingOrder = readingOrder
+        let positionsByReadingOrder = positionsByReadingOrder
+        let tableOfContentsTitles = tableOfContentsTitleByHrefTask
+        let publication = publication
+        return EPUBPublicationCapture(
+            // The weak spread keeps a deallocated spread's reused address
+            // from matching the key.
+            isCurrent: { [weak self, weak spreadView = live.spreadView] in
+                spreadView != nil && self?.livePublication()?.key == key
+            },
+            calculate: {
+                let tableOfContentsTitleByHref = await tableOfContentsTitles.value
+                let (locator, viewport) = await EPUBViewportAndLocationCalculator.compute(
+                    readingOrderIndices: readingOrderIndices,
+                    progression: { progressions[$0] ?? 0 ... 0 },
+                    readingOrder: readingOrder,
+                    positionsByReadingOrder: positionsByReadingOrder,
+                    tableOfContentsTitleByHref: tableOfContentsTitleByHref,
+                    fallbackLocator: { await publication.locate($0) }
+                )
+                return EPUBPublicationOutput(locator: locator, viewport: viewport)
+            }
+        )
+    }
+
+    private func commitPublication(_ output: EPUBPublicationOutput) {
+        currentLocation = output.locator
+        viewport = output.viewport
 
         guard
             let delegate = delegate,
@@ -1638,7 +1653,7 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
 
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
         if paginationView?.currentView == spreadView {
-            updateCurrentLocation()
+            locationPublication.request()
         }
     }
 
@@ -1696,7 +1711,7 @@ extension EPUBNavigatorViewController: PaginationViewDelegate {
         // Note that you should set the delegate before you load views
         // otherwise, when open the publication, you may miss the first
         // invocation.
-        updateCurrentLocation()
+        locationPublication.request()
     }
 
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {

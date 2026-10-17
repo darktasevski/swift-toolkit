@@ -1054,6 +1054,63 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertTrue(observation.isReading || observation.hasObligation, "An animation's end asked for nothing")
     }
 
+    // MARK: - Publication input
+
+    /// A reflowable spread publishes exactly its accepted observation, and
+    /// nothing once that observation is revoked.
+    func testPublicationInputIsTheAcceptedObservation() async throws {
+        let (spreadView, _) = try await openObservedReflowableSpread()
+        let observation = try XCTUnwrap(spreadView.builtLocationObservation)
+        let accepted = try XCTUnwrap(observation.currentObservation)
+
+        XCTAssertEqual(spreadView.publicationInput(), EPUBSpreadPublicationInput(
+            capability: accepted.sample.capability,
+            stamp: accepted.stamp,
+            progressions: [spreadView.spread.first.index: accepted.sample.range]
+        ))
+
+        observation.invalidate()
+        XCTAssertNil(spreadView.publicationInput(), "A revoked observation stayed publishable")
+    }
+
+    /// Readiness alone is not publishable for a reflowable spread: its
+    /// fallback range was never measured.
+    func testAReadyReflowableSpreadWithoutAnAcceptedObservationPublishesNothing() async throws {
+        let (spreadView, _) = try await loadObservedReflowableSpread()
+        let outcome = try await initializeLoadedReflowableSpread(spreadView)
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { spreadView.readiness.isCommandReady }
+
+        XCTAssertNil(spreadView.publicationInput())
+    }
+
+    /// A fixed spread publishes its full resources once ready, and tells its
+    /// delegate so, since nothing else would.
+    func testAFixedSpreadReportsItsPagesOnceReady() async throws {
+        let spreadView = makeFixedSpreadView()
+        let delegate = TestSpreadDelegate()
+        spreadView.delegate = delegate
+        spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        try await waitForFixedResourceLoad(in: spreadView)
+        try await enableAnimationFrames(in: spreadView)
+        XCTAssertNil(spreadView.publicationInput(), "A loading fixed spread was publishable")
+        XCTAssertEqual(delegate.pageChanges, 0)
+
+        let outcome = try await initializeLoadedFixedSpread(spreadView)
+        XCTAssertEqual(outcome, .succeeded)
+        try await waitUntil { spreadView.readiness.isCommandReady }
+
+        XCTAssertEqual(delegate.pageChanges, 1, "Readiness did not tell the delegate the pages changed")
+        let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
+        XCTAssertEqual(spreadView.publicationInput(), EPUBSpreadPublicationInput(
+            capability: capability,
+            stamp: nil,
+            progressions: [spreadView.spread.first.index: 0 ... 1]
+        ))
+    }
+
     /// The stability allowance these tests build spread views with.
     ///
     /// Deliberately far wider than production's 5 s. The budget is a product

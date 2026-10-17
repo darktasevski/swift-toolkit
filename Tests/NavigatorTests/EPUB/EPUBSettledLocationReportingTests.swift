@@ -136,6 +136,70 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
     }
 
+    // MARK: - Publication currency
+
+    /// A calculation still waiting on the table of contents when the page
+    /// turns never delivers the geometry it started from; the turned page is
+    /// what the reader reports.
+    func test_aCalculationOutlivedByATurnDeliversOnlyTheTurnedPage() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(tableOfContents: contents)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let before = try await reader.requireGeometry()
+
+        let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        _ = try await reader.waitForOffset(differentFrom: before)
+        try await reader.waitFor("the turned page's measurement") {
+            (spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound ?? 0) > 0
+        }
+
+        try await assertOnlyTheNewGeometryIsReported(by: reader, once: contents)
+    }
+
+    /// The same holds for a native scroll, which moves no navigator state: only
+    /// the changed observation keeps the old calculation from committing.
+    func test_aCalculationOutlivedByAScrollDeliversOnlyTheScrolledPage() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(tableOfContents: contents)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let before = try await reader.requireGeometry()
+
+        spread.scrollView.contentOffset = CGPoint(x: spread.scrollView.bounds.width, y: 0)
+        _ = try await reader.waitForOffset(differentFrom: before)
+        try await reader.waitFor("the scrolled page's measurement") {
+            (spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound ?? 0) > 0
+        }
+
+        try await assertOnlyTheNewGeometryIsReported(by: reader, once: contents)
+    }
+
+    private func assertOnlyTheNewGeometryIsReported(
+        by reader: Reader,
+        once contents: HeldTableOfContents,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        XCTAssertEqual(reader.spy.locations.count, 0, "A location was delivered before the table of contents answered", file: file, line: line)
+        let report = reader.spy.expectLocation("the new page") { ($0.locations.progression ?? 0) > 0 }
+
+        contents.release()
+
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        XCTAssertTrue(
+            reader.spy.locations.allSatisfy { ($0.locations.progression ?? 0) > 0 },
+            "The outlived calculation delivered the opening page",
+            file: file,
+            line: line
+        )
+        let settled = try await reader.requireGeometry()
+        let last = try XCTUnwrap(reader.spy.locations.last?.locations.progression, file: file, line: line)
+        XCTAssertEqual(last, settled.firstProgression, accuracy: 0.000_001, file: file, line: line)
+    }
+
     // MARK: - Isolated-world progression read
 
     func test_progressionReadMeasuresLeftToRightPages() async throws {
@@ -671,7 +735,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     private func openReader(
         at href: RelativeURL = longChapterHREF,
-        minimumScreens: Int = 3
+        minimumScreens: Int = 3,
+        tableOfContents: HeldTableOfContents? = nil
     ) async throws -> Reader {
         let initialLocation = Locator(
             href: href.anyURL,
@@ -679,7 +744,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             locations: Locator.Locations(progression: 0)
         )
         let navigator = try EPUBNavigatorViewController(
-            publication: makePublication(),
+            publication: makePublication(tableOfContents: tableOfContents),
             initialLocation: initialLocation,
             config: EPUBNavigatorViewController.Configuration()
         )
@@ -695,8 +760,12 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
 
         let reader = Reader(window: window, navigator: navigator, spy: spy)
-        try await reader.waitUntilUsable(minimumScreens: minimumScreens)
-        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        // A held table of contents holds the opening report too.
+        let requiringReport = tableOfContents == nil
+        try await reader.waitUntilUsable(minimumScreens: minimumScreens, requiringReport: requiringReport)
+        if requiringReport {
+            try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        }
         return reader
     }
 
@@ -739,7 +808,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return held
     }
 
-    private func makePublication() -> Publication {
+    private func makePublication(tableOfContents: HeldTableOfContents? = nil) -> Publication {
         let paragraphs = (1 ... 160)
             .map { "<p>Synthetic paragraph \($0). The quick brown fox jumps over the lazy dog, again and again, to fill the page.</p>" }
             .joined()
@@ -763,7 +832,12 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
                     resource: DataResource(string: nextChapter),
                     at: Self.nextChapterHREF.anyURL
                 )
-            )
+            ),
+            servicesBuilder: PublicationServicesBuilder { builder in
+                if let tableOfContents {
+                    builder.setTableOfContentsServiceFactory { _ in tableOfContents }
+                }
+            }
         )
     }
 }
@@ -787,13 +861,13 @@ private struct Reader {
     /// Waits for a ready spread whose paginated content spans enough screens,
     /// and for the navigator's opening report, so the turn under test starts
     /// from a settled page and cannot be confused with the opening.
-    func waitUntilUsable(minimumScreens: Int) async throws {
+    func waitUntilUsable(minimumScreens: Int, requiringReport: Bool = true) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.setupTimeout)
         var lastGeometry: PageGeometry?
         while clock.now < deadline {
             if
-                !spy.locations.isEmpty,
+                !requiringReport || !spy.locations.isEmpty,
                 let spread = currentSpread,
                 spread.readiness.isCommandReady,
                 let geometry = try await geometry()
@@ -1662,4 +1736,33 @@ private final class LocationReportSpy: EPUBNavigatorDelegate {
     }
 
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
+}
+
+/// A table of contents that answers only once the test releases it.
+@MainActor
+private final class HeldTableOfContents: TableOfContentsService {
+    private(set) var wasAsked = false
+    private var isReleased = false
+    private var waiters: [CheckedContinuation<Void, Never>] = []
+
+    func release() {
+        isReleased = true
+        for waiter in waiters {
+            waiter.resume()
+        }
+        waiters = []
+    }
+
+    nonisolated func tableOfContents() async -> ReadResult<[Link]> {
+        await waitForRelease()
+        return .success([])
+    }
+
+    private func waitForRelease() async {
+        wasAsked = true
+        guard !isReleased else {
+            return
+        }
+        await withCheckedContinuation { waiters.append($0) }
+    }
 }
