@@ -606,6 +606,21 @@ final class EPUBLocationObservationTests: XCTestCase {
         XCTAssertEqual(fixture.startedReads, 2)
     }
 
+    /// Only a missing hand-off is re-issued by a grant: a healthy one gets no
+    /// injection, and a pending first re-issue keeps its gap.
+    func test_aGrantLeavesAHealthyHandshakeAlone() {
+        let fixture = ObservationFixture()
+
+        fixture.observation.grant(.visibility)
+        XCTAssertEqual(fixture.reissued, [], "A grant re-issued a hand-off that never failed")
+
+        fixture.observation.handshakeDidFail(for: fixture.capability)
+        fixture.observation.grant(.commandSettlement)
+        XCTAssertEqual(fixture.reissued, [], "A grant re-issued the failed hand-off before its gap")
+        fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
+        XCTAssertEqual(fixture.reissued, [fixture.capability], "The grant cancelled the pending re-issue")
+    }
+
     func test_aRegistrationRestoresTheHandshakeRetry() {
         let fixture = ObservationFixture()
         fixture.observation.handshakeDidFail(for: fixture.capability)
@@ -732,6 +747,23 @@ final class EPUBLocationObservationTests: XCTestCase {
         XCTAssertFalse(fixture.observation.isRegistrationMissing, "The previous document's re-issue was counted")
         fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
         XCTAssertEqual(fixture.reissued, [fixture.capability, next])
+    }
+
+    /// A new document is not held by the previous document's missing
+    /// hand-off: it reads at once.
+    func test_aResetEndsAMissingHandshake() {
+        let fixture = ObservationFixture()
+        failHandshakeTwice(fixture)
+        XCTAssertTrue(fixture.observation.isRegistrationMissing, "Setup: the hand-off is not missing")
+
+        let next = EPUBSpreadFrameCapability()
+        fixture.observation.reset()
+        fixture.documentCapability = next
+        fixture.eligibility = .eligible(next)
+        fixture.observation.request()
+
+        XCTAssertFalse(fixture.observation.isRegistrationMissing)
+        XCTAssertEqual(fixture.startedReads, 1, "The previous document's missing hand-off held the new document's read")
     }
 
     func test_aResetRenewsProvenance() {

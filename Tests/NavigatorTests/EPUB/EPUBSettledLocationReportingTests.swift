@@ -22,8 +22,25 @@ import XCTest
 final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_commandTurnReportsMeasuredProgressionWithinSameResource() async throws {
         let reader = try await openReader()
-        let opening = try XCTUnwrap(reader.spy.locations.last)
-        let openingProgression = try XCTUnwrap(opening.locations.progression)
+        try await assertATurnReportsTheMeasuredProgression(in: reader)
+    }
+
+    /// The command's own settlement measures the turned page: with the page's
+    /// hints silenced, the report still arrives.
+    func test_commandTurnWithHintsSilencedReportsTheMeasuredProgression() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: "progressionChanged")
+        try await assertATurnReportsTheMeasuredProgression(in: reader)
+    }
+
+    private func assertATurnReportsTheMeasuredProgression(
+        in reader: Reader,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        let opening = try XCTUnwrap(reader.spy.locations.last, file: file, line: line)
+        let openingProgression = try XCTUnwrap(opening.locations.progression, file: file, line: line)
         let before = try await reader.requireGeometry()
 
         // Only an advancing report can stand for the turn: a late repeat of
@@ -34,16 +51,23 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
                 && $0.locations.progression.map { $0 > openingProgression } == true
         }
         let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
-        XCTAssertTrue(moved)
+        XCTAssertTrue(moved, file: file, line: line)
         _ = try await reader.waitForOffset(differentFrom: before)
 
         await fulfillment(of: [report], timeout: Self.reportTimeout)
-        _ = try XCTUnwrap(reader.spy.matchedLocation, "No advancing location was reported after the turn")
+        _ = try XCTUnwrap(reader.spy.matchedLocation, "No advancing location was reported after the turn", file: file, line: line)
         let atMatch = try await reader.requireGeometry()
 
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let settled = try await reader.requireGeometry()
-        assertSettledReports(reader.spy.locationsSinceArming, isIn: opening.href, matchedAt: atMatch, settled: settled)
+        assertSettledReports(
+            reader.spy.locationsSinceArming,
+            isIn: opening.href,
+            matchedAt: atMatch,
+            settled: settled,
+            file: file,
+            line: line
+        )
     }
 
     func test_boundaryTurnWithoutMovementInventsNoAdvancement() async throws {
@@ -174,6 +198,65 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
 
         try await assertOnlyTheNewGeometryIsReported(by: reader, once: contents)
+    }
+
+    /// An equal re-measure of the page already reported reports nothing new.
+    func test_anEqualReMeasureReportsNothingNew() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        let scene = try XCTUnwrap(reader.window.windowScene, "Setup: the reader's window has no scene")
+        let accepted = try XCTUnwrap(observation.currentObservation, "Setup: the opening page has no accepted observation")
+        let reported = reader.spy.locations.count
+        let duplicate = reader.spy.expectNoLocation("a second report of the same page") { _ in true }
+
+        observation.invalidate()
+        spread.sceneDidActivate(Notification(name: UIScene.didActivateNotification, object: scene))
+        try await reader.waitFor("the re-measure") { observation.currentObservation != nil }
+        XCTAssertEqual(observation.currentObservation, accepted, "Setup: the re-measure was not equal")
+
+        await fulfillment(of: [duplicate], timeout: Self.quietWindow)
+        XCTAssertEqual(reader.spy.locations.count, reported)
+    }
+
+    /// Closing the reader while a calculation waits on the table of contents
+    /// releases it, and the calculation reports nothing once it answers.
+    func test_aClosedReaderIsReleasedDespiteAHeldCalculation() async throws {
+        let contents = HeldTableOfContents()
+        var reader: Reader? = try await openReader(tableOfContents: contents)
+        try await reader?.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let spy = try XCTUnwrap(reader?.spy)
+        weak let weakNavigator = reader?.navigator
+        // A visible window keeps its former root controller until hidden.
+        reader?.window.isHidden = true
+        reader?.window.rootViewController = nil
+        reader = nil
+
+        // The table of contents task holds the navigator until it answers.
+        contents.release()
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(Self.reportTimeout))
+        while weakNavigator != nil, clock.now < deadline {
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTAssertNil(weakNavigator, "A held calculation kept the closed reader alive")
+        XCTAssertEqual(spy.locations.count, 0, "The closed reader reported the held calculation")
+    }
+
+    // MARK: - Fixed layout
+
+    /// A fixed-layout reader reports its opening page and the page a turn
+    /// lands on.
+    func test_aFixedLayoutTurnReportsTheDestinationPage() async throws {
+        let reader = try await openReader(layout: .fixed, minimumScreens: 0)
+        let opening = try XCTUnwrap(reader.spy.locations.last, "The opening page was not reported")
+        XCTAssertTrue(opening.href.isEquivalentTo(Self.longChapterHREF.anyURL), "The opening report named \(opening.href)")
+        let report = reader.spy.expectLocation("the turned page") { $0.href.isEquivalentTo(Self.nextChapterHREF.anyURL) }
+
+        let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
+
+        XCTAssertTrue(moved)
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
     }
 
     private func assertOnlyTheNewGeometryIsReported(
@@ -735,6 +818,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     private func openReader(
         at href: RelativeURL = longChapterHREF,
+        layout: ReadiumShared.Layout = .reflowable,
         minimumScreens: Int = 3,
         tableOfContents: HeldTableOfContents? = nil
     ) async throws -> Reader {
@@ -744,7 +828,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             locations: Locator.Locations(progression: 0)
         )
         let navigator = try EPUBNavigatorViewController(
-            publication: makePublication(tableOfContents: tableOfContents),
+            publication: makePublication(layout: layout, tableOfContents: tableOfContents),
             initialLocation: initialLocation,
             config: EPUBNavigatorViewController.Configuration()
         )
@@ -808,7 +892,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return held
     }
 
-    private func makePublication(tableOfContents: HeldTableOfContents? = nil) -> Publication {
+    private func makePublication(layout: ReadiumShared.Layout = .reflowable, tableOfContents: HeldTableOfContents? = nil) -> Publication {
         let paragraphs = (1 ... 160)
             .map { "<p>Synthetic paragraph \($0). The quick brown fox jumps over the lazy dog, again and again, to fill the page.</p>" }
             .joined()
@@ -820,7 +904,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         ]
         return Publication(
             manifest: Manifest(
-                metadata: Metadata(title: "Settled location reporting", layout: .reflowable),
+                metadata: Metadata(title: "Settled location reporting", layout: layout),
                 readingOrder: readingOrder
             ),
             container: CompositeContainer(

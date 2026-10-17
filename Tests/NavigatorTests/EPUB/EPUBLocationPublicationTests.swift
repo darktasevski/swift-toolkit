@@ -227,6 +227,31 @@ final class EPUBLocationPublicationTests: XCTestCase {
         XCTAssertFalse(fixture.publication.isOperationPending)
     }
 
+    /// A calculation still running does not keep the publication alive, and
+    /// its late exit commits nothing.
+    func test_aRunningCalculationDoesNotKeepThePublicationAlive() async throws {
+        let deadlines = ManualDeadlines()
+        let calculation = try Calculation(name: "a", href: XCTUnwrap(RelativeURL(path: "chapter.html")).anyURL)
+        let commits = CommitRecorder()
+        var publication: EPUBLocationPublication? = EPUBLocationPublication(
+            scheduler: deadlines.scheduler,
+            capture: { EPUBPublicationCapture(isCurrent: { true }, calculate: { await calculation.run() }) },
+            commit: { commits.titles.append($0.locator?.title ?? "nil") }
+        )
+        publication?.setIdle(true)
+        publication?.request()
+        try await pollUntil { calculation.started }
+        weak let weakPublication = publication
+
+        publication = nil
+        XCTAssertNil(weakPublication, "The running calculation kept the publication alive")
+
+        calculation.release()
+        try await pollUntil { calculation.exited }
+        try await ContinuousClock().sleep(for: .milliseconds(50))
+        XCTAssertEqual(commits.titles, [], "The released publication's calculation committed")
+    }
+
     func test_aCalculationThatExitsInTimeLeavesNoDeadlineArmed() async throws {
         let fixture = try PublicationFixture()
         fixture.publication.setIdle(true)
@@ -249,6 +274,7 @@ private final class Calculation {
     let href: AnyURL
     var isCurrent = true
     private(set) var started = false
+    private(set) var exited = false
     private var released = false
     private var continuation: CheckedContinuation<Void, Never>?
 
@@ -268,6 +294,7 @@ private final class Calculation {
         if !released {
             await withCheckedContinuation { continuation = $0 }
         }
+        exited = true
         return EPUBPublicationOutput(
             locator: Locator(href: href, mediaType: .html, title: name),
             viewport: NavigatorViewport(resources: [], progression: 0 ... 0, positions: nil)
@@ -316,17 +343,34 @@ private final class PublicationFixture {
         file: StaticString = #filePath,
         line: UInt = #line
     ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(10))
-        while clock.now < deadline {
-            if condition() {
-                return
-            }
-            try await clock.sleep(for: .milliseconds(5))
-        }
-        XCTFail("Condition did not become true before timeout", file: file, line: line)
-        throw PublicationTimeout()
+        try await pollUntil(condition, file: file, line: line)
     }
+}
+
+/// Commits recorded apart from any fixture, so a test can release everything
+/// else.
+@MainActor
+private final class CommitRecorder {
+    var titles: [String] = []
+}
+
+/// Polls until `condition` holds, failing otherwise.
+@MainActor
+private func pollUntil(
+    _ condition: () -> Bool,
+    file: StaticString = #filePath,
+    line: UInt = #line
+) async throws {
+    let clock = ContinuousClock()
+    let deadline = clock.now.advanced(by: .seconds(10))
+    while clock.now < deadline {
+        if condition() {
+            return
+        }
+        try await clock.sleep(for: .milliseconds(5))
+    }
+    XCTFail("Condition did not become true before timeout", file: file, line: line)
+    throw PublicationTimeout()
 }
 
 private struct PublicationTimeout: Error {}

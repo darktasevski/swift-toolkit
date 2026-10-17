@@ -73,7 +73,7 @@ final class EPUBLocationPublication {
     private let capture: @MainActor () -> EPUBPublicationCapture?
     private let commit: @MainActor (EPUBPublicationOutput) -> Void
 
-    /// Advanced each time the navigator leaves idle.
+    /// Advanced by every `setIdle(false)`.
     private var revision: UInt64 = 0
     private var isIdle = false
     private var active: Active?

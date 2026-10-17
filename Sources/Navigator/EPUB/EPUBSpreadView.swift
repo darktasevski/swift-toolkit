@@ -36,7 +36,8 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     ///   - domRange: The DOM range for anchoring highlights (optional)
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?)
 
-    /// Called when the pages visible in the spread changed.
+    /// Called when the pages visible in the spread changed: a reflowable
+    /// spread accepted a measurement, or a fixed spread became ready.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
 
     /// Called when the spread view needs to present a view controller.
@@ -275,8 +276,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         fatalError("loadSpread() must be implemented in subclasses")
     }
 
-    /// Told of each readiness change. Fixed layout keeps its own geometry
-    /// ownership, so the base does nothing.
+    /// Told of each readiness change. The base does nothing; each layout
+    /// overrides it.
     func readinessDidChange(_ state: EPUBSpreadReadiness.State) {}
 
     /// Told when a frame registering under the current capability becomes the

@@ -194,7 +194,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let outcome = await turn.value
 
         XCTAssertEqual(outcome, .succeeded)
-        XCTAssertEqual(coordinator.lastSettlement, .finished, "The fallback timer ended the wait")
+        XCTAssertEqual(coordinator.lastSettlementForTesting, .finished, "The fallback timer ended the wait")
     }
 
     func testReflowablePageTurnAtBoundaryReturnsBoundaryAndRemainsReady() async throws {
@@ -915,13 +915,17 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// Admission revokes the accepted sample at once, before the command's
     /// writer moves readiness.
     func testACommandRevokesTheAcceptedSampleOnAdmission() async throws {
+        guard #available(iOS 26.0, *) else {
+            throw XCTSkip("Stopping a command between admission and its writer needs Task.immediate")
+        }
         let (spreadView, _) = try await openObservedReflowableSpread()
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
 
-        let command = Task { @MainActor in
+        // Runs the command here up to its first suspension, so the writer task
+        // it admitted has not started; a yield left that order to the executor.
+        let command = Task.immediate { @MainActor in
             await spreadView.go(to: .start, animated: false)
         }
-        await Task.yield()
 
         XCTAssertTrue(spreadView.readiness.isCommandReady, "The command's writer had already moved readiness")
         XCTAssertNil(observation.currentObservation, "Admission kept the accepted sample")
@@ -934,17 +938,25 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     /// Only a registration ends a hand-off that failed twice; its re-issue
     /// alone does not.
     func testARegistrationEndsAMissingHandshake() async throws {
-        let (spreadView, _) = try await openObservedReflowableSpread()
+        let (spreadView, delegate) = try await openObservedReflowableSpread()
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
         let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
         let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
         report(.handshakeFailed(capability, .registrationMissing))
         report(.handshakeFailed(capability, .registrationMissing))
         XCTAssertTrue(observation.isRegistrationMissing)
+        observation.invalidate()
+        observation.request()
+        XCTAssertFalse(observation.isReading, "A read started while the hand-off was missing")
+        let pageChanges = delegate.pageChanges
 
         spreadView.locatorCommandBridge.setFrameCapability(capability)
 
-        try await waitUntil { !observation.isRegistrationMissing }
+        // The hand-off's freed slot cannot read while it is missing, so only
+        // the registration can bring this report.
+        try await waitUntil { delegate.pageChanges > pageChanges }
+        XCTAssertFalse(observation.isRegistrationMissing)
+        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
     }
 
     /// A new document's hand-off gets a re-issue of its own, whatever the
@@ -1111,6 +1123,35 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         ))
     }
 
+    /// A ready double spread publishes each of its resources, not only the
+    /// leading one.
+    func testAReadyDoubleFixedSpreadPublishesBothResources() async throws {
+        let fixture = makeFixture(layout: .fixed, double: true)
+        let spreadView = EPUBFixedSpreadView(
+            viewModel: fixture.viewModel,
+            spread: fixture.spread,
+            scripts: [],
+            animatedLoad: false,
+            stabilityBudget: Self.generousStabilityBudget
+        )
+        spreadView.frame = CGRect(x: 0, y: 0, width: 1200, height: 800)
+        spreadView.layoutIfNeeded()
+        try await waitForDocumentLoad(in: spreadView)
+        let capability = EPUBSpreadFrameCapability()
+        let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
+            for: spreadView.readiness.generation,
+            frameCapability: capability
+        ))
+        spreadView.readiness.finishInitialization(rootLease, outcome: .succeeded)
+        XCTAssertTrue(spreadView.readiness.isCommandReady, "Setup: the spread is not ready")
+
+        XCTAssertEqual(spreadView.publicationInput(), EPUBSpreadPublicationInput(
+            capability: capability,
+            stamp: nil,
+            progressions: [0: 0 ... 1, 1: 0 ... 1]
+        ))
+    }
+
     /// The stability allowance these tests build spread views with.
     ///
     /// Deliberately far wider than production's 5 s. The budget is a product
@@ -1267,24 +1308,32 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
     private func makeFixture(
         layout: ReadiumShared.Layout,
-        scroll: Bool = false
+        scroll: Bool = false,
+        double: Bool = false
     ) -> (
         viewModel: EPUBNavigatorViewModel,
         spread: EPUBSpread
     ) {
         let href = RelativeURL(path: "chapter.html")!
+        let secondHREF = RelativeURL(path: "facing.html")!
         let stylesheetHREF = RelativeURL(path: "late.css")!
         let link = Link(href: href.string, mediaType: .html)
+        let secondLink = Link(href: secondHREF.string, mediaType: .html)
+        let readingOrder = double ? [link, secondLink] : [link]
         let publication = Publication(
             manifest: Manifest(
                 metadata: Metadata(title: "Spread command outcome", layout: layout),
-                readingOrder: [link],
+                readingOrder: readingOrder,
                 resources: [Link(href: stylesheetHREF.string, mediaType: .css)]
             ),
             container: CompositeContainer(
                 SingleResourceContainer(
                     resource: DataResource(string: "<!doctype html><html><head><style>body{height:10000px}</style></head><body>Chapter</body></html>"),
                     at: href.anyURL
+                ),
+                SingleResourceContainer(
+                    resource: DataResource(string: "<!doctype html><html><body>Facing</body></html>"),
+                    at: secondHREF.anyURL
                 ),
                 SingleResourceContainer(
                     resource: DataResource(string: "body { letter-spacing: 0; }"),
@@ -1294,12 +1343,13 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
         let viewModel = EPUBNavigatorViewModel(
             publication: publication,
-            readingOrder: [link],
+            readingOrder: readingOrder,
             config: .init(preferences: EPUBPreferences(scroll: scroll))
         )
-        let spread = EPUBSpread.single(EPUBSingleSpread(
-            resource: EPUBSpreadResource(index: 0, link: link)
-        ))
+        let first = EPUBSpreadResource(index: 0, link: link)
+        let spread: EPUBSpread = double
+            ? .double(EPUBDoubleSpread(first: first, second: EPUBSpreadResource(index: 1, link: secondLink)))
+            : .single(EPUBSingleSpread(resource: first))
         return (viewModel, spread)
     }
 

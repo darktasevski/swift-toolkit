@@ -99,7 +99,8 @@ enum EPUBObservationEligibility: Equatable, Sendable {
     case unsettled
 }
 
-/// What grants one recovery cycle, and so ends an unavailability.
+/// What grants one recovery cycle, and so ends an unavailability or a
+/// missing hand-off.
 enum EPUBObservationGrant: Equatable, Sendable {
     /// The owning scene became active again.
     case visibility
@@ -249,7 +250,8 @@ final class EPUBLocationObservation {
     }
 
     /// A page hint asks for one measurement at the end of a fixed window that
-    /// later hints neither extend nor restart. Ignored while unavailable.
+    /// later hints neither extend nor restart. Ignored while unavailable or
+    /// while the hand-off is missing.
     func hint() {
         guard hintWindowDeadline == nil, unavailability == nil, !isRegistrationMissing else {
             return

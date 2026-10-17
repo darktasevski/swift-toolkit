@@ -49,8 +49,9 @@ final class EPUBScrollAnimationCoordinator {
             case fellBack
         }
 
-        /// How the last wait that was still pending ended.
-        private(set) var lastSettlement: Settlement?
+        /// What ended the last wait that `finish()` or its own fallback
+        /// timer ended. A cancelled or superseded wait records nothing.
+        private(set) var lastSettlementForTesting: Settlement?
     #endif
 
     func waitUntilSettled() async {
@@ -99,7 +100,7 @@ final class EPUBScrollAnimationCoordinator {
     func finish() {
         guard let request = takePendingRequest() else { return }
         #if RENDER_FAITHFUL_NAV_TESTING
-            lastSettlement = .finished
+            lastSettlementForTesting = .finished
         #endif
         request.resume()
     }
@@ -107,7 +108,7 @@ final class EPUBScrollAnimationCoordinator {
     private func fallBack(_ request: Request) {
         guard let request = takePendingRequest(matching: request) else { return }
         #if RENDER_FAITHFUL_NAV_TESTING
-            lastSettlement = .fellBack
+            lastSettlementForTesting = .fellBack
         #endif
         request.resume()
     }
@@ -137,8 +138,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var activePositionCommand: PositionCommandEntry?
 
     /// Built on first use: the base initializer's first load reports readiness
-    /// before this class could assign it. A `deinit` never builds it, since the
-    /// hooks reach the spread through weak references that are nil by then.
+    /// before this class could assign it. A `deinit` never builds it: its hooks
+    /// capture the spread weakly, and forming a weak reference to a deallocating
+    /// object traps.
     private(set) var builtLocationObservation: EPUBLocationObservation?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")

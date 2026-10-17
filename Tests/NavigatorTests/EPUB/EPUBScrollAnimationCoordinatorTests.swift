@@ -84,6 +84,33 @@ final class EPUBScrollAnimationCoordinatorTests: XCTestCase {
         XCTAssertTrue(finished)
     }
 
+    /// A superseded wait's fallback timer cannot end the wait that replaced
+    /// it; that wait ends on its own timer.
+    func testASupersededWaitsFallbackLeavesTheNewerWaitToItsOwnTimer() async throws {
+        let coordinator = EPUBScrollAnimationCoordinator()
+        let first = Task { @MainActor in
+            await coordinator.waitUntilSettled()
+        }
+        await waitUntil { coordinator.hasPendingRequest }
+        // Holding the superseded request keeps its fallback timer live.
+        let superseded = try XCTUnwrap(coordinator.takePendingRequest())
+        superseded.resume()
+        await first.value
+        let clock = ContinuousClock()
+        try await clock.sleep(for: .milliseconds(600))
+
+        let secondStart = clock.now
+        await coordinator.waitUntilSettled()
+
+        XCTAssertGreaterThanOrEqual(
+            secondStart.duration(to: clock.now),
+            .milliseconds(800),
+            "The superseded wait's fallback ended the newer wait"
+        )
+        XCTAssertEqual(coordinator.lastSettlementForTesting, .fellBack)
+        withExtendedLifetime(superseded) {}
+    }
+
     private func waitUntil(
         _ predicate: @MainActor () -> Bool,
         iterations: Int = 100
