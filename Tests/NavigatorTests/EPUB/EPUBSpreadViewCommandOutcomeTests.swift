@@ -11,6 +11,47 @@ import XCTest
 
 @MainActor
 final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
+    func testNavigatorForwardsNativeInputBeforeReportsAndExcludesSelection() throws {
+        let fixture = makeFixture(layout: .reflowable)
+        let locator = Locator(href: RelativeURL(path: "chapter.html")!.anyURL, mediaType: .html)
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: locator)
+        let delegate = NavigationInputDelegate()
+        navigator.delegate = delegate
+        let spread = makeReflowableSpreadView()
+        spread.delegate = navigator
+        spread.scrollViewWillBeginDragging(spread.scrollView)
+        XCTAssertEqual(delegate.inputs, 1)
+        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), frame: .zero, domRange: nil)
+        XCTAssertNotNil(navigator.currentSelection)
+        spread.scrollViewWillBeginDragging(spread.scrollView)
+        XCTAssertEqual(delegate.inputs, 1, "Selection dragging must not admit navigation")
+    }
+
+    func testVoiceOverPageScrollAdmitsBeforeTurningPages() throws {
+        let fixture = makeFixture(layout: .reflowable)
+        let locator = Locator(href: RelativeURL(path: "chapter.html")!.anyURL, mediaType: .html)
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: locator)
+        let delegate = NavigationInputDelegate()
+        navigator.delegate = delegate
+        let directions: [UIAccessibilityScrollDirection] = [.next, .previous, .left, .right, .up, .down]
+        for (index, direction) in directions.enumerated() {
+            XCTAssertTrue(navigator.accessibilityScroll(direction))
+            XCTAssertEqual(delegate.inputs, index + 1, "VoiceOver scroll \(direction.rawValue) must admit")
+        }
+    }
+
+    func testNativeDragAdmitsPaginatedAndContinuousNavigation() {
+        for scrolling in [false, true] {
+            let spread = makeReflowableSpreadView(scroll: scrolling)
+            let delegate = TestSpreadDelegate()
+            spread.delegate = delegate
+            spread.scrollViewWillBeginDragging(spread.scrollView)
+            XCTAssertEqual(delegate.navigationInputs, 1)
+            spread.scrollViewDidScroll(spread.scrollView)
+            XCTAssertEqual(delegate.navigationInputs, 1, "Geometry is not another input")
+        }
+    }
+
     func testFreshReflowablePaginationImmediatelyAwaitsItsPageCommand() async {
         let spreadView = makeReflowableSpreadView(
             scroll: true,
@@ -20,7 +61,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.layoutIfNeeded()
         let (pagination, delegate) = makePagination(spreadView: spreadView)
         _ = delegate
-        let hostWindow = hostView(pagination)
+        let hostWindow = EPUBSpreadViewHosting.host(pagination)
         defer { hostWindow.isHidden = true }
 
         let outcome = await pagination.goToIndex(
@@ -41,7 +82,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.layoutIfNeeded()
         let (pagination, delegate) = makePagination(spreadView: spreadView)
         _ = delegate
-        let hostWindow = hostView(pagination)
+        let hostWindow = EPUBSpreadViewHosting.host(pagination)
         defer { hostWindow.isHidden = true }
 
         let outcome = await pagination.goToIndex(
@@ -56,7 +97,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
     func testReplacementReflowableLoadStartsItsGenerationSynchronously() async throws {
         let spreadView = makeReflowableSpreadView()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         let firstGeneration = spreadView.readiness.generation
 
         spreadView.loadSpread()
@@ -72,7 +113,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let spreadView = makeReflowableSpreadView(scroll: true)
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
 
         let navigation = Task { @MainActor in
             await spreadView.go(to: .end, animated: false)
@@ -93,7 +134,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let spreadView = makeReflowableSpreadView(scroll: true)
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
 
         let olderNavigation = Task { @MainActor in
             await spreadView.go(to: .start, animated: false)
@@ -188,7 +229,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
                 options: NavigatorGoOptions(animated: true)
             )
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
                 return true
             }
@@ -226,7 +267,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             pageCount: 1,
             readingProgression: .ltr
         )
-        try await waitUntil { delegate.updateCount == 1 }
+        try await EPUBSpreadViewHosting.waitUntil { delegate.updateCount == 1 }
         try await blockAnimationFrames(in: spreadView)
 
         let navigation = Task { @MainActor in
@@ -236,7 +277,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
                 options: NavigatorGoOptions(animated: false)
             )
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
                 return true
             }
@@ -271,7 +312,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
                 options: NavigatorGoOptions(animated: false)
             )
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             spreadView.scrollView.contentOffset.x > 0
                 && spreadView.readiness.state == .initializing(
                     generation: spreadView.readiness.generation,
@@ -308,7 +349,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let first = Task { @MainActor in
             await spreadView.go(to: .start, animated: false)
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             if case .initializing(_, activeWriterLeases: 1) = spreadView.readiness.state {
                 return true
             }
@@ -353,7 +394,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
         delegate.contentInset = UIEdgeInsets(top: 24, left: 0, bottom: 32, right: 0)
         spreadView.safeAreaInsetsDidChange()
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             spreadView.readiness.state == .initializing(
                 generation: spreadView.readiness.generation,
                 activeWriterLeases: 1
@@ -426,7 +467,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let superseded = Task { @MainActor in
             await spreadView.go(to: .start, animated: false)
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             if case .initializing = spreadView.readiness.state {
                 return true
             }
@@ -459,7 +500,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let cancelled = Task { @MainActor in
             await spreadView.go(to: .start, animated: false)
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             if case .initializing = spreadView.readiness.state {
                 return true
             }
@@ -482,8 +523,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let spreadView = makeFixedSpreadView()
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
-        try await waitForFixedResourceLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForFixedResourceLoad(in: spreadView)
         try await blockAnimationFrames(in: spreadView)
 
         let generation = spreadView.readiness.generation
@@ -494,7 +535,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let initialization = Task { @MainActor in
             await spreadView.initializeSpread()
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             spreadView.readiness.state == .initializing(
                 generation: generation,
                 activeWriterLeases: 2
@@ -507,7 +548,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             rootLease,
             outcome: initializationOutcome
         )
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
 
         XCTAssertEqual(initializationOutcome, .succeeded)
     }
@@ -516,10 +557,10 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let spreadView = makeReflowableSpreadView()
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         try await installDelayedStylesheet(in: spreadView, documentExpression: "document")
-        let hostWindow = hostView(spreadView)
+        let hostWindow = EPUBSpreadViewHosting.host(spreadView)
         defer { hostWindow.isHidden = true }
 
         let outcome = try await initializeLoadedReflowableSpread(spreadView)
@@ -539,14 +580,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let spreadView = makeFixedSpreadView()
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
-        try await waitForFixedResourceLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForFixedResourceLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         try await installDelayedStylesheet(
             in: spreadView,
             documentExpression: "document.querySelector('iframe').contentDocument"
         )
-        let hostWindow = hostView(spreadView)
+        let hostWindow = EPUBSpreadViewHosting.host(spreadView)
         defer { hostWindow.isHidden = true }
 
         let outcome = try await initializeLoadedFixedSpread(spreadView)
@@ -575,7 +616,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         _ = try await spreadView.webView.callAsyncJavaScript(
             "const link = document.createElement('link'); link.rel = 'stylesheet'; document.head.append(link); return true;",
@@ -637,7 +678,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             forMainFrameOnly: false
         ))
         spreadView.loadSpread()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         let replacementOutcome = try await initializeLoadedReflowableSpread(spreadView)
 
         XCTAssertEqual(replacementOutcome, .succeeded)
@@ -661,7 +702,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             contentWorld: .page
         ) as? String
         let wrapperHTML = try XCTUnwrap(wrapperHTMLResult)
-        let hostWindow = hostView(spreadView)
+        let hostWindow = EPUBSpreadViewHosting.host(spreadView)
         defer { hostWindow.isHidden = true }
 
         spreadView.webView.loadHTMLString(
@@ -669,19 +710,19 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             baseURL: spreadView.viewModel.publicationBaseURL.url
         )
 
-        try await waitUntil(timeout: .seconds(3)) {
+        try await EPUBSpreadViewHosting.waitUntil(timeout: .seconds(3)) {
             spreadView.readiness.isCommandReady
                 && spreadView.readiness.generation > firstGeneration
         }
         XCTAssertEqual(spreadView.readiness.generation, firstGeneration + 1)
-        try await waitForFixedResourceLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForFixedResourceLoad(in: spreadView)
     }
 
     func testReflowableInitializationGatesReadinessAndAppliesLatestPendingLocation() async throws {
         let spreadView = makeReflowableSpreadView(scroll: true)
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
 
         let olderNavigation = Task { @MainActor in
@@ -709,7 +750,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             rootLease,
             outcome: initializationOutcome
         )
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
 
         let olderOutcome = await olderNavigation.value
         let latestOutcome = await latestNavigation.value
@@ -919,18 +960,6 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         return (pagination, delegate)
     }
 
-    private func hostView(_ view: UIView) -> UIWindow {
-        let window = UIWindow(frame: CGRect(x: 0, y: 0, width: 600, height: 800))
-        let viewController = UIViewController()
-        window.rootViewController = viewController
-        view.frame = viewController.view.bounds
-        view.autoresizingMask = [.flexibleWidth, .flexibleHeight]
-        viewController.view.addSubview(view)
-        window.makeKeyAndVisible()
-        viewController.view.layoutIfNeeded()
-        return window
-    }
-
     private func makeFixture(
         layout: ReadiumShared.Layout,
         scroll: Bool = false
@@ -967,72 +996,6 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             resource: EPUBSpreadResource(index: 0, link: link)
         ))
         return (viewModel, spread)
-    }
-
-    /// Waits for the spread's document to finish loading.
-    ///
-    /// This is SETUP, never the property under test: every assertion in this
-    /// class is about what happens to an already-loaded document. So a wait
-    /// that expires here means the host failed to deliver a precondition, and
-    /// the honest verdict is a skip rather than a failure attributed to the
-    /// navigator.
-    ///
-    /// The environmental cause is identified (#1693): under CPU starvation the
-    /// simulator's WebContent process becomes unresponsive — WebKit logs
-    /// `WebProcessProxy::didBecomeUnresponsive` and stops making progress with
-    /// the main resource already served, so the load hangs at
-    /// `estimatedProgress == 0.1` forever. WebKit exposes no delegate for that
-    /// state; `webViewWebContentProcessDidTerminate` fires only on termination,
-    /// which is why nothing here can convert it into a navigator-visible
-    /// failure. A longer ceiling cannot help a process that is not running.
-    ///
-    /// Deliberately narrow: only this wait skips. An initialization that
-    /// completes and reports `.failed` still fails the test, because a spent
-    /// stability budget and a broken contract are indistinguishable from the
-    /// outcome alone — and the budget these tests run with is wide enough that
-    /// starvation is no longer the likely explanation.
-    private func waitForDocumentLoad(in spreadView: EPUBSpreadView) async throws {
-        do {
-            try await waitUntil(reportingFailure: false) {
-                guard case .loading = spreadView.readiness.state else {
-                    return false
-                }
-                return !spreadView.webView.isLoading
-            }
-        } catch {
-            let diagnosis = """
-            state=\(spreadView.readiness.state), \
-            isLoading=\(spreadView.webView.isLoading), \
-            progress=\(spreadView.webView.estimatedProgress), \
-            committedURL=\(spreadView.webView.url?.lastPathComponent ?? "nil")
-            """
-
-            // A skip has to be EARNED by the environmental signature, not
-            // granted to every expired wait. Narrowness of site is not
-            // narrowness of cause: this wait also expires when readiness never
-            // enters `.loading`, when it lands in `.failed` or `.unavailable`,
-            // or when the fixture stops resolving — every one of them a genuine
-            // navigator defect that must stay red.
-            //
-            // The unresponsive-process signature is specifically: still
-            // `.loading`, and WebKit still believes it is loading. That is the
-            // state a WebContent process that stopped answering leaves behind,
-            // because nothing can move it on.
-            guard
-                case .loading = spreadView.readiness.state,
-                spreadView.webView.isLoading
-            else {
-                XCTFail("Document did not load, and not for a reason the host explains: \(diagnosis)")
-                throw error
-            }
-
-            throw XCTSkip(
-                """
-                Environment did not deliver a loaded document — WebContent \
-                process is not making progress (see #1693). \(diagnosis)
-                """
-            )
-        }
     }
 
     private func enableAnimationFrames(in spreadView: EPUBSpreadView) async throws {
@@ -1108,58 +1071,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
     }
 
-    /// Liveness backstop, not a performance bound — see `waitUntil`. Setup, so
-    /// an expiry is an environmental skip for the reasons `waitForDocumentLoad`
-    /// documents.
-    private func waitForFixedResourceLoad(in spreadView: EPUBFixedSpreadView) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(30))
-        while clock.now < deadline {
-            let loaded = try await spreadView.webView.callAsyncJavaScript(
-                "const frame = document.querySelector('iframe'); return frame?.contentDocument?.URL.includes('chapter.html') === true && frame.contentDocument.readyState === 'complete';",
-                arguments: [:],
-                in: nil,
-                contentWorld: .page
-            ) as? Bool
-            if loaded == true {
-                return
-            }
-            try await clock.sleep(for: .milliseconds(20))
-        }
-        let diagnosis = """
-        state=\(spreadView.readiness.state), \
-        isLoading=\(spreadView.webView.isLoading), \
-        progress=\(spreadView.webView.estimatedProgress)
-        """
-
-        // Same earned-skip rule as `waitForDocumentLoad`, and deliberately the
-        // same shape: these two are the only skip sites, so they must not drift
-        // into disagreeing about what counts as the host's fault. Here the
-        // wrapper document is already loaded and it is the iframe that has not
-        // arrived, so the signature is a readiness that has not failed —
-        // a `.failed` or `.unavailable` spread is a navigator defect.
-        switch spreadView.readiness.state {
-        case .failed, .unavailable:
-            XCTFail("Fixed resource did not load, and not for a reason the host explains: \(diagnosis)")
-            throw TestTimeout()
-        case .loading, .initializing, .ready:
-            throw XCTSkip(
-                """
-                Environment did not deliver the fixed-layout iframe resource — \
-                WebContent process is not making progress (see #1693). \(diagnosis)
-                """
-            )
-        }
-    }
-
     private func initializeReflowableSpread(
         _ spreadView: EPUBReflowableSpreadView
     ) async throws {
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         let outcome = try await initializeLoadedReflowableSpread(spreadView)
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
     }
 
     private func initializeLoadedReflowableSpread(
@@ -1179,8 +1098,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     private func initializeLoadedFixedSpread(
         _ spreadView: EPUBFixedSpreadView
     ) async throws -> EPUBSpreadReadiness.InitializationOutcome {
-        try await waitForDocumentLoad(in: spreadView)
-        try await waitForFixedResourceLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForFixedResourceLoad(in: spreadView)
         let generation = spreadView.readiness.generation
         let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
             for: generation,
@@ -1251,40 +1170,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             line: line
         )
     }
-
-    /// Polls a precondition until it holds.
-    ///
-    /// The timeout is a liveness backstop, NOT a performance bound. Every caller
-    /// here waits for a real WKWebView document to reach a state that the test's
-    /// own assertions then examine; none asserts "within N seconds". A predicate
-    /// that is wrong stays wrong, so a generous ceiling only delays a real
-    /// failure while removing the false one a loaded host produces — a 5 s
-    /// ceiling was a bet on machine speed, and a saturated simulator lost it
-    /// while the behaviour under test was correct.
-    /// - Parameter reportingFailure: whether an expiry is itself a test failure.
-    ///   Setup waits pass `false` and translate the throw into an environmental
-    ///   skip; assertion waits keep the default and go red.
-    private func waitUntil(
-        timeout: Duration = .seconds(30),
-        reportingFailure: Bool = true,
-        _ predicate: @MainActor () -> Bool
-    ) async throws {
-        let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: timeout)
-        while clock.now < deadline {
-            if predicate() {
-                return
-            }
-            try await clock.sleep(for: .milliseconds(20))
-        }
-        if reportingFailure {
-            XCTFail("Condition did not become true before timeout")
-        }
-        throw TestTimeout()
-    }
 }
-
-private struct TestTimeout: Error {}
 
 @MainActor
 private final class ReflowablePaginationDelegate: PaginationViewDelegate {
@@ -1341,6 +1227,11 @@ private final class SpreadPaginationDelegate: PaginationViewDelegate {
 
 @MainActor
 private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
+    var navigationInputs = 0
+    func spreadViewWillBeginUserNavigation(_ spreadView: EPUBSpreadView) {
+        navigationInputs += 1
+    }
+
     var contentInset: UIEdgeInsets = .zero
 
     func spreadViewContentInset(_ spreadView: EPUBSpreadView) -> UIEdgeInsets {
@@ -1358,4 +1249,14 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: KeyEvent) {}
     func spreadViewDidTerminate() {}
+}
+
+@MainActor
+private final class NavigationInputDelegate: EPUBNavigatorDelegate {
+    var inputs = 0
+    func navigatorWillBeginUserNavigation(_ navigator: EPUBNavigatorViewController) {
+        inputs += 1
+    }
+
+    func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
 }

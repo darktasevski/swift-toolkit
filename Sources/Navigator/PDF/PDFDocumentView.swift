@@ -107,7 +107,21 @@ public final class PDFDocumentView: PDFView {
         fatalError("init(coder:) has not been implemented")
     }
 
+    /// PDFKit routes `go(to:on:)` through `go(to: PDFDestination)`, which the delegate otherwise
+    /// sees only as a link activation, so a programmatic move must bypass it.
+    private var isMovingProgrammatically = false
+
+    override public func go(to rect: CGRect, on page: PDFPage) {
+        isMovingProgrammatically = true
+        defer { isMovingProgrammatically = false }
+        super.go(to: rect, on: page)
+    }
+
     override public func go(to destination: PDFDestination) {
+        guard !isMovingProgrammatically else {
+            super.go(to: destination)
+            return
+        }
         guard documentViewDelegate?.pdfDocumentView(self, shouldGoTo: destination) ?? true else {
             return
         }
