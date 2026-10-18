@@ -828,6 +828,30 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(offset, [0, 0])
     }
 
+    /// A jump superseded, not aborted, while it waits for its viewport is
+    /// cancelled at its late frame and writes nothing, though the viewport has
+    /// its size by then: a superseded command never misses.
+    func test_aSupersededJumpWaitingForItsViewportIsCancelledAndWritesNothing() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, holdingCommandWorldFrames: true)
+        try await page.landCommandWorldSmoothScrolls(after: .zero)
+        try await page.emptyCommandWorldViewport()
+        try await page.holdCommandWorldFrames()
+
+        let jump = Task { try await page.executeProgressionJump(to: 0.5, budgetMilliseconds: 5000) }
+        try await waitUntil("the jump waits for its viewport") {
+            try await page.heldCommandWorldFrames() > 0
+        }
+        let successor = try await page.restoreViewportAndSupersedeTheJump()
+        let answer = try await jump.value
+
+        XCTAssertEqual(successor, ["applied", "none"], "Setup: the superseding jump did not run")
+        XCTAssertEqual(answer, ["cancelled", "staleToken"])
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 0, "The superseded jump wrote its offset")
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [0, 0])
+    }
+
     /// Locator navigation keeps ending its viewport wait at the first late
     /// frame: its miss releases only its writer, so it need not wait out its
     /// deadline as a jump does.
@@ -846,11 +870,13 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let elapsed = started.duration(to: clock.now)
         let framesLeft = try await page.framesLeftBeforeHolding()
         XCTAssertEqual(framesLeft, 0, "Setup: the navigation's frame before its scroll was not delivered")
-        let held = try await page.heldCommandWorldFrames()
-        XCTAssertGreaterThan(held, 0, "Setup: no frame of the navigation's viewport wait was held")
+        let widthReads = try await page.commandWorldViewportWidthReads()
+        XCTAssertGreaterThan(widthReads, 0, "Setup: the navigation never reached its viewport wait")
         let writes = try await page.commandWorldScrollWrites()
         XCTAssertEqual(writes, 0, "Setup: the navigation scrolled before its viewport wait ended")
         XCTAssertEqual(answer, ["miss", "paintTimeout"])
+        let held = try await page.heldCommandWorldFrames()
+        XCTAssertEqual(held, 1, "The viewport wait asked for another frame after its late one")
         XCTAssertLessThan(elapsed, .milliseconds(budgetMilliseconds / 2), "The navigation waited out its deadline")
     }
 
@@ -2381,12 +2407,20 @@ private final class ProgressionPage {
     }
 
     /// Gives the document no viewport size in the command world, restored
-    /// after `milliseconds` when given. A timer restores it, so the restore
-    /// does not wait on animation frames a test holds.
+    /// after `milliseconds` when given, and counts the reads of its width. A
+    /// timer restores it, so the restore does not wait on animation frames a
+    /// test holds.
     func emptyCommandWorldViewport(restoringAfterMilliseconds milliseconds: Int? = nil) async throws {
         try await runInCommandWorld(
             """
-            Object.defineProperty(document.documentElement, "clientWidth", { value: 0, configurable: true });
+            globalThis.__viewportWidthReads = 0;
+            Object.defineProperty(document.documentElement, "clientWidth", {
+                get() {
+                    globalThis.__viewportWidthReads += 1;
+                    return 0;
+                },
+                configurable: true,
+            });
             if (milliseconds !== null) {
                 setTimeout(() => { delete document.documentElement.clientWidth; }, milliseconds);
             }
@@ -2403,6 +2437,18 @@ private final class ProgressionPage {
             "globalThis.__framesBeforeHolding = deliveredFrames; globalThis.__heldFrames = [];",
             arguments: ["deliveredFrames": deliveredFrames]
         )
+    }
+
+    /// How often the command world read the width
+    /// `emptyCommandWorldViewport(restoringAfterMilliseconds:)` emptied.
+    func commandWorldViewportWidthReads() async throws -> Int {
+        let value = try await webView.callAsyncJavaScript(
+            "return globalThis.__viewportWidthReads ?? 0;",
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? Int, "Setup: the viewport width reads were not counted")
     }
 
     /// How many of the frames `holdCommandWorldFrames(afterDelivering:)` was
@@ -2437,6 +2483,33 @@ private final class ProgressionPage {
             contentWorld: EPUBLocatorCommandBridge.contentWorld
         )
         return try XCTUnwrap(value as? Bool, "Setup: the invalidation's answer was unreadable")
+    }
+
+    /// Gives the document its viewport size back and, in the same turn,
+    /// supersedes the jump `executeProgressionJump(to:budgetMilliseconds:)`
+    /// started with a jump to the showing page, which writes nothing. Answers
+    /// the superseding jump's `[outcome, reasonCode]`.
+    func restoreViewportAndSupersedeTheJump() async throws -> [String] {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            delete document.documentElement.clientWidth;
+            const result = await readerLocatorCommands.execute(
+                { kind: "navigateProgression", progression: 0, animated: false },
+                {
+                    webViewInstanceID: "settled-location-test",
+                    documentEpoch: 0,
+                    operationKind: "navigation",
+                    sequence: 2,
+                    budgetMilliseconds: 5000,
+                }
+            );
+            return [result.outcome, result.reasonCode];
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? [String], "Setup: the superseding jump's answer was unreadable")
     }
 
     /// Runs an instant navigation to the document's only element straight

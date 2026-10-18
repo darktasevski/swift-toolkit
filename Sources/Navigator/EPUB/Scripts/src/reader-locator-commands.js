@@ -1160,6 +1160,8 @@ async function scrollAndSettle(
 // by whatever remains of it, never by a fresh per-frame allowance — so a
 // starved rAF can no longer multiply a per-rung timeout across the viewport,
 // offset-settle, and correction rungs and overrun the total command budget.
+// A wait that times out after its command was superseded answers "stale": a
+// superseded command is cancelled, never a miss.
 function nextFrame(token, signal, deadlineAt) {
   return new Promise((resolve) => {
     const remaining = deadlineAt - performance.now();
@@ -1189,7 +1191,7 @@ function nextFrame(token, signal, deadlineAt) {
     };
     const onAbort = () => finish("stale");
     const timeoutID = scheduleTimeout(
-      () => finish("timeout"),
+      () => finish(isCurrent(token) ? "timeout" : "stale"),
       Math.min(FRAME_DEADLINE_MILLISECONDS, remaining)
     );
     if (signal) {
@@ -1600,15 +1602,10 @@ async function awaitUsableViewport(
       return "stale";
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    const stillCurrent = !signal?.aborted && isCurrent(token);
-    if (
-      toleratesLateFrames &&
-      stillCurrent &&
-      isLateFrame(frameStatus, deadlineAt)
-    ) {
+    if (toleratesLateFrames && isLateFrame(frameStatus, deadlineAt)) {
       continue;
     }
-    if (frameStatus !== "current" || !stillCurrent) {
+    if (frameStatus !== "current") {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
   }
