@@ -395,6 +395,10 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let opening = try XCTUnwrap(reader.spy.locations.last)
         let openingProgression = try XCTUnwrap(opening.locations.progression)
         let before = try await reader.requireGeometry()
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        try await reader.waitFor("the opening's reads to end") {
+            !observation.isReading && !observation.hasObligation
+        }
         let transport = TransportEventTap(spread.locatorCommandBridge)
         let joining = ExtraWriter(joiningTheNextGenerationOf: spread.readiness)
         let early = reader.spy.expectNoLocation("a report before the last writer released") { _ in true }
@@ -407,6 +411,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         await fulfillment(of: [early], timeout: Self.quietWindow)
         XCTAssertEqual(transport.events, [], "The turned page was read while a writer was held")
 
+        XCTAssertEqual(
+            spread.readiness.state,
+            .initializing(generation: extra.generation, activeWriterLeases: 1),
+            "Setup: the extra writer is not the last one held"
+        )
         let report = reader.spy.expectLocation("report of the turned page") {
             $0.href.isEquivalentTo(opening.href) && ($0.locations.progression ?? openingProgression) > openingProgression
         }
@@ -732,7 +741,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let page = try await openProgressionPage(.leftToRightPages)
         try await page.runInCommandWorld(ProgressionPage.droppingScrollWrites)
         let budgetMilliseconds = 300
-        let answered = expectation(description: "the jump answers")
+        let answered = XCTestExpectation(description: "the jump answers")
         let clock = ContinuousClock()
         let started = clock.now
         let jump = Task {
@@ -763,7 +772,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         let answer = try await page.executeProgressionJump(to: 0.5, budgetMilliseconds: 3000)
 
-        let held = try await page.heldCommandWorldFrames()
+        let held = try await page.heldCommandWorldFramesAtViewportRestore()
         XCTAssertGreaterThan(held, 0, "Setup: no frame of the jump's viewport wait was held")
         XCTAssertEqual(answer, ["applied", "none"])
         let offset = try await page.offset()
@@ -966,6 +975,34 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         assertCancelled(result, "the relayed jump")
         XCTAssertLessThan(relayedAt.duration(to: clock.now), .seconds(1), "The relayed jump waited for its landing")
+    }
+
+    /// A superseded jump that returns leaves its successor as the navigation
+    /// the relay cancels.
+    func test_theRelayCancelsTheJumpThatSupersededAnother() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        try await page.landCommandWorldSmoothScrolls(after: .seconds(3))
+        let clock = ContinuousClock()
+
+        let superseded = Task { try await page.jump(to: 0.5, animated: true) }
+        try await waitUntil("the first jump asks for its scroll") {
+            try await page.commandWorldScrollWrites() == 1
+        }
+        let successor = Task { try await page.jump(to: 1, animated: true) }
+        let supersededResult = try await superseded.value
+        try await waitUntil("the successor asks for its scroll") {
+            try await page.commandWorldScrollWrites() == 2
+        }
+        let relayedAt = clock.now
+        await page.bridge.cancelInFlightNavigation(
+            deadline: EPUBLocatorOperationDeadline(startingAt: relayedAt, budget: .seconds(1))
+        )
+        let successorResult = try await successor.value
+
+        assertCancelled(supersededResult, "the superseded jump")
+        assertCancelled(successorResult, "the relayed successor")
+        XCTAssertLessThan(relayedAt.duration(to: clock.now), .seconds(1), "The relayed successor waited for its landing")
     }
 
     private func assertApplied(
@@ -1443,6 +1480,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView, file: file, line: line)
         let observation = try XCTUnwrap(spread.builtLocationObservation, file: file, line: line)
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        try await reader.waitFor("the opening's reads to end") {
+            !observation.isReading && !observation.hasObligation
+        }
         let settled = try await reader.requireGeometry()
         if !holdingASample {
             observation.invalidate()
@@ -1471,6 +1511,13 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             settled.firstProgression,
             accuracy: 0.000_001,
             "The spread would publish the page world's numbers",
+            file: file,
+            line: line
+        )
+        XCTAssertLessThan(
+            published.upperBound,
+            1,
+            "The spread would publish the whole resource, not the page it measured",
             file: file,
             line: line
         )
@@ -2062,6 +2109,8 @@ private final class ProgressionPage {
         return globalThis.__deliverFrame(callback);
     };
     """
+    /// The document's only element, as a locator command payload.
+    private static let elementLocator = #"{"href":"chapter.xhtml","locations":{"cssSelector":"body > div"}}"#
     /// Drops every scroll write the command world asks for, so a jump never lands.
     static let droppingScrollWrites = "Element.prototype.scrollTo = function () {};"
 
@@ -2422,7 +2471,10 @@ private final class ProgressionPage {
                 configurable: true,
             });
             if (milliseconds !== null) {
-                setTimeout(() => { delete document.documentElement.clientWidth; }, milliseconds);
+                setTimeout(() => {
+                    globalThis.__heldFramesAtViewportRestore = globalThis.__heldFrames?.length ?? 0;
+                    delete document.documentElement.clientWidth;
+                }, milliseconds);
             }
             """,
             arguments: ["milliseconds": milliseconds.map { $0 as Any } ?? NSNull()]
@@ -2531,13 +2583,26 @@ private final class ProgressionPage {
             return [result.outcome, result.reasonCode];
             """,
             arguments: [
-                "locator": #"{"href":"chapter.xhtml","locations":{"cssSelector":"body > div"}}"#,
+                "locator": Self.elementLocator,
                 "budgetMilliseconds": budgetMilliseconds,
             ],
             in: nil,
             contentWorld: EPUBLocatorCommandBridge.contentWorld
         )
         return try XCTUnwrap(value as? [String], "Setup: the navigation's answer was unreadable")
+    }
+
+    /// How many animation frames the command world had been held from when
+    /// `emptyCommandWorldViewport(restoringAfterMilliseconds:)` restored the
+    /// viewport: the viewport wait's alone, before any landing frame.
+    func heldCommandWorldFramesAtViewportRestore() async throws -> Int {
+        let value = try await webView.callAsyncJavaScript(
+            "return globalThis.__heldFramesAtViewportRestore ?? 0;",
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? Int, "Setup: the frames held at the viewport's restore were not counted")
     }
 
     /// How many animation frames the command world has been held from.
@@ -2714,7 +2779,7 @@ private final class ProgressionPage {
             """,
             arguments: [
                 "sequence": sequence,
-                "locator": #"{"href":"chapter.xhtml","locations":{"cssSelector":"body > div"}}"#,
+                "locator": Self.elementLocator,
                 "companionKind": companionKind,
                 "capability": capability,
             ],
@@ -2919,8 +2984,10 @@ private final class LoadObserver: NSObject, WKNavigationDelegate {
 }
 
 /// Records the location transport events a spread's bridge reports from now
-/// on, still passing each to the spread. A read reports `.slotAvailable` when
-/// it ends.
+/// on, still passing each to the spread. `.slotAvailable` follows any call's
+/// actual completion, a read's, a capability injection's or a late one, and
+/// only when nothing took the freed slot: a read whose completion starts a
+/// pending hand-off reports none.
 @MainActor
 private final class TransportEventTap {
     private(set) var events: [EPUBLocationTransportEvent] = []

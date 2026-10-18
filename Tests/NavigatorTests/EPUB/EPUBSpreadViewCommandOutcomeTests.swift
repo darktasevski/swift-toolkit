@@ -908,7 +908,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.locatorCommandBridge.setFrameCapability(capability)
 
         try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > 0 }
-        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
+        try assertReportsTheMeasuredStart(of: spreadView, to: delegate, under: capability)
     }
 
     /// A frame that registers while initialization still holds readiness is
@@ -937,7 +937,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(outcome, .succeeded)
 
         try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > 0 }
-        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
+        try assertReportsTheMeasuredStart(of: spreadView, to: delegate, under: capability)
     }
 
     /// A command that leaves the viewport where it was moves nothing a hint
@@ -1000,7 +1000,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         // the registration can bring this report.
         try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > pageChanges }
         XCTAssertFalse(observation.isRegistrationMissing)
-        try assertReportsTheMeasuredStart(of: spreadView, under: capability)
+        try assertReportsTheMeasuredStart(of: spreadView, to: delegate, under: capability)
     }
 
     /// A new document's hand-off gets a re-issue of its own, whatever the
@@ -1129,8 +1129,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertNil(spreadView.publicationInput(), "A revoked observation stayed publishable")
     }
 
-    /// Readiness alone is not publishable for a reflowable spread: its
-    /// fallback range was never measured.
+    /// Readiness alone is not publishable for a reflowable spread: it has
+    /// measured nothing yet.
     func testAReadyReflowableSpreadWithoutAnAcceptedObservationPublishesNothing() async throws {
         let (spreadView, _) = try await loadObservedReflowableSpread()
         let outcome = try await initializeLoadedReflowableSpread(spreadView)
@@ -1138,6 +1138,42 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
 
         XCTAssertNil(spreadView.publicationInput())
+    }
+
+    /// An initialization whose placement jump misses fails its spread: only an
+    /// applied command places it. The frame registers first, so the jump runs
+    /// as a command, and the command world measures no scroll width, so it
+    /// misses before writing.
+    func testAnInitializationWhosePlacementJumpMissesFails() async throws {
+        let (spreadView, _) = try await loadObservedReflowableSpread()
+        let registrations = RegistrationRecorder(spreadView.locatorCommandBridge)
+        let placement = Task { @MainActor in
+            await spreadView.go(to: .start, animated: false)
+        }
+        await Task.yield()
+        let generation = spreadView.readiness.generation
+        let capability = EPUBSpreadFrameCapability()
+        let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
+            for: generation,
+            frameCapability: capability
+        ))
+        spreadView.locatorCommandBridge.setFrameCapability(capability)
+        try await EPUBSpreadViewHosting.waitUntil { registrations.capabilities == [capability] }
+        _ = try await spreadView.webView.callAsyncJavaScript(
+            #"Object.defineProperty(document.scrollingElement, "scrollWidth", { value: 0, configurable: true });"#,
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+
+        spreadView.applySettings()
+        let outcome = await spreadView.initializeSpread()
+        spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
+        let placementOutcome = await placement.value
+
+        XCTAssertEqual(outcome, .failed, "The spread initialized though its placement missed")
+        XCTAssertEqual(spreadView.readiness.state, .failed(generation: generation))
+        XCTAssertNotEqual(placementOutcome, .succeeded)
     }
 
     /// A fixed spread publishes its full resources once ready, and tells its
@@ -1512,9 +1548,11 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         return (spreadView, delegate)
     }
 
-    /// The fixture opens at its start, on the first of several pages.
+    /// The fixture opens at its start, on the first of several pages. The
+    /// range is the one published when the delegate heard of the page change.
     private func assertReportsTheMeasuredStart(
         of spreadView: EPUBReflowableSpreadView,
+        to delegate: TestSpreadDelegate,
         under capability: EPUBSpreadFrameCapability,
         file: StaticString = #filePath,
         line: UInt = #line
@@ -1522,8 +1560,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let accepted = try XCTUnwrap(spreadView.builtLocationObservation?.currentObservation, file: file, line: line)
         XCTAssertEqual(accepted.sample.capability, capability, file: file, line: line)
         let reported = try XCTUnwrap(
-            spreadView.publicationInput()?.progressions[spreadView.spread.first.index],
-            "The spread has nothing to publish",
+            delegate.reportedRanges.last ?? nil,
+            "The spread had nothing to publish when it reported its page change",
             file: file,
             line: line
         )
