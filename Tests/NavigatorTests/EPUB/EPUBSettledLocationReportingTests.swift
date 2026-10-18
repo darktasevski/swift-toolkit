@@ -1514,10 +1514,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             file: file,
             line: line
         )
-        XCTAssertLessThan(
+        XCTAssertEqual(
             published.upperBound,
-            1,
-            "The spread would publish the whole resource, not the page it measured",
+            settled.lastProgression,
+            accuracy: 0.000_001,
+            "The spread would publish \(published), not the page it measured (\(settled))",
             file: file,
             line: line
         )
@@ -1952,6 +1953,12 @@ private struct PageGeometry: Equatable, CustomStringConvertible {
     /// The paginated (LTR or RTL) start of the viewport within the resource.
     var firstProgression: Double {
         abs(scrollX) / scrollWidth
+    }
+
+    /// The paginated end of the viewport within the resource, unclamped
+    /// (`progression.js` § `measureProgression` clamps it to 1).
+    var lastProgression: Double {
+        (abs(scrollX) + innerWidth) / scrollWidth
     }
 
     var description: String {
