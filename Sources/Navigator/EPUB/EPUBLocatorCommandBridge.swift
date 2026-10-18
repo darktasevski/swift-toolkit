@@ -299,7 +299,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// round-trip in the exact frame the command is executing in.
     private struct InFlightNavigation {
         let token: EPUBLocatorCommandToken
-        let frame: WKFrameInfo
+        /// `nil` for the main frame.
+        let frame: WKFrameInfo?
     }
 
     private struct DecorationActivationState {
@@ -631,15 +632,12 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             return .transportOccupied
         }
         guard
-            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
-            let targetKey = frameKey(for: targetURL),
-            let capability = currentFrameCapability,
-            case let .selected(frameID) = registry.select(href: targetKey, capability: capability),
-            let storedFrame = framesByID[frameID],
-            let webView
+            let targetKey = frameKey(forTarget: targetHREF),
+            case let .selected(frameID, storedFrame, webView) = selectCommandFrame(for: targetKey)
         else {
             return .frameUnavailable
         }
+        let capability = storedFrame.capability
         let invoke = invokeLocationScript
         let started = locationTransport.start(
             until: deadline,
@@ -850,17 +848,16 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
 
         guard
-            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
-            let targetKey = frameKey(for: targetURL),
+            let targetKey = frameKey(forTarget: targetHREF),
             locatorHREF(payload.href, targets: targetKey)
         else {
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField)
         }
 
-        switch selectNavigationFrame(for: targetKey) {
+        switch selectCommandFrame(for: targetKey) {
         case let .unavailable(reason):
             return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: reason)
-        case let .selected(storedFrame, webView):
+        case let .selected(_, storedFrame, webView):
             return await runNavigationCommand(
                 [
                     "kind": "navigateLocator",
@@ -868,26 +865,23 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                     "animated": animated,
                 ],
                 token: token,
-                in: storedFrame,
+                in: storedFrame.info,
                 of: webView,
                 until: deadline
             )
         }
     }
 
-    /// What a progression jump did.
-    enum ProgressionNavigationResult: Sendable {
-        /// No frame of the current document could take the command, so no
-        /// script ran and the caller may move the page another way.
-        case frameUnavailable(EPUBLocatorCommandReason)
-        /// The command's outcome, including a refusal before it was sent.
-        case completed(EPUBLocatorCommandResult)
-    }
-
     /// Scrolls the document to the page holding `progression` and answers
     /// once its offset is there (`navigateProgression` in
     /// `reader-locator-commands.js`). It is a navigation, so it supersedes,
     /// and is superseded by, any other.
+    ///
+    /// Command readiness does not wait for the frame hand-off, so a reflowable
+    /// placement can run before its document's frame registers, or after its
+    /// hand-off failed. The jump then runs in the main frame, which is that
+    /// document, once the main frame shows the target resource: one world and
+    /// one geometry, registered or not.
     ///
     /// - Parameter deadline: the position command's deadline; the jump spends
     ///   what remains of it.
@@ -896,50 +890,64 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         targetHREF: AnyURL,
         animated: Bool,
         deadline: EPUBLocatorOperationDeadline
-    ) async -> ProgressionNavigationResult {
+    ) async -> EPUBLocatorCommandResult {
         let token = nextToken(
             for: .navigation,
             budgetMilliseconds: deadline.remainingMilliseconds(at: clock.now())
         )
 
         guard !Task.isCancelled else {
-            return .completed(EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken))
+            return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
         guard progression.isFinite, (0 ... 1).contains(progression) else {
-            return .completed(EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidNumber))
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidNumber)
         }
-        guard
-            let targetURL = publicationBaseURL.resolve(targetHREF)?.url,
-            let targetKey = frameKey(for: targetURL)
-        else {
-            return .completed(EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField))
+        guard let targetKey = frameKey(forTarget: targetHREF) else {
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .invalidField)
         }
 
-        switch selectNavigationFrame(for: targetKey) {
+        let frame: WKFrameInfo?
+        let webView: WKWebView
+        switch selectCommandFrame(for: targetKey) {
+        case let .selected(_, storedFrame, selectedWebView):
+            frame = storedFrame.info
+            webView = selectedWebView
+        case .unavailable(.frameMissing):
+            guard
+                registry.layout == .reflowable,
+                let mainFrameWebView = self.webView,
+                let mainFrameURL = mainFrameWebView.url,
+                frameKey(for: mainFrameURL) == targetKey
+            else {
+                return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: .frameMissing)
+            }
+            frame = nil
+            webView = mainFrameWebView
         case let .unavailable(reason):
-            return .frameUnavailable(reason)
-        case let .selected(storedFrame, webView):
-            return await .completed(runNavigationCommand(
-                [
-                    "kind": "navigateProgression",
-                    "progression": progression,
-                    "animated": animated,
-                ],
-                token: token,
-                in: storedFrame,
-                of: webView,
-                until: deadline
-            ))
+            return EPUBLocatorCommandResult(token: token, outcome: .miss, reason: reason)
         }
+        return await runNavigationCommand(
+            [
+                "kind": "navigateProgression",
+                "progression": progression,
+                "animated": animated,
+            ],
+            token: token,
+            in: frame,
+            of: webView,
+            until: deadline
+        )
     }
 
-    private enum NavigationFrameSelection {
-        case selected(StoredFrame, WKWebView)
+    private enum CommandFrameSelection {
+        case selected(frameID: String, StoredFrame, WKWebView)
         case unavailable(EPUBLocatorCommandReason)
     }
 
-    /// The current document's registered frame for `targetKey`.
-    private func selectNavigationFrame(for targetKey: String) -> NavigationFrameSelection {
+    /// The one frame of the current document that commands and reads for
+    /// `targetKey` may run in: registered under the current capability and
+    /// selected by the registry.
+    private func selectCommandFrame(for targetKey: String) -> CommandFrameSelection {
         switch registry.select(href: targetKey, capability: currentFrameCapability) {
         case let .selected(id):
             guard
@@ -949,23 +957,32 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             else {
                 return .unavailable(.staleDocument)
             }
-            return .selected(storedFrame, webView)
+            return .selected(frameID: id, storedFrame, webView)
         case let .miss(reason):
             return .unavailable(EPUBLocatorCommandReason(rawValue: reason.rawValue) ?? .invalidResult)
         }
     }
 
+    /// The registry key of the publication resource `href` names.
+    private func frameKey(forTarget href: AnyURL) -> String? {
+        guard let url = publicationBaseURL.resolve(href)?.url else {
+            return nil
+        }
+        return frameKey(for: url)
+    }
+
+    /// - Parameter frame: the frame to run in; `nil` runs in the main frame.
     private func runNavigationCommand(
         _ command: [String: Any],
         token: EPUBLocatorCommandToken,
-        in storedFrame: StoredFrame,
+        in frame: WKFrameInfo?,
         of webView: WKWebView,
         until deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
         // Record the suspended command so a superseding request's relay can
         // abort it in the exact frame it is running in. Cleared on every exit,
         // but only if a newer navigation has not already replaced it.
-        inFlightNavigation = InFlightNavigation(token: token, frame: storedFrame.info)
+        inFlightNavigation = InFlightNavigation(token: token, frame: frame)
         defer {
             if inFlightNavigation?.token == token {
                 inFlightNavigation = nil
@@ -987,7 +1004,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                 let rawResult = try await webView.callAsyncJavaScript(
                     Self.commandScript,
                     arguments: ["command": command, "token": token.javascriptValue],
-                    in: storedFrame.info,
+                    in: frame,
                     contentWorld: Self.contentWorld
                 )
                 return Self.decodeResult(rawResult, expectedToken: token)

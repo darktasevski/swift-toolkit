@@ -898,20 +898,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
                 animated: animated,
                 deadline: EPUBLocatorOperationDeadline(expiringAt: deadline)
             )
-            switch result {
-            case let .completed(result):
-                return result.outcome == .applied
-            case .frameUnavailable:
-                // Command readiness does not wait for the frame hand-off, so a
-                // placement can run before this document's frame registers, or
-                // after its hand-off failed. Nothing ran, so nothing can fight
-                // this jump, and an instant one has landed once its script returns.
-                let dir = viewModel.readingProgression.rawValue
-                return await evaluateDocumentScriptBounded(
-                    "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', false)",
-                    until: deadline
-                )
-            }
+            return result.outcome == .applied
         }
     }
 
