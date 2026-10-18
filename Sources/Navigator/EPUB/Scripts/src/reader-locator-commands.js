@@ -1570,11 +1570,24 @@ function frameChainVerdict(localSubRect) {
   }
 }
 
+// A frame wait that timed out with the command's deadline still ahead: the
+// frame came late rather than never.
+function isLateFrame(frameStatus, deadlineAt) {
+  return frameStatus === "timeout" && deadlineAt - performance.now() > 0;
+}
+
 // Waits, bounded, for the document to have a usable (non-zero) layout
 // viewport before any viewport-relative work runs. Returns "usable",
 // "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
-// never arrived), or "stale".
-async function awaitUsableViewport(token, signal, deadlineAt) {
+// never arrived), or "stale". `toleratesLateFrames` counts a late frame as a
+// frame, so only the deadline ends the wait, for a command whose miss fails
+// its document.
+async function awaitUsableViewport(
+  token,
+  signal,
+  deadlineAt,
+  { toleratesLateFrames = false } = {}
+) {
   for (let frame = 0; frame <= VIEWPORT_READY_FRAMES; frame += 1) {
     const viewport = effectiveRootViewportSize();
     if (viewport.width > 0 && viewport.height > 0) {
@@ -1587,7 +1600,15 @@ async function awaitUsableViewport(token, signal, deadlineAt) {
       return "stale";
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
+    const stillCurrent = !signal?.aborted && isCurrent(token);
+    if (
+      toleratesLateFrames &&
+      stillCurrent &&
+      isLateFrame(frameStatus, deadlineAt)
+    ) {
+      continue;
+    }
+    if (frameStatus !== "current" || !stillCurrent) {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
   }
@@ -1848,8 +1869,9 @@ const PROGRESSION_LANDING_TOLERANCE = 1;
 // for, not a stable offset, which a smooth scroll that has not started yet also
 // has. The target must lie within the scrollport: the web process reports an
 // overscrolled write's offset unclamped until the UI process clamps it. Only the
-// command's deadline ends the wait, as `paintTimeout`: a frame later than one
-// frame's wait does not, because a failed position command fails its document.
+// command's deadline ends its waits, for a usable viewport and for the landing,
+// as `paintTimeout`: a late frame does not, because a failed position command
+// fails its document.
 async function navigateProgression(command, token, signal, deadlineAt) {
   requireOnlyKeys(command, NAVIGATE_PROGRESSION_KEYS);
   if (
@@ -1865,7 +1887,9 @@ async function navigateProgression(command, token, signal, deadlineAt) {
   if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt);
+  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt, {
+    toleratesLateFrames: true,
+  });
   if (viewportStatus === "stale") {
     return commandResult(token, "cancelled", "staleToken");
   }
@@ -1903,7 +1927,7 @@ async function navigateProgression(command, token, signal, deadlineAt) {
     if (frameStatus === "stale" || signal?.aborted || !isCurrent(token)) {
       return commandResult(token, "cancelled", "staleToken");
     }
-    if (frameStatus === "timeout" && !(deadlineAt - performance.now() > 0)) {
+    if (frameStatus === "timeout" && !isLateFrame(frameStatus, deadlineAt)) {
       return commandResult(token, "miss", "paintTimeout");
     }
   }
