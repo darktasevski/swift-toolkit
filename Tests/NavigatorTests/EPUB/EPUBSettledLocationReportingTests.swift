@@ -935,6 +935,26 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertLessThan(started.duration(to: clock.now), .seconds(1), "The superseded jump waited for its landing")
     }
 
+    /// A page script's own `pagehide` aborts no command: a jump waiting for its
+    /// landing still lands. A failed position command fails its document, so
+    /// a page that could abort one could stop every later page turn.
+    func test_aPageScriptsPagehideLeavesAJumpLanding() async throws {
+        let page = try await openProgressionPage(.leftToRightPages)
+        try await page.register(EPUBSpreadFrameCapability())
+        try await page.landCommandWorldSmoothScrolls(after: .milliseconds(400))
+
+        let jump = Task { try await page.jump(to: 0.5, animated: true) }
+        try await waitUntil("the jump asks for its scroll") {
+            try await page.commandWorldScrollWrites() == 1
+        }
+        try await page.dispatchPageScriptPagehide()
+        let result = try await jump.value
+
+        assertApplied(result, "the jump the page script tried to abort")
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [600, 0])
+    }
+
     /// Cancelling the task of a jump waiting for its landing ends the wait.
     func test_cancellingAJumpWaitingToLandEndsItsWait() async throws {
         let page = try await openProgressionPage(.leftToRightPages)
@@ -1199,15 +1219,16 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertNil(absent, "A read with no capability answered")
     }
 
-    func test_progressionReadRefusesARevokedCapability() async throws {
+    /// Every content world receives a DOM event, so a page script can dispatch
+    /// `pagehide` itself. Only the browser's own revokes the capability: the
+    /// document is still current, and so is its capability.
+    func test_aPageScriptsPagehideLeavesTheCapabilityAnswering() async throws {
         let page = try await openProgressionPage(.leftToRightPages)
         try await page.acceptCapability(ProgressionPage.capability)
+
+        try await page.dispatchPageScriptPagehide()
+
         try await assertSample(page.read(ProgressionPage.capability), first: 0, last: 1.0 / 3)
-
-        try await page.hide()
-
-        let revoked = try await page.read(ProgressionPage.capability)
-        XCTAssertNil(revoked, "A hidden document answered under its revoked capability")
     }
 
     func test_progressionReadRefusesACapabilityFromAReplacedSameURLDocument() async throws {
@@ -1261,14 +1282,16 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: (1.0 / 3) ... (2.0 / 3))))
     }
 
-    /// A direct same-origin child frame receives the forwarded capability and
-    /// answers a read with its own geometry; the bridge still reads the main
-    /// frame it selected.
+    /// A direct same-origin child frame that holds the capability answers a
+    /// read with its own geometry; the bridge still reads the main frame it
+    /// selected.
     func test_bridgeReadIgnoresAChildFrameHoldingTheCapability() async throws {
         let page = try await openServedProgressionPage(.leftToRightPagesWithChildFrame)
         let capability = EPUBSpreadFrameCapability()
         try await page.register(capability)
         try await page.scroll(x: 600, y: 0)
+        try await page.waitForChildFrameCommandWorld()
+        try await page.handChildFrame(capability)
         let child = try await page.waitForChildFrameSample(capability)
         XCTAssertEqual(child.first, 0, accuracy: 0.000_001, "Setup: the child frame did not measure its own geometry")
         XCTAssertEqual(child.last, 1.0 / 6, accuracy: 0.000_001, "Setup: the child frame did not measure its own geometry")
@@ -1276,6 +1299,40 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let outcome = try await page.readThroughBridge()
 
         XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: (1.0 / 3) ... (2.0 / 3))))
+    }
+
+    /// A reflowable command target is the main frame, so its hand-off keeps
+    /// the capability out of child frames, where a page script listening on
+    /// the child's window would see it.
+    func test_aReflowableHandOffKeepsTheCapabilityOutOfChildFrames() async throws {
+        let page = try await openServedProgressionPage(.leftToRightPagesWithChildFrame)
+        try await page.waitForChildFrameCommandWorld()
+        let capability = EPUBSpreadFrameCapability()
+
+        try await page.register(capability)
+
+        try await ContinuousClock().sleep(for: .milliseconds(500))
+        let child = try await page.childFrameRead(capability)
+        XCTAssertNil(child, "The child frame received the reflowable capability")
+        try await page.handChildFrame(capability)
+        _ = try await page.waitForChildFrameSample(capability)
+    }
+
+    /// A child frame accepts a capability only as a real message from its
+    /// parent: one a page script dispatches on the child's window, however it
+    /// names its source, hands it nothing.
+    func test_aPageScriptsCapabilityMessageHandsTheChildFrameNothing() async throws {
+        let page = try await openServedProgressionPage(.leftToRightPagesWithChildFrame)
+        try await page.waitForChildFrameCommandWorld()
+        let capability = EPUBSpreadFrameCapability()
+
+        try await page.dispatchPageScriptCapabilityMessage(capability)
+
+        try await ContinuousClock().sleep(for: .milliseconds(200))
+        let child = try await page.childFrameRead(capability)
+        XCTAssertNil(child, "A page script's own message handed the child frame a capability")
+        try await page.postCapabilityMessage(capability)
+        _ = try await page.waitForChildFrameSample(capability)
     }
 
     func test_bridgeReadOfUnmeasurableGeometryIsUnavailable() async throws {
@@ -2409,16 +2466,88 @@ private final class ProgressionPage {
     /// Waits until the direct child frame answers a read under `capability`,
     /// in the locator command world reached through its same-origin window,
     /// and returns its range.
+    /// Waits until the child frame has loaded the locator command script.
+    func waitForChildFrameCommandWorld() async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while clock.now < deadline {
+            let loaded = try await webView.callAsyncJavaScript(
+                "return document.querySelector('iframe')?.contentWindow?.readerLocatorCommands !== undefined;",
+                arguments: [:],
+                in: nil,
+                contentWorld: EPUBLocatorCommandBridge.contentWorld
+            ) as? Bool
+            if loaded == true {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Setup: the child frame never loaded its command script")
+        throw SetupTimeout()
+    }
+
+    /// Hands `capability` to the child frame's command world directly, as no
+    /// reflowable hand-off does.
+    func handChildFrame(_ capability: EPUBSpreadFrameCapability) async throws {
+        _ = try await webView.callAsyncJavaScript(
+            "document.querySelector('iframe').contentWindow.readerLocatorCommands.acceptFrameCapability(capability, false);",
+            arguments: ["capability": capability.id.uuidString],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+    }
+
+    /// Dispatches, from the parent's page world, a capability message on the
+    /// child frame's window that names the parent as its source, as a book's
+    /// own script can.
+    func dispatchPageScriptCapabilityMessage(_ capability: EPUBSpreadFrameCapability) async throws {
+        _ = try await webView.callAsyncJavaScript(
+            """
+            const child = document.querySelector('iframe').contentWindow;
+            child.dispatchEvent(new MessageEvent("message", {
+                data: { type: "readium.locator.frameCapability", capability },
+                origin: location.origin,
+                source: window,
+            }));
+            """,
+            arguments: ["capability": capability.id.uuidString],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+    }
+
+    /// Posts the same capability message from the parent's page world: a
+    /// real message, which the child accepts.
+    func postCapabilityMessage(_ capability: EPUBSpreadFrameCapability) async throws {
+        _ = try await webView.callAsyncJavaScript(
+            """
+            document.querySelector('iframe').contentWindow.postMessage(
+                { type: "readium.locator.frameCapability", capability },
+                location.origin
+            );
+            """,
+            arguments: ["capability": capability.id.uuidString],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+    }
+
+    /// The child frame's own read under `capability`, or `nil` when it does
+    /// not hold it.
+    func childFrameRead(_ capability: EPUBSpreadFrameCapability) async throws -> [String: Any]? {
+        try await webView.callAsyncJavaScript(
+            "return document.querySelector('iframe').contentWindow.readerLocatorCommands.readProgression(expectedCapability);",
+            arguments: ["expectedCapability": capability.id.uuidString],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        ) as? [String: Any]
+    }
+
     func waitForChildFrameSample(_ capability: EPUBSpreadFrameCapability) async throws -> (first: Double, last: Double) {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.setupTimeout)
         while clock.now < deadline {
-            let sample = try await webView.callAsyncJavaScript(
-                "return document.querySelector('iframe').contentWindow.readerLocatorCommands.readProgression(expectedCapability);",
-                arguments: ["expectedCapability": capability.id.uuidString],
-                in: nil,
-                contentWorld: EPUBLocatorCommandBridge.contentWorld
-            ) as? [String: Any]
+            let sample = try await childFrameRead(capability)
             if
                 let sample,
                 sample["capability"] as? String == capability.id.uuidString,
@@ -2429,7 +2558,7 @@ private final class ProgressionPage {
             }
             try await clock.sleep(for: .milliseconds(20))
         }
-        XCTFail("Setup: the child frame never answered under the forwarded capability")
+        XCTFail("Setup: the child frame never answered under the capability it was handed")
         throw SetupTimeout()
     }
 
@@ -3009,8 +3138,9 @@ private final class ProgressionPage {
         ) as? Bool == true
     }
 
-    /// Fires the `pagehide` the document receives when it stops being current.
-    func hide() async throws {
+    /// Dispatches a `pagehide` from the page world, as a book's own script
+    /// can, while the document stays current.
+    func dispatchPageScriptPagehide() async throws {
         _ = try await webView.callAsyncJavaScript(
             #"window.dispatchEvent(new PageTransitionEvent("pagehide"));"#,
             arguments: [:],

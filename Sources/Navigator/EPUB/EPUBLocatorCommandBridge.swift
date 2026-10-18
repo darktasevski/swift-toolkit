@@ -322,7 +322,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private static let decorationActivatedMessageName = "readerLocatorDecorationActivated"
     private static let commandScript = "return await readerLocatorCommands.execute(command, token);"
     private static let invalidateScript = "return readerLocatorCommands.invalidate(token);"
-    private static let acceptFrameCapabilityScript = "readerLocatorCommands.acceptFrameCapability(capability);"
+    private static let acceptFrameCapabilityScript =
+        "readerLocatorCommands.acceptFrameCapability(capability, forwardToChildFrames);"
     private static let readProgressionScript = "return readerLocatorCommands.readProgression(expectedCapability);"
     private static let visibleTextScript = """
     const range = document.caretRangeFromPoint(globalThis.innerWidth / 2, globalThis.innerHeight / 2);
@@ -558,11 +559,12 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// it into the main frame's *current* document via `callAsyncJavaScript(in: nil)`.
     /// WebKit runs the injection in whichever document currently occupies the
     /// main frame, so a superseded or old document instance can never receive it.
-    /// Reflowable content is the main frame and registers directly; a fixed-layout
-    /// wrapper is the main frame and the JS side forwards the capability one hop to
-    /// its child resource frame (see `forwardCapabilityToChildFrames` in
-    /// `reader-locator-commands.js`), which is where registration happens for that
-    /// layout. Either way only the current document tree can echo it back.
+    /// Reflowable content is the main frame, registers directly and forwards the
+    /// capability nowhere; a fixed-layout wrapper is the main frame and the JS side
+    /// forwards the capability one hop to its child resource frame (see
+    /// `forwardCapabilityToChildFrames` in `reader-locator-commands.js`), which is
+    /// where registration happens for that layout. Either way only the current
+    /// document tree can echo it back.
     ///
     /// A reflowable hand-off shares the location transport: it waits for an
     /// outstanding call rather than adding a second one, injects the latest
@@ -592,7 +594,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             _ = try? await EPUBLocatorCommandWatchdog.run(until: deadline, clock: injectionClock) {
                 _ = try await webView.callAsyncJavaScript(
                     Self.acceptFrameCapabilityScript,
-                    arguments: ["capability": capability.id.uuidString],
+                    arguments: ["capability": capability.id.uuidString, "forwardToChildFrames": true],
                     in: nil,
                     contentWorld: Self.contentWorld
                 )
@@ -738,7 +740,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                 invoke(
                     webView,
                     Self.acceptFrameCapabilityScript,
-                    ["capability": capability.id.uuidString],
+                    ["capability": capability.id.uuidString, "forwardToChildFrames": false],
                     nil,
                     done
                 )
@@ -1666,8 +1668,8 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
             info: message.frameInfo,
             capability: registration.capability
         )
-        // A child frame holding the forwarded capability registers too; only
-        // the frame commands and reads would select has completed the hand-off.
+        // Only the frame that commands and reads select completes the hand-off:
+        // a fixed layout's wrapper registers beside its resource frame.
         guard
             registry.select(href: registration.key, capability: registration.capability)
             == .selected(registration.id)

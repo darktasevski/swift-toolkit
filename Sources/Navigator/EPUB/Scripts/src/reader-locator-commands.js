@@ -2147,10 +2147,13 @@ document.addEventListener(
   true
 );
 
-// The unforgeable per-document capability the native side issues to THIS document
-// instance (via callAsyncJavaScript into the frame's current document). It starts
-// null: the document does not register as a command target until it has received a
-// capability, so a bare document-start href announcement can never register.
+// The per-document capability the native side issues to THIS document instance (via
+// callAsyncJavaScript into the frame's current document). It starts null: the
+// document does not register as a command target until it has received a
+// capability, so a bare document-start href announcement can never register. It is
+// unguessable, not secret: a capability forwarded to a fixed-layout resource frame
+// travels as a message that frame's page script can also read. What protects
+// registration is that only this isolated world can reach the native handler.
 let frameCapability = null;
 
 // The postMessage discriminator for a wrapper->child capability hand-off. Fixed
@@ -2202,24 +2205,26 @@ function forwardCapabilityToChildFrames(token) {
 // capability can register: a delayed old document, a same-URL reload, or a
 // nested/self-navigated frame never received it, so their announcements never
 // present the current capability and are rejected. Reflowable content is the main
-// frame and registers directly; a fixed-layout wrapper is the main frame and
-// forwards the capability to its child resource frame.
-function acceptFrameCapability(token) {
+// frame and registers directly, and keeps the capability out of its child frames,
+// which can never be its command target; a fixed-layout wrapper is the main frame
+// and forwards the capability to its child resource frame.
+function acceptFrameCapability(token, forwardToChildFrames = true) {
   if (typeof token !== "string" || token.length === 0) {
     return;
   }
   frameCapability = token;
   postFrameReady();
-  forwardCapabilityToChildFrames(token);
+  if (forwardToChildFrames === true) {
+    forwardCapabilityToChildFrames(token);
+  }
 }
 
 // Measures the viewport of the document holding `expectedCapability`, as
 // exactly `{ capability, first, last }`, or null. A document answers only while
 // it holds that capability and has not revoked it on pagehide. That does not
-// identify the resource frame on its own: `acceptFrameCapability` forwards the
-// capability to direct same-origin child frames, which can then answer too, so
-// the native side must read in the main frame it selected. Read-only: it never
-// scrolls, registers a frame, or touches a command.
+// identify the resource frame on its own: a direct same-origin child frame that
+// holds the capability answers too, so the native side must read in the main frame
+// it selected. Read-only: it never scrolls, registers a frame, or touches a command.
 function readProgression(expectedCapability) {
   if (frameCapability === null || expectedCapability !== frameCapability) {
     return null;
@@ -2231,12 +2236,14 @@ function readProgression(expectedCapability) {
   return { capability: frameCapability, first: range.first, last: range.last };
 }
 
-// Receives a capability forwarded by the parent wrapper frame. Accepts it only
-// from a direct child of the top frame, over the same origin, and never
-// re-forwards it — so the resource frame registers while a nested grandchild or a
-// self-navigated frame (whose parent is not the top frame) can never consume it.
+// Receives a capability forwarded by the parent wrapper frame. Accepts it only as
+// a real message, not one a page script dispatched itself, from a direct child of
+// the top frame, over the same origin, and never re-forwards it — so the resource
+// frame registers while a nested grandchild or a self-navigated frame (whose parent
+// is not the top frame) can never consume it.
 globalThis.addEventListener("message", (event) => {
   if (
+    !event.isTrusted ||
     globalThis.self === globalThis.top ||
     globalThis.parent !== globalThis.top ||
     event.source !== globalThis.parent ||
@@ -2277,7 +2284,14 @@ globalThis.addEventListener("message", (event) => {
 // interruption, and a miss would send the consumer down its fallback rungs
 // fighting a navigation that no longer exists. Each command clears its own
 // registry entry as it unwinds, so this only fires the signal.
-globalThis.addEventListener("pagehide", () => {
+//
+// Only the browser's own `pagehide` counts. Every content world receives a DOM
+// event, so a page script dispatching one would otherwise revoke the capability of
+// a document that stays current, and abort the command landing in it.
+globalThis.addEventListener("pagehide", (event) => {
+  if (!event.isTrusted) {
+    return;
+  }
   frameCapability = null;
   for (const entry of inFlightCommands.values()) {
     entry.controller.abort();
