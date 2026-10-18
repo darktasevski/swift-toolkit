@@ -861,8 +861,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
 
     /// Publishes the current location only from inputs that are still current
     /// when the calculation ends. Requests made while navigating are retained
-    /// and run once the navigator is idle.
-    private lazy var locationPublication = EPUBLocationPublication(
+    /// and run once the navigator is idle. Internal so a locator navigation
+    /// (`EPUBNavigatorViewController+LocatorCommands.swift`) can hold it.
+    lazy var locationPublication = EPUBLocationPublication(
         scheduler: .clock(locatorClock),
         capture: { [weak self] in self?.capturePublication() },
         commit: { [weak self] in self?.commitPublication($0) }

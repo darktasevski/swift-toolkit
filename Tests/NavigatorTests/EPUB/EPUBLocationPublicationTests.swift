@@ -200,6 +200,46 @@ final class EPUBLocationPublicationTests: XCTestCase {
         )
     }
 
+    // MARK: - Holds
+
+    /// A hold keeps an idle navigator from calculating; its release runs the
+    /// obligation retained meanwhile.
+    func test_aHoldKeepsAnIdleNavigatorFromCalculatingUntilItsRelease() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.offer("a").release()
+        fixture.publication.hold()
+
+        fixture.publication.request()
+        XCTAssertEqual(fixture.dispatched, [], "A held publication calculated")
+        XCTAssertTrue(fixture.publication.hasObligation)
+
+        fixture.publication.release()
+
+        XCTAssertEqual(fixture.dispatched, ["a"])
+        try await fixture.waitUntil { fixture.committed == ["a"] }
+    }
+
+    /// A hold taken while a calculation runs keeps its result from committing,
+    /// as leaving idle does; the release calculates the latest inputs.
+    func test_aCalculationOutlivedByAHoldCommitsNothingAndTheReleaseRecalculates() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+
+        fixture.publication.hold()
+        fixture.offer("b").release()
+        a.release()
+        try await fixture.waitUntil { a.exited && !fixture.publication.isCalculating }
+
+        XCTAssertEqual(fixture.committed, [], "A calculation outlived by a hold committed")
+        XCTAssertEqual(fixture.dispatched, ["a"], "A held publication calculated")
+        fixture.publication.release()
+        try await fixture.waitUntil { fixture.committed == ["b"] }
+    }
+
     // MARK: - Deadline and actual exit
 
     /// A calculation past its deadline keeps the slot: no replacement starts

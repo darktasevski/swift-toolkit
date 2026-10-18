@@ -46,8 +46,9 @@ struct EPUBPublicationCapture {
 
 /// Publishes the navigator's location from current inputs only.
 ///
-/// Calculations start only while the navigator is idle; a request made while
-/// it navigates is retained and runs the moment it settles. One calculation
+/// Calculations start only while the navigator is idle and no operation holds
+/// publication; a request made meanwhile is retained and runs the moment both
+/// end. One calculation
 /// runs at a time and one obligation is retained until a current result
 /// discharges it; requests made meanwhile coalesce into one follow-up. A
 /// result commits only when the navigator has not left idle since it started
@@ -73,9 +74,10 @@ final class EPUBLocationPublication {
     private let capture: @MainActor () -> EPUBPublicationCapture?
     private let commit: @MainActor (EPUBPublicationOutput) -> Void
 
-    /// Advanced by every `setIdle(false)`.
+    /// Advanced by every `setIdle(false)` and `hold()`.
     private var revision: UInt64 = 0
     private var isIdle = false
+    private var holds = 0
     private var active: Active?
     private var lastID = 0
     private(set) var hasObligation = false
@@ -116,6 +118,25 @@ final class EPUBLocationPublication {
         }
     }
 
+    /// Holds publication across an operation the navigator settles in the
+    /// middle of, as a locator navigation does between its hop to a resource
+    /// and its landing: what shows in between is not the operation's result.
+    /// Like leaving idle, it keeps a calculation already running from
+    /// committing.
+    func hold() {
+        holds += 1
+        revision &+= 1
+    }
+
+    /// Ends one hold; the last runs retained work.
+    func release() {
+        guard holds > 0 else {
+            return
+        }
+        holds -= 1
+        attemptDispatch()
+    }
+
     /// Asks for a publication, coalesced with any already retained.
     func request() {
         hasObligation = true
@@ -123,7 +144,7 @@ final class EPUBLocationPublication {
     }
 
     private func attemptDispatch() {
-        guard hasObligation, isIdle, active == nil, let capture = capture() else {
+        guard hasObligation, isIdle, holds == 0, active == nil, let capture = capture() else {
             return
         }
         lastID += 1

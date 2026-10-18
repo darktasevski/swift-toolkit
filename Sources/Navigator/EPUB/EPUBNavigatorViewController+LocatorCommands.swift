@@ -152,6 +152,13 @@ extension EPUBNavigatorViewController {
 
         let spreadView: EPUBSpreadView
         var didHopToResource = false
+        // Released after the landing below, whatever it answers.
+        var holdsPublication = false
+        defer {
+            if holdsPublication {
+                locationPublication.release()
+            }
+        }
         if
             paginationView.currentIndex == spreadIndex,
             let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
@@ -165,6 +172,11 @@ extension EPUBNavigatorViewController {
             // perceived landing — no chapter-top paint, no post-reveal slide).
             // The bridge run below stays the truthful landing authority.
             didHopToResource = true
+            // The navigator settles between the hop and the landing, and the
+            // hop places the spread only approximately: publish neither until
+            // the landing ends.
+            locationPublication.hold()
+            holdsPublication = true
             // Publish the hop so the TARGET spread's stylesheet/font/geometry
             // stabilization spends what is LEFT of this deadline rather than minting a
             // fresh allowance of its own. The spread initializes on its own load event,
