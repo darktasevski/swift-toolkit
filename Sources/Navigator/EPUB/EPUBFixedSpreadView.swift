@@ -207,10 +207,9 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             ) { [weak self] in
                 guard let self else { return false }
                 return await withCheckedContinuation { continuation in
-                    self.webView.evaluateJavaScript(self.viewportScript(for: configuration)) { [weak self] _, error in
+                    self.webView.evaluateJavaScript(self.viewportScript(for: configuration)) { _, error in
                         if let error {
-                            let ns = error as NSError
-                            self?.log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+                            EPUBPageWorldLog.report(.fixedViewportFailed, withholding: error)
                             continuation.resume(returning: false)
                         } else {
                             continuation.resume(returning: true)
@@ -229,8 +228,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // throws, so `Expired` is the only verdict `run` can rethrow. Named rather than
             // collapsed into the arm above so a future throwing operation is not silently
             // misreported as a deadline expiry.
-            let ns = error as NSError
-            log(.warning, "Fixed viewport failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            EPUBPageWorldLog.report(.fixedViewportOperationFailed, withholding: error)
             return false
         }
     }
@@ -339,8 +337,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
         } catch is CancellationError {
             return false
         } catch {
-            let ns = error as NSError
-            log(.warning, "Fixed layout stability failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+            EPUBPageWorldLog.report(.fixedLayoutStabilityFailed, withholding: error)
             return false
         }
     }

@@ -362,10 +362,9 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         }
 
         return await withCheckedContinuation { continuation in
-            webView.evaluateJavaScript(script) { [weak self] res, error in
+            webView.evaluateJavaScript(script) { res, error in
                 if let error = error {
-                    let ns = error as NSError
-                    self?.log(.error, "JavaScript evaluation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+                    EPUBPageWorldLog.report(.javaScriptEvaluationFailed, withholding: error)
                     continuation.resume(returning: .failure(error))
                 } else {
                     continuation.resume(returning: .success(res ?? ()))
@@ -1106,8 +1105,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
         if readiness.fail(ifCurrent: generation) {
             locatorCommandBridge.invalidateDocument()
         }
-        let ns = error as NSError
-        log(.error, "Web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+        EPUBPageWorldLog.report(.webNavigationFailed, withholding: error)
     }
 
     func webView(
@@ -1121,8 +1119,7 @@ extension EPUBSpreadView: WKNavigationDelegate {
         if readiness.fail(ifCurrent: generation) {
             locatorCommandBridge.invalidateDocument()
         }
-        let ns = error as NSError
-        log(.error, "Provisional web navigation failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+        EPUBPageWorldLog.report(.provisionalWebNavigationFailed, withholding: error)
     }
 
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
@@ -1221,7 +1218,7 @@ private extension EPUBSpreadView {
                 return
             }
 
-            trace("stopping activity indicator because spread \(spread.first.link.href) did not load")
+            trace("stopping activity indicator because spread did not load")
             activityIndicatorView?.stopAnimating()
         }
 

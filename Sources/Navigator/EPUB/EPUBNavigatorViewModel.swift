@@ -417,8 +417,7 @@ protocol EPUBNavigatorViewModelDelegate: AnyObject {
                 }
                 return content
             } catch {
-                let ns = error as NSError
-                log(.error, "Publication CSS load failed type=\(type(of: error)) [\(ns.domain)#\(ns.code)]")
+                EPUBPageWorldLog.report(.publicationCSSLoadFailed, withholding: error)
                 return content
             }
         }
