@@ -350,8 +350,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             // Spread teardown — not a failure.
             return .failed
         } catch {
-            // type+domain+code only — never bare \(error). WKErrorDomain.userInfo
-            // can echo script source + arguments.
+            // The error is withheld whole: WKErrorDomain.userInfo can echo script source and arguments.
             EPUBPageWorldLog.report(.anchorTrackingInitializationFailed, withholding: error)
         }
 

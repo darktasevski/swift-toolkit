@@ -83,9 +83,6 @@ enum EPUBPageWorldLog: Loggable {
         }
     }
 
-    /// The fixed prefix every withheld-payload log line carries.
-    static let messagePrefix = "Page world payload withheld"
-
     /// Reports `reason`, withholding `payload`.
     ///
     /// `payload` is deliberately unread. Passing it is what makes the drop
