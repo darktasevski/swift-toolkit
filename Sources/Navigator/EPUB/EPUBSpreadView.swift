@@ -1218,7 +1218,7 @@ private extension EPUBSpreadView {
                 return
             }
 
-            log(.trace, "Stopping activity indicator because spread did not load")
+            trace("stopping activity indicator because spread did not load")
             activityIndicatorView?.stopAnimating()
         }
 
@@ -1227,7 +1227,7 @@ private extension EPUBSpreadView {
         // schedule below will stop the activity indicator.
         // If the spread begins to load it will send a `spreadLoadStart` JS
         // event which will cancel the work item being scheduled here.
-        log(.trace, "Scheduling activity indicator stop")
+        trace("scheduling activity indicator stop")
         DispatchQueue.main.asyncAfter(
             deadline: .now() + 2,
             execute: activityIndicatorStopWorkItem!
