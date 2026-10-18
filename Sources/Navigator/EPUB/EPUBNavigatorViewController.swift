@@ -880,7 +880,6 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return nil
         }
         let key = EPUBPublicationKey(
-            spread: ObjectIdentifier(spreadView),
             spreadIndex: paginationView.currentIndex,
             capability: input.capability,
             stamp: input.stamp
@@ -900,10 +899,8 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         let tableOfContentsTitles = tableOfContentsTitleByHrefTask
         let publication = publication
         return EPUBPublicationCapture(
-            // The weak spread keeps a deallocated spread's reused address
-            // from matching the key.
-            isCurrent: { [weak self, weak spreadView = live.spreadView] in
-                spreadView != nil && self?.livePublication()?.key == key
+            isCurrent: { [weak self] in
+                self?.livePublication()?.key == key
             },
             calculate: {
                 let tableOfContentsTitleByHref = await tableOfContentsTitles.value

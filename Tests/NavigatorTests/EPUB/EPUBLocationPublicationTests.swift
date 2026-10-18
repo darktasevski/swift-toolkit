@@ -178,25 +178,18 @@ final class EPUBLocationPublicationTests: XCTestCase {
 
     func test_aNewObservationOfTheSameSpreadIsANewKey() {
         let capability = EPUBSpreadFrameCapability()
-        let spread = ObjectIdentifier(NSObject())
-        let before = EPUBPublicationKey(spread: spread, spreadIndex: 2, capability: capability, stamp: 4)
+        let before = EPUBPublicationKey(spreadIndex: 2, capability: capability, stamp: 4)
 
-        XCTAssertNotEqual(before, EPUBPublicationKey(spread: spread, spreadIndex: 2, capability: capability, stamp: 5))
-        XCTAssertEqual(before, EPUBPublicationKey(spread: spread, spreadIndex: 2, capability: capability, stamp: 4))
+        XCTAssertNotEqual(before, EPUBPublicationKey(spreadIndex: 2, capability: capability, stamp: 5))
+        XCTAssertEqual(before, EPUBPublicationKey(spreadIndex: 2, capability: capability, stamp: 4))
     }
 
+    /// A spread replaced at the same index loads its document under a
+    /// capability of its own, so its key is new.
     func test_aReplacedSpreadAtTheSameIndexIsANewKey() {
-        let capability = EPUBSpreadFrameCapability()
-        let old = NSObject()
-        let replacement = NSObject()
-
         XCTAssertNotEqual(
-            EPUBPublicationKey(spread: ObjectIdentifier(old), spreadIndex: 2, capability: capability, stamp: 4),
-            EPUBPublicationKey(spread: ObjectIdentifier(replacement), spreadIndex: 2, capability: capability, stamp: 4)
-        )
-        XCTAssertNotEqual(
-            EPUBPublicationKey(spread: ObjectIdentifier(old), spreadIndex: 2, capability: capability, stamp: 4),
-            EPUBPublicationKey(spread: ObjectIdentifier(old), spreadIndex: 2, capability: EPUBSpreadFrameCapability(), stamp: 4)
+            EPUBPublicationKey(spreadIndex: 2, capability: EPUBSpreadFrameCapability(), stamp: 4),
+            EPUBPublicationKey(spreadIndex: 2, capability: EPUBSpreadFrameCapability(), stamp: 4)
         )
     }
 

@@ -25,8 +25,9 @@ struct EPUBSpreadPublicationInput: Equatable {
 
 /// What a spread's publishable inputs were captured from. A calculation is
 /// current while the navigator's live key still equals the one it captured.
+/// The capability names the spread too: every spread mints its own for each
+/// document it loads.
 struct EPUBPublicationKey: Equatable {
-    let spread: ObjectIdentifier
     let spreadIndex: Int
     let capability: EPUBSpreadFrameCapability
     /// The accepted observation's stamp of a reflowable spread; `nil` for fixed
