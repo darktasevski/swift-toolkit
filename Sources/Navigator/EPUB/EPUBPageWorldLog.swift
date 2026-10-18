@@ -54,6 +54,7 @@ enum EPUBPageWorldLog: Loggable {
         case resourceReadFailed = "resource_read_failed"
         case anchorTrackingReinjectionFailed = "anchor_tracking_reinjection_failed"
         case fixedViewportFailed = "fixed_viewport_failed"
+        case fixedViewportOperationFailed = "fixed_viewport_operation_failed"
         case fixedLayoutStabilityFailed = "fixed_layout_stability_failed"
         case publicationCSSLoadFailed = "publication_css_load_failed"
         case anchorTrackingInitializationFailed = "anchor_tracking_initialization_failed"
@@ -76,7 +77,7 @@ enum EPUBPageWorldLog: Loggable {
                  .malformedDecorationActivationBody,
                  .malformedImageActivationBody,
                  .malformedLinkActivationBody,
-                 .invalidScrollProgression, .internalLinkUnavailable, .noteFragmentUnavailable, .noteResourceUnavailable, .noteElementUnavailable, .noteReadFailed, .anchorTrackingReinjectionFailed, .fixedViewportFailed, .fixedLayoutStabilityFailed, .anchorTrackingInitializationFailed, .reflowableLayoutStabilityFailed:
+                 .invalidScrollProgression, .internalLinkUnavailable, .noteFragmentUnavailable, .noteResourceUnavailable, .noteElementUnavailable, .noteReadFailed, .anchorTrackingReinjectionFailed, .fixedViewportFailed, .fixedViewportOperationFailed, .fixedLayoutStabilityFailed, .anchorTrackingInitializationFailed, .reflowableLayoutStabilityFailed:
                 return .warning
             }
         }

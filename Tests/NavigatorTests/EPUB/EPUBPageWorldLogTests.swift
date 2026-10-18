@@ -268,6 +268,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
             .resourceReadFailed: .error,
             .anchorTrackingReinjectionFailed: .warning,
             .fixedViewportFailed: .warning,
+            .fixedViewportOperationFailed: .warning,
             .fixedLayoutStabilityFailed: .warning,
             .publicationCSSLoadFailed: .error,
             .anchorTrackingInitializationFailed: .warning,

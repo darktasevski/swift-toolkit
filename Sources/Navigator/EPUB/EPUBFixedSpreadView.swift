@@ -228,7 +228,7 @@ final class EPUBFixedSpreadView: EPUBSpreadView {
             // throws, so `Expired` is the only verdict `run` can rethrow. Named rather than
             // collapsed into the arm above so a future throwing operation is not silently
             // misreported as a deadline expiry.
-            EPUBPageWorldLog.report(.fixedViewportFailed, withholding: error)
+            EPUBPageWorldLog.report(.fixedViewportOperationFailed, withholding: error)
             return false
         }
     }
