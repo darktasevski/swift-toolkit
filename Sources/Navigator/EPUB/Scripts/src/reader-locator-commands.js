@@ -1160,17 +1160,21 @@ async function scrollAndSettle(
 // by whatever remains of it, never by a fresh per-frame allowance — so a
 // starved rAF can no longer multiply a per-rung timeout across the viewport,
 // offset-settle, and correction rungs and overrun the total command budget.
-// A wait that times out after its command was superseded answers "stale": a
-// superseded command is cancelled, never a miss.
+// A wait whose command is superseded or aborted by the time it ends answers
+// "stale", however it ends: a superseded command is cancelled, never a miss.
+// Callers do not re-check currency after the wait: a supersession or an abort
+// runs as its own task, so nothing changes currency before their continuation.
 function nextFrame(token, signal, deadlineAt) {
   return new Promise((resolve) => {
+    const timeoutStatus = () =>
+      isCurrent(token) && !(signal && signal.aborted) ? "timeout" : "stale";
     const remaining = deadlineAt - performance.now();
     if (!(remaining > 0)) {
       // Budget already spent (or a non-finite deadline): terminal now, before
       // any timer/rAF/listener is registered, so there is nothing to tear down.
       // Resolving here is what stops an exhausted command from buying one more
       // frame at every remaining rung.
-      resolve("timeout");
+      resolve(timeoutStatus());
       return;
     }
     let settled = false;
@@ -1191,7 +1195,7 @@ function nextFrame(token, signal, deadlineAt) {
     };
     const onAbort = () => finish("stale");
     const timeoutID = scheduleTimeout(
-      () => finish(isCurrent(token) ? "timeout" : "stale"),
+      () => finish(timeoutStatus()),
       Math.min(FRAME_DEADLINE_MILLISECONDS, remaining)
     );
     if (signal) {
@@ -1208,7 +1212,7 @@ function nextFrame(token, signal, deadlineAt) {
         )
       );
     } catch (_) {
-      finish("timeout");
+      finish(timeoutStatus());
     }
   });
 }
@@ -1580,10 +1584,11 @@ function isLateFrame(frameStatus, deadlineAt) {
 
 // Waits, bounded, for the document to have a usable (non-zero) layout
 // viewport before any viewport-relative work runs. Returns "usable",
-// "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
-// never arrived), or "stale". `toleratesLateFrames` counts a late frame as a
-// frame, for a command whose miss fails its document: a late frame does not
-// end the wait, only the deadline or the frame cap does.
+// "notReady" (still 0-sized after `VIEWPORT_READY_FRAMES` frames), "timeout"
+// (a frame never arrived), or "stale". `toleratesLateFrames` counts a late
+// frame as a frame, for a command whose miss fails its document: a late frame
+// does not end a current command's wait, only the deadline or the frame cap
+// does; a command superseded meanwhile ends it as "stale" (see `nextFrame`).
 async function awaitUsableViewport(
   token,
   signal,
@@ -1631,7 +1636,7 @@ async function awaitOffsetStability(
       return "stale";
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
+    if (frameStatus !== "current") {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
     if (belt && belt.fired()) {
@@ -1835,7 +1840,7 @@ async function navigateLocator(command, token, signal, deadlineAt) {
   if (preScrollFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (preScrollFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+  if (preScrollFrame !== "current") {
     return commandResult(token, "cancelled", "staleToken");
   }
   const landing = await landAndVerify(
@@ -1867,8 +1872,9 @@ const PROGRESSION_LANDING_TOLERANCE = 1;
 // has. The target must lie within the scrollport: the web process reports an
 // overscrolled write's offset unclamped until the UI process clamps it. A late
 // frame ends neither of its waits, because a failed position command fails its
-// document: the deadline ends either as `paintTimeout`, and the viewport wait's
-// frame cap ends it as `viewportNotReady`.
+// document (a command superseded meanwhile answers `cancelled`): the deadline
+// ends it as `paintTimeout`, and the viewport wait's frame cap ends it as
+// `viewportNotReady`.
 async function navigateProgression(command, token, signal, deadlineAt) {
   requireOnlyKeys(command, NAVIGATE_PROGRESSION_KEYS);
   if (
@@ -1921,7 +1927,7 @@ async function navigateProgression(command, token, signal, deadlineAt) {
       return commandResult(token, "applied", "none");
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    if (frameStatus === "stale" || signal?.aborted || !isCurrent(token)) {
+    if (frameStatus === "stale") {
       return commandResult(token, "cancelled", "staleToken");
     }
     if (frameStatus === "timeout" && !isLateFrame(frameStatus, deadlineAt)) {
@@ -1952,7 +1958,7 @@ async function replaceDecorationGroup(command, token, signal, deadlineAt) {
   if (prePaintFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (prePaintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+  if (prePaintFrame !== "current") {
     return commandResult(token, "cancelled", "staleToken");
   }
 
@@ -1969,7 +1975,7 @@ async function replaceDecorationGroup(command, token, signal, deadlineAt) {
 
   for (let frame = 0; frame < 2; frame += 1) {
     const paintFrame = await nextFrame(token, signal, deadlineAt);
-    if (paintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+    if (paintFrame !== "current") {
       if (decorationGroups.get(value.groupID) === state) {
         restoreDecorationGroup(value.groupID, previous);
       }
