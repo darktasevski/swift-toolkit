@@ -189,7 +189,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let turn = Task { @MainActor in
             await spreadView.go(to: .right, options: NavigatorGoOptions(animated: true))
         }
-        try await waitUntil { coordinator.hasPendingRequest }
+        try await EPUBSpreadViewHosting.waitUntil { coordinator.hasPendingRequest }
         XCTAssertFalse(spreadView.readiness.isCommandReady, "The turn waited without holding readiness")
         let outcome = await turn.value
 
@@ -374,7 +374,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let superseded = Task { @MainActor in
             await spreadView.go(to: .right, options: NavigatorGoOptions(animated: false))
         }
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             spreadView.scrollView.contentOffset.x > 0 && !spreadView.readiness.isCommandReady
         }
         let secondPage = spreadView.scrollView.contentOffset.x
@@ -388,7 +388,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertEqual(supersededOutcome, .cancelled)
         XCTAssertEqual(latestOutcome, .succeeded)
 
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             observation.currentObservation != nil && !observation.hasObligation && !observation.isReading
         }
         let scrollView = spreadView.scrollView
@@ -899,14 +899,14 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let capability = EPUBSpreadFrameCapability()
         let outcome = try await initializeLoadedReflowableSpread(spreadView, frameCapability: capability)
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
         XCTAssertTrue(observation.hasObligation, "A read refused for an unregistered frame dropped its obligation")
         XCTAssertFalse(observation.isReading)
 
         spreadView.locatorCommandBridge.setFrameCapability(capability)
 
-        try await waitUntil { delegate.pageChanges > 0 }
+        try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > 0 }
         try assertReportsTheMeasuredStart(of: spreadView, under: capability)
     }
 
@@ -923,7 +923,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
             frameCapability: capability
         ))
         spreadView.locatorCommandBridge.setFrameCapability(capability)
-        try await waitUntil { registrations.capabilities == [capability] && freedSlots.count > 0 }
+        try await EPUBSpreadViewHosting.waitUntil { registrations.capabilities == [capability] && freedSlots.count > 0 }
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
         XCTAssertTrue(observation.hasObligation, "The registration asked for no measurement")
         XCTAssertFalse(observation.isReading, "A read started while initialization held readiness")
@@ -935,7 +935,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.readiness.finishInitialization(rootLease, outcome: outcome)
         XCTAssertEqual(outcome, .succeeded)
 
-        try await waitUntil { delegate.pageChanges > 0 }
+        try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > 0 }
         try assertReportsTheMeasuredStart(of: spreadView, under: capability)
     }
 
@@ -950,7 +950,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let outcome = await spreadView.go(to: .start, animated: false)
 
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { observation.currentObservation != nil }
+        try await EPUBSpreadViewHosting.waitUntil { observation.currentObservation != nil }
         XCTAssertEqual(observation.currentObservation, before, "The command moved the viewport")
         XCTAssertGreaterThan(delegate.pageChanges, reports)
     }
@@ -997,7 +997,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
         // The hand-off's freed slot cannot read while it is missing, so only
         // the registration can bring this report.
-        try await waitUntil { delegate.pageChanges > pageChanges }
+        try await EPUBSpreadViewHosting.waitUntil { delegate.pageChanges > pageChanges }
         XCTAssertFalse(observation.isRegistrationMissing)
         try assertReportsTheMeasuredStart(of: spreadView, under: capability)
     }
@@ -1030,7 +1030,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.readiness.finishMutation(lease, outcome: .succeeded)
 
         XCTAssertTrue(observation.isReading || observation.hasObligation, "Readiness asked for no measurement")
-        try await waitUntil { observation.currentObservation != nil }
+        try await EPUBSpreadViewHosting.waitUntil { observation.currentObservation != nil }
     }
 
     /// A hand-off that fails twice waits for a grant, and the grant re-issues
@@ -1048,7 +1048,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
 
         report(.lateCompletion)
         XCTAssertFalse(observation.isRegistrationMissing, "The grant left the hand-off missing")
-        try await waitUntil { registrations.capabilities.contains(capability) }
+        try await EPUBSpreadViewHosting.waitUntil { registrations.capabilities.contains(capability) }
     }
 
     /// A read refused because another call holds the transport runs as soon as
@@ -1069,7 +1069,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertFalse(observation.isReading, "A read started beside the outstanding call")
         XCTAssertTrue(observation.hasObligation)
 
-        try await waitUntil { observation.currentObservation != nil }
+        try await EPUBSpreadViewHosting.waitUntil { observation.currentObservation != nil }
     }
 
     /// Native motion revokes the sample at once, whoever moved the content.
@@ -1097,12 +1097,12 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         XCTAssertFalse(observation.isReading || observation.hasObligation, "A decelerating drag asked before it settled")
         spreadView.scrollViewDidEndDecelerating(scrollView)
         XCTAssertTrue(observation.isReading || observation.hasObligation, "The deceleration's end asked for nothing")
-        try await waitUntil { observation.currentObservation != nil && !observation.isReading }
+        try await EPUBSpreadViewHosting.waitUntil { observation.currentObservation != nil && !observation.isReading }
 
         observation.invalidate()
         spreadView.scrollViewDidEndDragging(scrollView, willDecelerate: false)
         XCTAssertTrue(observation.isReading || observation.hasObligation, "A drag's end asked for nothing")
-        try await waitUntil { observation.currentObservation != nil && !observation.isReading }
+        try await EPUBSpreadViewHosting.waitUntil { observation.currentObservation != nil && !observation.isReading }
 
         observation.invalidate()
         spreadView.scrollViewDidEndScrollingAnimation(scrollView)
@@ -1134,7 +1134,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let (spreadView, _) = try await loadObservedReflowableSpread()
         let outcome = try await initializeLoadedReflowableSpread(spreadView)
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
 
         XCTAssertNil(spreadView.publicationInput())
     }
@@ -1147,15 +1147,15 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.delegate = delegate
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
-        try await waitForFixedResourceLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForFixedResourceLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         XCTAssertNil(spreadView.publicationInput(), "A loading fixed spread was publishable")
         XCTAssertEqual(delegate.pageChanges, 0)
 
         let outcome = try await initializeLoadedFixedSpread(spreadView)
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
 
         XCTAssertEqual(delegate.pageChanges, 1, "Readiness did not tell the delegate the pages changed")
         let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
@@ -1179,7 +1179,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         )
         spreadView.frame = CGRect(x: 0, y: 0, width: 1200, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         let capability = EPUBSpreadFrameCapability()
         let rootLease = try XCTUnwrap(spreadView.readiness.beginInitialization(
             for: spreadView.readiness.generation,
@@ -1490,7 +1490,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spreadView.delegate = delegate
         spreadView.frame = CGRect(x: 0, y: 0, width: 600, height: 800)
         spreadView.layoutIfNeeded()
-        try await waitForDocumentLoad(in: spreadView)
+        try await EPUBSpreadViewHosting.waitForDocumentLoad(in: spreadView)
         try await enableAnimationFrames(in: spreadView)
         return (spreadView, delegate)
     }
@@ -1502,10 +1502,10 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let capability = EPUBSpreadFrameCapability()
         let outcome = try await initializeLoadedReflowableSpread(spreadView, frameCapability: capability)
         XCTAssertEqual(outcome, .succeeded)
-        try await waitUntil { spreadView.readiness.isCommandReady }
+        try await EPUBSpreadViewHosting.waitUntil { spreadView.readiness.isCommandReady }
         spreadView.locatorCommandBridge.setFrameCapability(capability)
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
-        try await waitUntil {
+        try await EPUBSpreadViewHosting.waitUntil {
             observation.currentObservation != nil && !observation.hasObligation && !observation.isReading
         }
         return (spreadView, delegate)
