@@ -1000,8 +1000,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             reissueHandshake: { [weak self] capability in
                 self?.locatorCommandBridge.setFrameCapability(capability)
             },
-            onAccepted: { [weak self] accepted in
-                self?.observationDidAccept(accepted)
+            onAccepted: { [weak self] _ in
+                self?.observationDidAccept()
             }
         )
         builtLocationObservation = observation
@@ -1037,7 +1037,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         )
     }
 
-    private func observationDidAccept(_ observation: EPUBAcceptedObservation) {
+    private func observationDidAccept() {
         // An equal range is reported too: pending navigator work may be
         // waiting for it.
         delegate?.spreadViewPagesDidChange(self)

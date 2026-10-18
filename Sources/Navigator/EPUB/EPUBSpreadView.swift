@@ -858,22 +858,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     // MARK: - Location and progression.
 
-    /// Current progression in the resource with given href.
-    func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
-        // To be overridden in subclasses if the resource supports a progression.
-        0 ... 1
-    }
-
     /// What the navigator may publish from this spread now, or `nil` while
-    /// nothing current can be read. A ready spread publishes its resources'
-    /// progressions; a reflowable one requires an accepted observation.
+    /// nothing current can be read. A ready fixed-layout spread shows each of
+    /// its resources whole; a reflowable spread overrides this to publish only
+    /// an accepted observation.
     func publicationInput() -> EPUBSpreadPublicationInput? {
         guard case let .ready(_, capability) = readiness.state else {
             return nil
         }
         var progressions: [ReadingOrder.Index: ClosedRange<Double>] = [:]
         for index in spread.readingOrderIndices {
-            progressions[index] = progression(in: index)
+            progressions[index] = 0 ... 1
         }
         return EPUBSpreadPublicationInput(capability: capability, stamp: nil, progressions: progressions)
     }
