@@ -71,6 +71,11 @@ try:
         f"Executed {totals['totalTestCount'] - totals['skippedTests']} — passed {totals['passedTests']}, "
         f"failed {totals['failedTests']}, skipped {totals['skippedTests']}"
     )
+    # An empty tree beside a positive total classes every identifier unmatched; the evidence
+    # disagrees, so no identifier is to blame.
+    if outcome == "inconsistent":
+        print("NOT PROVEN: the summary counts tests the test tree does not hold.")
+        sys.exit(EXITS[outcome])
     for entry in report["identifiers"]:
         if entry["class"] == "skipped-only":
             print(f"NOT PROVEN: {entry['identifier']} — every test it selected skipped:")
@@ -86,8 +91,6 @@ try:
         print("  function takes its full signature: Type/function(), or Type/function(label:).")
     elif outcome == "nothing-unskipped":
         print("NOT PROVEN: the run executed no test that did not skip.")
-    elif outcome == "inconsistent":
-        print("NOT PROVEN: the summary counts tests the test tree does not hold.")
     sys.exit(EXITS[outcome])
 except Exception:  # noqa: BLE001 — a fault here is "could not tell", never "matched nothing"
     print("Could not render the coverage report, so this run proves nothing.")
