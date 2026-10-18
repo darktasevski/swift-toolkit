@@ -1045,7 +1045,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func locationTransportDidReport(_ event: EPUBLocationTransportEvent) {
         switch event {
-        case let .handshakeFailed(capability, _):
+        case let .handshakeFailed(capability):
             locationObservation.handshakeDidFail(for: capability)
         case .lateCompletion:
             locationObservation.grant(.lateCompletion)

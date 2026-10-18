@@ -6,23 +6,12 @@
 
 import Foundation
 
-/// Why a reflowable capability hand-off ended without the frame registering.
-enum EPUBHandshakeFailure: Equatable, Sendable {
-    /// WebKit returned an error for the injection.
-    case injectionFailed
-    /// The injection had not completed by the attempt's deadline.
-    case injectionUnresponsive
-    /// The injection completed, but no frame registered by the deadline.
-    case registrationMissing
-    /// Another call held the transport until the deadline.
-    case transportOccupied
-}
-
 /// What the location transport reports to its owner: closed outcomes keyed
 /// only by the opaque capability they concern.
 enum EPUBLocationTransportEvent: Equatable, Sendable {
-    /// The hand-off of `capability` ended without a registered frame.
-    case handshakeFailed(EPUBSpreadFrameCapability, EPUBHandshakeFailure)
+    /// The hand-off of `capability` ended without a registered frame: WebKit
+    /// rejected the injection, or the attempt's deadline passed first.
+    case handshakeFailed(EPUBSpreadFrameCapability)
     /// A call whose deadline had passed finally completed and its value was
     /// discarded. The slot it freed may already hold a pending hand-off.
     case lateCompletion

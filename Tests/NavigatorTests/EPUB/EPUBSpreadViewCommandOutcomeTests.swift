@@ -988,8 +988,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
         let capability = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
         let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
-        report(.handshakeFailed(capability, .registrationMissing))
-        report(.handshakeFailed(capability, .registrationMissing))
+        report(.handshakeFailed(capability))
+        report(.handshakeFailed(capability))
         XCTAssertTrue(observation.isRegistrationMissing)
         observation.invalidate()
         observation.request()
@@ -1012,12 +1012,12 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let observation = try XCTUnwrap(spreadView.builtLocationObservation)
         let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
         let first = try XCTUnwrap(spreadView.readiness.currentFrameCapability)
-        report(.handshakeFailed(first, .registrationMissing))
+        report(.handshakeFailed(first))
 
         let generation = spreadView.readiness.beginLoading()
         let next = EPUBSpreadFrameCapability()
         _ = try XCTUnwrap(spreadView.readiness.beginInitialization(for: generation, frameCapability: next))
-        report(.handshakeFailed(next, .registrationMissing))
+        report(.handshakeFailed(next))
 
         XCTAssertFalse(observation.isRegistrationMissing, "The previous document's re-issue was counted")
     }
@@ -1045,8 +1045,8 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let registrations = RegistrationRecorder(spreadView.locatorCommandBridge)
         let report = try XCTUnwrap(spreadView.locatorCommandBridge.onLocationTransportEvent)
 
-        report(.handshakeFailed(capability, .registrationMissing))
-        report(.handshakeFailed(capability, .registrationMissing))
+        report(.handshakeFailed(capability))
+        report(.handshakeFailed(capability))
         XCTAssertTrue(observation.isRegistrationMissing)
 
         report(.lateCompletion)

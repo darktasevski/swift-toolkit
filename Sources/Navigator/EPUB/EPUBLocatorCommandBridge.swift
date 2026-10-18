@@ -398,8 +398,8 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private struct HandshakeAttempt {
         enum Phase: Equatable {
             case awaitingTransport
-            case injecting
-            case awaitingRegistration
+            /// Injected or injecting; the registration ends it.
+            case started
         }
 
         /// What the attempt's injection and deadline answer to. The capability
@@ -528,7 +528,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         latestSequences.removeAll(keepingCapacity: true)
         decorationActivationStates.removeAll(keepingCapacity: true)
         inFlightNavigation = nil
-        endHandshake(reporting: nil)
+        endHandshake(failed: false)
     }
 
     @MainActor
@@ -552,7 +552,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         currentFrameCapability = nil
         framesByID.removeAll(keepingCapacity: true)
         registry.removeAll()
-        endHandshake(reporting: nil)
+        endHandshake(failed: false)
         locationTransport.close()
     }
 
@@ -696,7 +696,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// injecting, and it waits for the transport if a call is outstanding.
     @MainActor
     private func beginHandshake(for capability: EPUBSpreadFrameCapability) {
-        endHandshake(reporting: nil)
+        endHandshake(failed: false)
         lastHandshakeID += 1
         let id = lastHandshakeID
         let deadline = EPUBLocatorOperationDeadline(
@@ -728,10 +728,10 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         let id = attempt.id
         let capability = attempt.capability
         let invoke = invokeLocationScript
-        // The attempt is marked injecting before the call starts: an answer
+        // The attempt is marked started before the call starts: an answer
         // delivered inside the invocation frees the slot, and this attempt
         // must not take it again.
-        handshake?.phase = .injecting
+        handshake?.phase = .started
         let started = locationTransport.start(
             until: attempt.deadline,
             invocation: { done in
@@ -760,43 +760,31 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         attempt id: Int
     ) {
         guard
-            case let .completed(result) = delivery,
+            case .completed(.failure) = delivery,
             handshake?.id == id
         else {
             return
         }
-        switch result {
-        case .success:
-            handshake?.phase = .awaitingRegistration
-        case .failure:
-            endHandshake(reporting: .injectionFailed)
-        }
+        endHandshake(failed: true)
     }
 
     @MainActor
     private func handshakeDeadlineDidPass(attempt id: Int) {
-        guard let attempt = handshake, attempt.id == id else {
+        guard handshake?.id == id else {
             return
         }
-        switch attempt.phase {
-        case .awaitingTransport:
-            endHandshake(reporting: .transportOccupied)
-        case .injecting:
-            endHandshake(reporting: .injectionUnresponsive)
-        case .awaitingRegistration:
-            endHandshake(reporting: .registrationMissing)
-        }
+        endHandshake(failed: true)
     }
 
     @MainActor
-    private func endHandshake(reporting failure: EPUBHandshakeFailure?) {
+    private func endHandshake(failed: Bool) {
         guard let attempt = handshake else {
             return
         }
         attempt.timer.cancel()
         handshake = nil
-        if let failure {
-            onLocationTransportEvent?(.handshakeFailed(attempt.capability, failure))
+        if failed {
+            onLocationTransportEvent?(.handshakeFailed(attempt.capability))
         }
     }
 
@@ -1694,7 +1682,7 @@ extension EPUBLocatorCommandBridge: WKScriptMessageHandler {
             return
         }
         if handshake?.capability == registration.capability {
-            endHandshake(reporting: nil)
+            endHandshake(failed: false)
         }
         onFrameRegistered?(registration.capability)
     }

@@ -163,7 +163,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(fixture.scripts.injectedCapabilities, [first])
 
         fixture.deadlines.advance(by: fixture.budget)
-        XCTAssertEqual(fixture.events, [.handshakeFailed(first, .injectionUnresponsive)])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(first)])
         for _ in 0 ..< 5 {
             XCTAssertEqual(try fixture.read(), .transportOccupied)
         }
@@ -177,7 +177,7 @@ final class EPUBLocationTransportTests: XCTestCase {
 
         fixture.scripts.complete(0, with: .success(NSNull()))
 
-        XCTAssertEqual(fixture.events, [.handshakeFailed(first, .injectionUnresponsive), .lateCompletion])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(first), .lateCompletion])
         XCTAssertEqual(fixture.scripts.injectedCapabilities, [first, third])
     }
 
@@ -189,7 +189,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.scripts.complete(0, with: .failure(URLError(.cancelled)))
         fixture.deadlines.advance(by: fixture.budget)
 
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed), .slotAvailable])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability), .slotAvailable])
     }
 
     /// A completed injection proves nothing on its own: the frame must still
@@ -203,7 +203,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(fixture.events, [.slotAvailable], "A completed injection reported more than the freed slot")
         fixture.deadlines.advance(by: fixture.budget)
 
-        XCTAssertEqual(fixture.events, [.slotAvailable, .handshakeFailed(capability, .registrationMissing)])
+        XCTAssertEqual(fixture.events, [.slotAvailable, .handshakeFailed(capability)])
     }
 
     func test_aHandshakeThatNeverGetsTheTransportReportsIt() throws {
@@ -215,7 +215,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.bridge.setFrameCapability(waiting)
         fixture.deadlines.advance(by: fixture.budget)
 
-        XCTAssertEqual(fixture.events.last, .handshakeFailed(waiting, .transportOccupied))
+        XCTAssertEqual(fixture.events.last, .handshakeFailed(waiting))
         XCTAssertEqual(fixture.scripts.count, 1)
     }
 
@@ -232,7 +232,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(fixture.scripts.injectedCapabilities, [capability, capability])
         XCTAssertEqual(fixture.events, [], "The superseded injection's failure ended the new attempt")
         fixture.deadlines.advance(by: fixture.budget)
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionUnresponsive)])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability)])
     }
 
     func test_aNewCapabilityIgnoresTheSupersededInjectionsAnswer() throws {
@@ -247,7 +247,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(fixture.scripts.injectedCapabilities, [first, second])
         XCTAssertEqual(fixture.events, [], "The superseded injection's failure ended the new attempt")
         fixture.deadlines.advance(by: fixture.budget)
-        XCTAssertEqual(fixture.events, [.handshakeFailed(second, .injectionUnresponsive)])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(second)])
     }
 
     /// An injection answered before its invocation returns frees the slot
@@ -260,7 +260,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         fixture.bridge.setFrameCapability(capability)
 
         XCTAssertEqual(fixture.scripts.count, 1, "The attempt injected again into the slot its own answer freed")
-        XCTAssertEqual(fixture.events, [.handshakeFailed(capability, .injectionFailed), .slotAvailable])
+        XCTAssertEqual(fixture.events, [.handshakeFailed(capability), .slotAvailable])
     }
 
     /// Clearing the spread drops a hand-off without a verdict, and its

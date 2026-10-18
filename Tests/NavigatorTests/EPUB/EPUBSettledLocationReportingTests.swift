@@ -1447,7 +1447,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         XCTAssertEqual(page.registrations, [], "An unselectable frame was reported as registered")
         deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
-        XCTAssertEqual(page.transportEvents, [.slotAvailable, .handshakeFailed(capability, .registrationMissing)])
+        XCTAssertEqual(page.transportEvents, [.slotAvailable, .handshakeFailed(capability)])
     }
 
     /// A read WebKit failed is `.failed`. One unanswered by its deadline is
@@ -3266,7 +3266,7 @@ private final class ObservedHeldPage {
                 return
             }
             switch event {
-            case let .handshakeFailed(capability, _):
+            case let .handshakeFailed(capability):
                 observation.handshakeDidFail(for: capability)
             case .lateCompletion:
                 observation.grant(.lateCompletion)
