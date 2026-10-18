@@ -532,6 +532,7 @@ assert_output "a scoped run that executed nothing fails" "VERDICT: FAILED (exit 
 CASE_TESTS=tests-empty \
 	run_verdict_case "an empty tree beside a positive total is not proven" 75 --only-testing ReadiumNavigatorTests/First
 assert_output "an empty tree beside a positive total is not proven" "the summary counts tests the test tree does not hold"
+refute_output "an empty tree beside a positive total is not proven" "NO MATCH:"
 
 CASE_SUMMARY=fail run_verdict_case "an unreadable summary is not proven" 75 --only-testing ReadiumNavigatorTests/First
 assert_output "an unreadable summary is not proven" "Could not read the result bundle"
