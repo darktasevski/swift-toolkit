@@ -314,16 +314,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Location and progression
 
-    override func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
-        guard
-            spread.first.index == index,
-            let progression = progression
-        else {
-            return 0 ... 0
-        }
-        return progression
-    }
-
     override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
         let stabilityDeadline = resolveInitializationStabilityDeadline(for: .sharedInitialization)
         let link = spread.first.link
@@ -985,10 +975,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Progression
 
-    /// The range of the last accepted observation. Only a fresh measurement
-    /// writes it.
-    private var progression: ClosedRange<Double>?
-
     private var locationObservation: EPUBLocationObservation {
         if let builtLocationObservation {
             return builtLocationObservation
@@ -1052,7 +1038,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private func observationDidAccept(_ observation: EPUBAcceptedObservation) {
-        progression = observation.sample.range
         // An equal range is reported too: pending navigator work may be
         // waiting for it.
         delegate?.spreadViewPagesDidChange(self)

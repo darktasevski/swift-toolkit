@@ -401,6 +401,7 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         let reported = delegate.reportedRanges.dropFirst(reportsBefore)
         XCTAssertEqual(reported.count, 1, "The supersession reported something besides the landing")
         for range in reported {
+            let range = try XCTUnwrap(range, "The supersession reported a page change with nothing to publish")
             XCTAssertEqual(range.lowerBound, landing, accuracy: 0.001, "The supersession reported \(range), not the landing")
         }
     }
@@ -1520,8 +1521,13 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
     ) throws {
         let accepted = try XCTUnwrap(spreadView.builtLocationObservation?.currentObservation, file: file, line: line)
         XCTAssertEqual(accepted.sample.capability, capability, file: file, line: line)
-        let reported = spreadView.progression(in: spreadView.spread.first.index)
-        XCTAssertEqual(reported, accepted.sample.range, "The spread reports something it did not measure", file: file, line: line)
+        let reported = try XCTUnwrap(
+            spreadView.publicationInput()?.progressions[spreadView.spread.first.index],
+            "The spread has nothing to publish",
+            file: file,
+            line: line
+        )
+        XCTAssertEqual(reported, accepted.sample.range, "The spread publishes something it did not measure", file: file, line: line)
         XCTAssertEqual(reported.lowerBound, 0, file: file, line: line)
         XCTAssertGreaterThan(reported.upperBound, 0, file: file, line: line)
         XCTAssertLessThan(reported.upperBound, 1, file: file, line: line)
@@ -1692,11 +1698,12 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {}
     var pageChanges = 0
-    /// The first resource's range at each page change, in order.
-    private(set) var reportedRanges: [ClosedRange<Double>] = []
+    /// The first resource's published range at each page change, in order;
+    /// `nil` when the spread had nothing to publish.
+    private(set) var reportedRanges: [ClosedRange<Double>?] = []
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {
         pageChanges += 1
-        reportedRanges.append(spreadView.progression(in: spreadView.spread.first.index))
+        reportedRanges.append(spreadView.publicationInput()?.progressions[spreadView.spread.first.index])
     }
 
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {}
