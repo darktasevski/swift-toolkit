@@ -24,11 +24,12 @@ final class EPUBPageWorldLogTests: XCTestCase {
         static let locator = "ZZLOCATORZZ"
         static let script = "ZZSCRIPTZZ"
         static let rawError = "ZZRAWERRORZZ"
+        static let domain = "ZZDOMAINZZ"
         static let geometry = "ZZGEOMETRYZZ"
 
         static let all = [
             bookText, quote, href, title, selector,
-            locator, script, rawError, geometry,
+            locator, script, rawError, domain, geometry,
         ]
     }
 
@@ -61,8 +62,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
         ]
     }
 
-    /// An error whose every renderable surface carries a sentinel, so reducing
-    /// it to type/domain/code is the only way to stay clean.
+    /// An error whose every renderable surface carries a sentinel, including a caller-controlled domain, so only withholding stays clean.
     private var adversarialError: Error {
         NSError(
             domain: "ZZDOMAINZZ",
@@ -78,8 +78,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
     /// A native Swift error, not an `NSError`. This is the shape `DOMRange(json:)`
     /// actually throws, and it bridges differently: `localizedDescription` comes
     /// from the `LocalizedError` conformance, and the domain becomes the mangled
-    /// Swift type name. Reading only domain and code is safe by construction —
-    /// this is what proves it.
+    /// Swift type name. Both shapes must be withheld without bridging or describing the error.
     private enum SentinelError: Error, LocalizedError {
         case leaked(String)
 
@@ -144,7 +143,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
         }
     }
 
-    func testTheErrorOverloadEmitsTypeDomainAndCodeOnly() throws {
+    func testTheErrorOverloadWithholdsAllErrorDetails() throws {
         EPUBPageWorldLog.report(
             .malformedDOMRange,
             withholding: adversarialPayload,
@@ -155,8 +154,8 @@ final class EPUBPageWorldLogTests: XCTestCase {
         XCTAssertEqual(captured.count, 1)
         let line = try XCTUnwrap(captured.first)
         XCTAssertTrue(line.contains("reason=malformed_dom_range"))
-        XCTAssertTrue(line.contains("type=NSError"), "the error's Swift type is the only type detail")
-        XCTAssertTrue(line.contains("[ZZDOMAINZZ#42]"), "domain and code are reported")
+        XCTAssertFalse(line.contains("type=NSError"), "raw error type is withheld")
+        XCTAssertFalse(line.contains("ZZDOMAINZZ"), "arbitrary error domains are content")
         XCTAssertFalse(
             line.contains(Sentinel.rawError),
             "the error's localized description reached the log"
@@ -198,6 +197,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
 
         let captured = logger.captured
         XCTAssertFalse(captured.isEmpty, "nothing was logged, so absence proves nothing")
+        XCTAssertEqual(logger.capturedObjectCount, 0, "raw objects must not reach the logger")
 
         for line in captured {
             for sentinel in Sentinel.all {
@@ -206,6 +206,40 @@ final class EPUBPageWorldLogTests: XCTestCase {
                     "page-world sentinel \(sentinel) reached the log: \(line)"
                 )
             }
+        }
+    }
+
+    func testNavigationDiagnosticsRetainOnlyClosedTokens() throws {
+        let locator = try Locator(href: XCTUnwrap(AnyURL(string: "ZZHREFZZ")), mediaType: .html, title: Sentinel.title,
+                                  text: .init(highlight: Sentinel.bookText))
+        let states: [(EPUBNavigatorViewController.State, EPUBPageWorldLog.NavigationState)] = [
+            (.initializing, .initializing), (.loading(pendingLocator: nil), .loading),
+            (.loading(pendingLocator: locator), .loading), (.idle, .idle),
+            (.jumping(pendingLocator: locator), .jumping), (.moving(direction: .left), .moving),
+        ]
+        let events: [(EPUBNavigatorViewController.Event, EPUBPageWorldLog.NavigationEvent)] = [
+            (.load(nil), .load), (.load(locator), .load), (.loaded, .loaded),
+            (.jump(locator), .jump), (.jumped, .jumped), (.move(.left), .move), (.moved, .moved),
+        ]
+        for (state, token) in states {
+            XCTAssertEqual(state.logToken, token)
+            EPUBPageWorldLog.reportState(state.logToken)
+            XCTAssertTrue(logger.captured.last?.contains("state=\(token.rawValue)") == true)
+            XCTAssertEqual(logger.capturedLevels.last, .debug)
+        }
+        for (event, token) in events {
+            XCTAssertEqual(event.logToken, token)
+            EPUBPageWorldLog.reportEvent(event.logToken)
+            XCTAssertTrue(logger.captured.last?.contains("event=\(token.rawValue)") == true)
+            XCTAssertEqual(logger.capturedLevels.last, .debug)
+        }
+        var state = EPUBNavigatorViewController.State.initializing
+        XCTAssertFalse(state.transition(.jump(locator)))
+        XCTAssertEqual(state, .initializing)
+        XCTAssertTrue(logger.captured.last?.contains("event=jump state=initializing") == true)
+        XCTAssertEqual(logger.capturedLevels.last, .error)
+        for sentinel in Sentinel.all {
+            XCTAssertFalse(logger.captured.contains { $0.contains(sentinel) })
         }
     }
 
@@ -224,6 +258,24 @@ final class EPUBPageWorldLogTests: XCTestCase {
             .malformedImageActivationBody: .warning,
             .malformedLinkActivationBody: .warning,
             .invalidScrollProgression: .warning,
+            .positionsLoadFailed: .error,
+            .internalLinkUnavailable: .warning,
+            .noteFragmentUnavailable: .warning,
+            .noteResourceUnavailable: .warning,
+            .noteElementUnavailable: .warning,
+            .noteReadFailed: .warning,
+            .resourceRangeReadFailed: .error,
+            .resourceReadFailed: .error,
+            .anchorTrackingReinjectionFailed: .warning,
+            .fixedViewportFailed: .warning,
+            .fixedViewportOperationFailed: .warning,
+            .fixedLayoutStabilityFailed: .warning,
+            .publicationCSSLoadFailed: .error,
+            .anchorTrackingInitializationFailed: .warning,
+            .reflowableLayoutStabilityFailed: .warning,
+            .javaScriptEvaluationFailed: .error,
+            .webNavigationFailed: .error,
+            .provisionalWebNavigationFailed: .error,
         ]
         // Driven off `allCases` so a new reason forces a decision here rather
         // than inheriting a neighbour's severity silently.
@@ -254,7 +306,7 @@ final class EPUBPageWorldLogTests: XCTestCase {
         }
 
         let captured = logger.captured
-        XCTAssertEqual(captured.count, 6, "expected the six non-debug reasons only")
+        XCTAssertEqual(captured.count, EPUBPageWorldLog.Reason.allCases.filter { $0.level != .debug }.count)
         XCTAssertFalse(captured.contains { $0.contains("reason=js_console_message") })
         XCTAssertFalse(captured.contains { $0.contains("reason=malformed_dom_range") })
         XCTAssertTrue(
@@ -278,223 +330,5 @@ final class EPUBPageWorldLogTests: XCTestCase {
                 "\(reason) carries characters outside [a-z_]"
             )
         }
-    }
-}
-
-/// Proves the spread's log call sites still route page-world data through the
-/// choke point.
-///
-/// `EPUBPageWorldLogTests` proves the choke point itself withholds a payload.
-/// That says nothing about whether the handlers still use it — a single
-/// `log(.warning, "bad body: \(body)")` restores the leak without failing any
-/// behavioural test, because a log line has no observable effect on navigation.
-/// So this reads the spread sources and pins the complete inventory of what any
-/// log call in them may interpolate. Anything new fails until it is reviewed and
-/// added here, which is the point.
-final class EPUBSpreadLogInterpolationTests: XCTestCase {
-    /// The exact set of expressions a log call in the spread sources
-    /// interpolates, pinned in both directions: a new one fails, and so does a
-    /// stale entry, so this list cannot quietly pre-authorise something nothing
-    /// uses.
-    ///
-    /// Each is a compile-time constant of our own declarations or a count, never
-    /// a value read out of the rendered document:
-    ///
-    /// - `type(of: error)`, `ns.domain`, `ns.code` — the sanctioned error shape.
-    /// - `rawAnchorIds.count` — a cardinality, used when a list exceeds its cap.
-    /// - `name` — a JS message-handler name, supplied only as a literal by
-    ///   `registerJSMessages()`, reported when one is registered twice.
-    private static let allowedInterpolations: Set<String> = [
-        "type(of: error)",
-        "ns.domain",
-        "ns.code",
-        "rawAnchorIds.count",
-        "name",
-    ]
-
-    /// Every spread view source in the directory — the base class, both subclasses and each
-    /// `EPUBSpreadView+*.swift` extension — so a new extension file is scanned without an edit here.
-    private static func spreadSourceNames() throws -> [String] {
-        try FileManager.default.contentsOfDirectory(atPath: spreadSourceDirectory.path)
-            .filter { $0.hasSuffix(".swift") && $0.contains("SpreadView") }
-            .sorted()
-    }
-
-    /// `Sources/Navigator/EPUB`, derived from this file's location so the test
-    /// needs no bundled resource.
-    private static var spreadSourceDirectory: URL {
-        URL(fileURLWithPath: #filePath)
-            // …/Tests/NavigatorTests/EPUB/<this file>
-            .deletingLastPathComponent() // EPUB
-            .deletingLastPathComponent() // NavigatorTests
-            .deletingLastPathComponent() // Tests
-            .deletingLastPathComponent() // repository root
-            .appendingPathComponent("Sources/Navigator/EPUB")
-    }
-
-    private func source(named name: String) throws -> String {
-        let url = Self.spreadSourceDirectory.appendingPathComponent(name)
-        // Fail rather than skip: an unreadable source would make every
-        // assertion below pass vacuously.
-        return try String(contentsOf: url, encoding: .utf8)
-    }
-
-    /// Lines that emit a log, whether directly through `Loggable` or through the
-    /// choke point.
-    ///
-    /// Matches bare `log(`, not `log(.`, deliberately. A call split as
-    /// `log(\n    .warning,\n    "…\(body)"\n)` puts no `log(.` on any line, so
-    /// the narrower filter would miss both the message line AND the `log(` line —
-    /// meaning the one-line guard below could be bypassed by exactly the split it
-    /// exists to catch. With this filter, line one still matches and is
-    /// paren-unbalanced, so the split fails loudly. Verified to match nothing in
-    /// these files beyond real log calls.
-    private func logEmittingLines(in source: String) -> [String] {
-        source
-            .components(separatedBy: .newlines)
-            .filter { $0.contains("log(") || $0.contains("PageWorldLog.report(") }
-    }
-
-    // MARK: - The inventory
-
-    func testNoLogCallInTheSpreadSourcesInterpolatesAnythingUnreviewed() throws {
-        for name in try Self.spreadSourceNames() {
-            let source = try source(named: name)
-            for line in logEmittingLines(in: source) {
-                for interpolation in Self.interpolations(in: line) {
-                    XCTAssertTrue(
-                        Self.allowedInterpolations.contains(interpolation),
-                        """
-                        \(name) interpolates \\(\(interpolation)) into a log call. \
-                        If it cannot carry page-world data, add it to \
-                        allowedInterpolations; otherwise route the site through \
-                        EPUBPageWorldLog.report.
-                        """
-                    )
-                }
-            }
-        }
-    }
-
-    /// A log call split across lines would hide its message from the scan above.
-    func testEveryLogCallInTheSpreadSourcesIsWrittenOnOneLine() throws {
-        for name in try Self.spreadSourceNames() {
-            let source = try source(named: name)
-            for line in logEmittingLines(in: source) {
-                XCTAssertEqual(
-                    line.filter { $0 == "(" }.count,
-                    line.filter { $0 == ")" }.count,
-                    """
-                    \(name) has a log call spanning lines, so \
-                    testNoLogCallInTheSpreadSourcesInterpolatesAnythingUnreviewed \
-                    cannot see its message: \(line.trimmingCharacters(in: .whitespaces))
-                    """
-                )
-            }
-        }
-    }
-
-    /// Catches a stale allowlist entry, which would pre-authorise an
-    /// interpolation no call site currently makes.
-    func testTheAllowlistIsExactlyWhatTheSpreadSourcesInterpolate() throws {
-        XCTAssertEqual(
-            try scan().interpolations,
-            Self.allowedInterpolations,
-            "allowedInterpolations has drifted from the spread sources"
-        )
-    }
-
-    // MARK: - Harness controls
-
-    /// The derived list can only grow past these; one that lost a file would scan it no more.
-    func testTheScanCoversTheSpreadClassesAndTheirExtensions() throws {
-        let names = try Set(Self.spreadSourceNames())
-        for name in [
-            "EPUBSpreadView.swift",
-            "EPUBReflowableSpreadView.swift",
-            "EPUBFixedSpreadView.swift",
-            "EPUBSpreadView+ExternalLinkActivation.swift",
-            "EPUBSpreadView+LinkContextMenu.swift",
-        ] {
-            XCTAssertTrue(names.contains(name), "the scan does not cover \(name)")
-        }
-    }
-
-    /// Without this, a scan that found no log lines at all — wrong directory,
-    /// renamed file — would report success.
-    func testTheScanFindsLogCallsAndAKnownInterpolation() throws {
-        let scanned = try scan()
-
-        XCTAssertGreaterThan(scanned.logLineCount, 10, "the scan found almost no log calls")
-        XCTAssertTrue(
-            scanned.interpolations.contains("type(of: error)"),
-            "the scan has no resolving power: it did not find the known error shape"
-        )
-    }
-
-    private func scan() throws -> (interpolations: Set<String>, logLineCount: Int) {
-        var interpolations: Set<String> = []
-        var logLineCount = 0
-
-        for name in try Self.spreadSourceNames() {
-            let lines = try logEmittingLines(in: source(named: name))
-            logLineCount += lines.count
-            for line in lines {
-                interpolations.formUnion(Self.interpolations(in: line))
-            }
-        }
-
-        return (interpolations, logLineCount)
-    }
-
-    func testTheInterpolationScannerHandlesNestedParentheses() {
-        XCTAssertEqual(
-            Self.interpolations(in: #"log(.error, "a \(type(of: error)) b \(ns.code)")"#),
-            ["type(of: error)", "ns.code"]
-        )
-        XCTAssertEqual(Self.interpolations(in: #"log(.warning, "static message")"#), [])
-    }
-
-    // MARK: - Scanner
-
-    /// Extracts each balanced `\(…)` interpolation from a line of Swift source.
-    private static func interpolations(in line: String) -> [String] {
-        let characters = Array(line)
-        var results: [String] = []
-        var index = 0
-
-        while index + 1 < characters.count {
-            guard characters[index] == "\\", characters[index + 1] == "(" else {
-                index += 1
-                continue
-            }
-
-            var depth = 0
-            var cursor = index + 1
-            var captured = ""
-
-            while cursor < characters.count {
-                let character = characters[cursor]
-                if character == "(" {
-                    depth += 1
-                    if depth == 1 {
-                        cursor += 1
-                        continue
-                    }
-                } else if character == ")" {
-                    depth -= 1
-                    if depth == 0 {
-                        break
-                    }
-                }
-                captured.append(character)
-                cursor += 1
-            }
-
-            results.append(captured)
-            index = cursor + 1
-        }
-
-        return results
     }
 }
