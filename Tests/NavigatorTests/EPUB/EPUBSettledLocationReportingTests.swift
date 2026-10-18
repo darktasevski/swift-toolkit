@@ -633,6 +633,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             (.rightToLeftScroll, 0.4, [0, 1280]),
             (.verticalWritingScroll, 0.5, [-900, 0]),
             (.verticalLeftToRightWritingScroll, 0.5, [900, 0]),
+            (.verticalLeftToRightWritingRightToLeftDirectionScroll, 0.5, [900, 0]),
             (.leftToRightPages, 1, [1200, 0]),
         ]
         for testCase in cases {
@@ -1099,6 +1100,16 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// right-to-left one.
     func test_progressionReadMeasuresLeftToRightVerticalWritingHorizontally() async throws {
         let page = try await openProgressionPage(.verticalLeftToRightWritingScroll)
+        try await page.acceptCapability(ProgressionPage.capability)
+        try await page.scroll(x: 600, y: 0)
+
+        try await assertSample(page.read(ProgressionPage.capability), first: 1.0 / 3, last: 2.0 / 3)
+    }
+
+    /// A right-to-left `direction` turns only the inline axis, which vertical
+    /// writing lays out vertically, so vertical-lr still advances right from 0.
+    func test_progressionReadMeasuresRightToLeftDirectionInLeftToRightVerticalWritingWithoutNegating() async throws {
+        let page = try await openProgressionPage(.verticalLeftToRightWritingRightToLeftDirectionScroll)
         try await page.acceptCapability(ProgressionPage.capability)
         try await page.scroll(x: 600, y: 0)
 
@@ -2137,6 +2148,7 @@ private enum ProgressionDocument {
     case rightToLeftScroll
     case verticalWritingScroll
     case verticalLeftToRightWritingScroll
+    case verticalLeftToRightWritingRightToLeftDirectionScroll
     case oddTwoColumnSpread
     /// Left-to-right pages with a direct child frame loading the sibling
     /// `child.xhtml`, 300 wide and fixed over the first page. Only a served page
@@ -2166,6 +2178,12 @@ private enum ProgressionDocument {
         case .verticalLeftToRightWritingScroll:
             Self.page(
                 rootAttributes: #"style="writing-mode: vertical-lr; --USER__view: readium-scroll-on""#,
+                width: 1800,
+                height: 800
+            )
+        case .verticalLeftToRightWritingRightToLeftDirectionScroll:
+            Self.page(
+                rootAttributes: #"dir="rtl" style="writing-mode: vertical-lr; --USER__view: readium-scroll-on""#,
                 width: 1800,
                 height: 800
             )

@@ -4,7 +4,13 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getClientRectsNoOverlap } from "./rect";
-import { measureProgression, progressionScrollTarget } from "./progression";
+import {
+  isRTL,
+  isScrollModeEnabled,
+  isVerticalWritingMode,
+  measureProgression,
+  progressionScrollTarget,
+} from "./progression";
 
 const LIMITS = Object.freeze({
   payloadBytes: 64 * 1024,
@@ -997,26 +1003,6 @@ function restoreDecorationGroup(groupID, state) {
   } else {
     decorationGroups.delete(groupID);
   }
-}
-
-function isScrollModeEnabled() {
-  return (
-    globalThis
-      .getComputedStyle(document.documentElement)
-      .getPropertyValue("--USER__view")
-      .trim() === "readium-scroll-on"
-  );
-}
-
-function isVerticalWritingMode() {
-  return globalThis
-    .getComputedStyle(document.documentElement)
-    .writingMode.startsWith("vertical");
-}
-
-function isRTL() {
-  const style = globalThis.getComputedStyle(document.documentElement);
-  return style.direction === "rtl" || style.writingMode === "vertical-rl";
 }
 
 function snapOffset(offset) {
