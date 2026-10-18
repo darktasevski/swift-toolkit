@@ -237,6 +237,34 @@ final class EPUBLocationObservation {
         self.onAccepted = onAccepted
     }
 
+    // MARK: - Spread events
+
+    /// The spread's readiness became `state`: a new load starts over, ready
+    /// asks for a measurement, and anything else revokes the accepted sample.
+    func readinessDidChange(to state: EPUBSpreadReadiness.State) {
+        switch state {
+        case .loading:
+            reset()
+        case .ready:
+            invalidate()
+            request()
+        case .unavailable, .initializing, .failed:
+            invalidate()
+        }
+    }
+
+    /// The bridge's location transport reported `event`.
+    func transportDidReport(_ event: EPUBLocationTransportEvent) {
+        switch event {
+        case let .handshakeFailed(capability):
+            handshakeDidFail(for: capability)
+        case .lateCompletion:
+            grant(.lateCompletion)
+        case .slotAvailable:
+            slotAvailable()
+        }
+    }
+
     // MARK: - Signals
 
     /// An authoritative change of what the document shows. Keeps the

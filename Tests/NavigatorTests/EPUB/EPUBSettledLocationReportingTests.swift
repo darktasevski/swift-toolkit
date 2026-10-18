@@ -3216,9 +3216,9 @@ private struct HeldProgressionPage {
 }
 
 /// A real observation reading a held page through its real bridge. The bridge's
-/// registrations and transport events reach it as `EPUBReflowableSpreadView`
-/// routes them (§ `frameDidRegister`, `locationTransportDidReport`); the test
-/// stands in for the spread's readiness, through `open(_:)` and `clear()`.
+/// registrations, transport events and the readiness the test stands in for
+/// (`open(_:)`, `clear()`) reach it through the observation's own spread-event
+/// entry points, as `EPUBReflowableSpreadView` routes them.
 @MainActor
 private final class ObservedHeldPage {
     let held: HeldProgressionPage
@@ -3262,35 +3262,27 @@ private final class ObservedHeldPage {
         let reported = bridge.onLocationTransportEvent
         bridge.onLocationTransportEvent = { [weak self] event in
             reported?(event)
-            guard let observation = self?.builtObservation else {
-                return
-            }
-            switch event {
-            case let .handshakeFailed(capability):
-                observation.handshakeDidFail(for: capability)
-            case .lateCompletion:
-                observation.grant(.lateCompletion)
-            case .slotAvailable:
-                observation.slotAvailable()
-            }
+            self?.builtObservation.transportDidReport(event)
         }
     }
+
+    private var generation: EPUBSpreadReadiness.Generation = 0
 
     /// A new document holding `capability` loads, hands it off and becomes
     /// ready, as the spread's readiness reports each step.
     func open(_ capability: EPUBSpreadFrameCapability) {
-        observation.reset()
+        generation += 1
+        observation.readinessDidChange(to: .loading(generation: generation))
         held.page.bridge.beginDocument()
         held.page.bridge.setFrameCapability(capability)
         self.capability = capability
-        observation.invalidate()
-        observation.request()
+        observation.readinessDidChange(to: .ready(generation: generation, frameCapability: capability))
     }
 
     /// The spread is cleared, as `EPUBReflowableSpreadView.clear()` clears it.
     func clear() {
         capability = nil
-        observation.invalidate()
+        observation.readinessDidChange(to: .unavailable(generation: generation))
         held.page.bridge.revokeFrameCapability()
         observation.reset()
     }

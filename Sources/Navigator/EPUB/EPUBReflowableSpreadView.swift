@@ -1028,15 +1028,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func readinessDidChange(_ state: EPUBSpreadReadiness.State) {
-        switch state {
-        case .loading:
-            locationObservation.reset()
-        case .ready:
-            locationObservation.invalidate()
-            locationObservation.request()
-        case .unavailable, .initializing, .failed:
-            locationObservation.invalidate()
-        }
+        locationObservation.readinessDidChange(to: state)
     }
 
     override func frameDidRegister(_ capability: EPUBSpreadFrameCapability) {
@@ -1044,14 +1036,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     override func locationTransportDidReport(_ event: EPUBLocationTransportEvent) {
-        switch event {
-        case let .handshakeFailed(capability):
-            locationObservation.handshakeDidFail(for: capability)
-        case .lateCompletion:
-            locationObservation.grant(.lateCompletion)
-        case .slotAvailable:
-            locationObservation.slotAvailable()
-        }
+        locationObservation.transportDidReport(event)
     }
 
     /// The page posts this on scroll and after a resize. Its numbers are
