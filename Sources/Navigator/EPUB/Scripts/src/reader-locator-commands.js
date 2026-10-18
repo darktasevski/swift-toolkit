@@ -1580,8 +1580,8 @@ function isLateFrame(frameStatus, deadlineAt) {
 // viewport before any viewport-relative work runs. Returns "usable",
 // "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
 // never arrived), or "stale". `toleratesLateFrames` counts a late frame as a
-// frame, so only the deadline ends the wait, for a command whose miss fails
-// its document.
+// frame, for a command whose miss fails its document: a late frame does not
+// end the wait, only the deadline or the frame cap does.
 async function awaitUsableViewport(
   token,
   signal,
@@ -1868,10 +1868,10 @@ const PROGRESSION_LANDING_TOLERANCE = 1;
 // nothing would end a wait for one. The landing is the target the scroll was asked
 // for, not a stable offset, which a smooth scroll that has not started yet also
 // has. The target must lie within the scrollport: the web process reports an
-// overscrolled write's offset unclamped until the UI process clamps it. Only the
-// command's deadline ends its waits, for a usable viewport and for the landing,
-// as `paintTimeout`: a late frame does not, because a failed position command
-// fails its document.
+// overscrolled write's offset unclamped until the UI process clamps it. A late
+// frame ends neither of its waits, because a failed position command fails its
+// document: the deadline ends either as `paintTimeout`, and the viewport wait's
+// frame cap ends it as `viewportNotReady`.
 async function navigateProgression(command, token, signal, deadlineAt) {
   requireOnlyKeys(command, NAVIGATE_PROGRESSION_KEYS);
   if (

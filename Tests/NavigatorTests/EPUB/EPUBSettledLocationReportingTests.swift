@@ -769,6 +769,55 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         )
     }
 
+    /// An invalidated jump waiting for its viewport writes nothing, even when
+    /// the viewport gets its size in the same turn.
+    func test_anInvalidatedJumpWaitingForItsViewportWritesNothing() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, holdingCommandWorldFrames: true)
+        try await page.landCommandWorldSmoothScrolls(after: .zero)
+        try await page.emptyCommandWorldViewport()
+        try await page.holdCommandWorldFrames()
+
+        let jump = Task { try await page.executeProgressionJump(to: 0.5, budgetMilliseconds: 5000) }
+        try await waitUntil("the jump waits for its viewport") {
+            try await page.heldCommandWorldFrames() > 0
+        }
+        let invalidated = try await page.restoreViewportAndInvalidateTheJump()
+        let answer = try await jump.value
+
+        XCTAssertTrue(invalidated, "Setup: no jump was in flight to invalidate")
+        XCTAssertEqual(answer, ["cancelled", "staleToken"])
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 0, "The invalidated jump wrote its offset")
+        let offset = try await page.offset()
+        XCTAssertEqual(offset, [0, 0])
+    }
+
+    /// Locator navigation keeps ending its viewport wait at the first late
+    /// frame: its miss releases only its writer, so it need not wait out its
+    /// deadline as a jump does.
+    func test_aLateFrameEndsALocatorNavigationWaitingForItsViewport() async throws {
+        let page = try await openProgressionPage(.leftToRightPages, holdingCommandWorldFrames: true)
+        try await page.landCommandWorldSmoothScrolls(after: .zero)
+        try await page.emptyCommandWorldViewport()
+        // The navigation's frame before its scroll arrives; its viewport wait's do not.
+        try await page.holdCommandWorldFrames(afterDelivering: 1)
+        let budgetMilliseconds = 3000
+        let clock = ContinuousClock()
+        let started = clock.now
+
+        let answer = try await page.executeLocatorNavigation(budgetMilliseconds: budgetMilliseconds)
+
+        let elapsed = started.duration(to: clock.now)
+        let framesLeft = try await page.framesLeftBeforeHolding()
+        XCTAssertEqual(framesLeft, 0, "Setup: the navigation's frame before its scroll was not delivered")
+        let held = try await page.heldCommandWorldFrames()
+        XCTAssertGreaterThan(held, 0, "Setup: no frame of the navigation's viewport wait was held")
+        let writes = try await page.commandWorldScrollWrites()
+        XCTAssertEqual(writes, 0, "Setup: the navigation scrolled before its viewport wait ended")
+        XCTAssertEqual(answer, ["miss", "paintTimeout"])
+        XCTAssertLessThan(elapsed, .milliseconds(budgetMilliseconds / 2), "The navigation waited out its deadline")
+    }
+
     /// A jump misses as unverifiable when the geometry stops supporting one,
     /// before it writes or while it waits to land.
     func test_aJumpWhoseGeometryCannotBeMeasuredMisses() async throws {
@@ -1912,8 +1961,11 @@ private final class ProgressionPage {
     private static let frameHoldingScript = """
     globalThis.__deliverFrame = globalThis.requestAnimationFrame.bind(globalThis);
     globalThis.__heldFrames = null;
+    globalThis.__framesBeforeHolding = 0;
     globalThis.requestAnimationFrame = (callback) => {
-        if (globalThis.__heldFrames) {
+        if (globalThis.__heldFrames && globalThis.__framesBeforeHolding > 0) {
+            globalThis.__framesBeforeHolding -= 1;
+        } else if (globalThis.__heldFrames) {
             globalThis.__heldFrames.push(callback);
             return 0;
         }
@@ -2279,10 +2331,76 @@ private final class ProgressionPage {
         )
     }
 
-    /// Holds every animation frame the command world asks for from now on.
-    /// Needs a page opened `holdingCommandWorldFrames`.
-    func holdCommandWorldFrames() async throws {
-        try await runInCommandWorld("globalThis.__heldFrames = [];")
+    /// Holds every animation frame the command world asks for from now on,
+    /// after delivering the first `deliveredFrames`. Needs a page opened
+    /// `holdingCommandWorldFrames`.
+    func holdCommandWorldFrames(afterDelivering deliveredFrames: Int = 0) async throws {
+        try await runInCommandWorld(
+            "globalThis.__framesBeforeHolding = deliveredFrames; globalThis.__heldFrames = [];",
+            arguments: ["deliveredFrames": deliveredFrames]
+        )
+    }
+
+    /// How many of the frames `holdCommandWorldFrames(afterDelivering:)` was
+    /// to deliver have not been asked for yet.
+    func framesLeftBeforeHolding() async throws -> Int {
+        let value = try await webView.callAsyncJavaScript(
+            "return globalThis.__framesBeforeHolding;",
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? Int, "Setup: the frames left before holding were not counted")
+    }
+
+    /// Gives the document its viewport size back and invalidates the jump
+    /// `executeProgressionJump(to:budgetMilliseconds:)` started, in one turn.
+    /// Answers whether a command in flight was invalidated.
+    func restoreViewportAndInvalidateTheJump() async throws -> Bool {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            delete document.documentElement.clientWidth;
+            return readerLocatorCommands.invalidate({
+                webViewInstanceID: "settled-location-test",
+                documentEpoch: 0,
+                operationKind: "navigation",
+                sequence: 1,
+                budgetMilliseconds: 0,
+            }).invalidated;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? Bool, "Setup: the invalidation's answer was unreadable")
+    }
+
+    /// Runs an instant navigation to the document's only element straight
+    /// through the command world with `budgetMilliseconds` to spend, and
+    /// answers its `[outcome, reasonCode]`.
+    func executeLocatorNavigation(budgetMilliseconds: Int) async throws -> [String] {
+        let value = try await webView.callAsyncJavaScript(
+            """
+            const result = await readerLocatorCommands.execute(
+                { kind: "navigateLocator", payload: locator, animated: false },
+                {
+                    webViewInstanceID: "settled-location-test",
+                    documentEpoch: 0,
+                    operationKind: "navigation",
+                    sequence: 1,
+                    budgetMilliseconds,
+                }
+            );
+            return [result.outcome, result.reasonCode];
+            """,
+            arguments: [
+                "locator": #"{"href":"chapter.xhtml","locations":{"cssSelector":"body > div"}}"#,
+                "budgetMilliseconds": budgetMilliseconds,
+            ],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
+        return try XCTUnwrap(value as? [String], "Setup: the navigation's answer was unreadable")
     }
 
     /// How many animation frames the command world has been held from.
