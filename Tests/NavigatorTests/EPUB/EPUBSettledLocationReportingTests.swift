@@ -1027,6 +1027,16 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
     }
 
+    /// Polls `condition` for up to two seconds without failing: the caller
+    /// asserts what it finds.
+    private func pollBriefly(until condition: () -> Bool) async throws {
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: .seconds(2))
+        while !condition(), clock.now < deadline {
+            try await clock.sleep(for: .milliseconds(20))
+        }
+    }
+
     /// Polls `condition` until it holds, failing with `description` otherwise.
     private func waitUntil(_ description: String, _ condition: () async throws -> Bool) async throws {
         let clock = ContinuousClock()
@@ -1457,6 +1467,107 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: 0 ... (1.0 / 3))))
     }
 
+    // MARK: - Observation over the bridge
+
+    /// A read answered after an authoritative change describes what was shown
+    /// before it: it is read again, not accepted. One answered after the
+    /// spread was cleared reaches nothing.
+    func test_aReadAnsweredAfterTheSpreadChangedIsNeverAccepted() async throws {
+        let observed = try await openObservedHeldPage()
+        let scripts = observed.held.scripts
+        let observation = observed.observation
+        XCTAssertTrue(observation.isReading, "Setup: the registration started no read")
+        XCTAssertEqual(scripts.count, 2, "Setup: expected the hand-off and one read")
+
+        observation.invalidate()
+        observed.complete(1, with: .success(observed.answer(0.5 ... 1)))
+        XCTAssertEqual(observed.accepted, [], "A read answered after the change was accepted")
+        XCTAssertEqual(scripts.count, 3, "The change's obligation was not read again")
+        observed.complete(2, with: .success(observed.answer(0 ... 0.5)))
+        XCTAssertEqual(observed.accepted.map(\.sample.range), [0 ... 0.5])
+
+        observation.request()
+        XCTAssertEqual(scripts.count, 4, "Setup: the request started no read")
+        let answerBeforeTheClear = observed.answer(0.5 ... 1)
+        observed.clear()
+        observed.complete(3, with: .success(answerBeforeTheClear))
+
+        XCTAssertEqual(observed.accepted.map(\.sample.range), [0 ... 0.5], "A read answered after the clear was accepted")
+        XCTAssertFalse(observation.isReading || observation.hasObligation, "The clear left work behind")
+    }
+
+    /// A read the page never answers expires for the observation, but its
+    /// physical call keeps the transport: hints arm nothing, a new document's
+    /// hand-off waits for the late answer, and no second call starts beside
+    /// it. The late answer frees the slot for that hand-off, and the new
+    /// document then reports.
+    func test_anExpiredReadKeepsItsCallThroughHintsAndADocumentChange() async throws {
+        let observed = try await openObservedHeldPage()
+        let held = observed.held
+        let observation = observed.observation
+        XCTAssertTrue(observation.isReading, "Setup: the registration started no read")
+        XCTAssertEqual(held.scripts.count, 2, "Setup: expected the hand-off and one read")
+
+        held.deadlines.advance(by: EPUBLocationObservation.readBudget)
+        XCTAssertEqual(observation.unavailability, .operationPending)
+        for _ in 0 ..< 100 {
+            observation.hint()
+        }
+        XCTAssertEqual(held.deadlines.armedCount, 0, "A hint armed a timer while the read was pending")
+        held.deadlines.advance(by: EPUBLocationObservation.recoveryCeiling)
+        let next = EPUBSpreadFrameCapability()
+        observed.open(next)
+
+        XCTAssertEqual(held.scripts.count, 2, "A second physical call started beside the expired read")
+        XCTAssertFalse(observation.isReading)
+        XCTAssertTrue(observation.hasObligation, "The new document's obligation was dropped")
+
+        observed.complete(1, with: .success(NSNull()))
+        XCTAssertEqual(held.scripts.injectedCapabilities.last, next, "The late answer did not free the slot for the hand-off")
+        observed.complete(2, with: .success(NSNull()))
+        try await held.page.echo(next)
+        XCTAssertEqual(held.scripts.count, 4, "The new document's registration started no read")
+        observed.complete(3, with: .success(observed.answer(0 ... 0.5)))
+        XCTAssertEqual(observed.accepted.map(\.sample), [EPUBProgressionSample(capability: next, range: 0 ... 0.5)])
+    }
+
+    /// A hand-off whose injection fails is re-issued once; a registration
+    /// that then arrives after the re-issue's deadline still ends it, and a
+    /// repeated echo of the same capability leaves one selectable frame, so
+    /// each registration's read reports.
+    func test_aFailedHandshakeRecoversOnceAndARepeatedEchoKeepsOneFrame() async throws {
+        let observed = try await makeObservedHeldPage()
+        let held = observed.held
+        let observation = observed.observation
+        let capability = EPUBSpreadFrameCapability()
+        observed.open(capability)
+        observed.complete(0, with: .failure(URLError(.cannotConnectToHost)))
+
+        held.deadlines.advance(by: EPUBLocationObservation.retryGap)
+        XCTAssertEqual(held.scripts.injectedCapabilities, [capability, capability], "The failed hand-off was not re-issued once")
+        observed.complete(1, with: .success(NSNull()))
+        held.deadlines.advance(by: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds))
+        XCTAssertTrue(observation.isRegistrationMissing, "Setup: the re-issue did not miss its registration")
+        held.deadlines.advance(by: EPUBLocationObservation.recoveryCeiling)
+        XCTAssertEqual(held.scripts.count, 2, "The hand-off was re-issued past its one retry")
+
+        try await held.page.echo(capability)
+        XCTAssertEqual(held.scripts.count, 3, "The late registration started no read")
+        observed.complete(2, with: .success(observed.answer(0 ... 0.5)))
+        try await held.page.runInCommandWorld(
+            "readerLocatorCommands.acceptFrameCapability(capability);",
+            arguments: ["capability": capability.id.uuidString]
+        )
+        try await pollBriefly { held.page.registrations.count == 2 }
+        XCTAssertEqual(held.page.registrations, [capability, capability], "The repeated echo left no selectable frame")
+        XCTAssertEqual(held.scripts.count, 4, "The repeated echo started no read")
+        observed.complete(3, with: .success(observed.answer(0 ... 0.5)))
+
+        let sample = EPUBProgressionSample(capability: capability, range: 0 ... 0.5)
+        XCTAssertEqual(observed.accepted.map(\.sample), [sample, sample])
+        XCTAssertEqual(Set(observed.accepted.map(\.stamp)).count, 1, "An equal sample advanced the stamp")
+    }
+
     // MARK: - Settlement signals in a real reader
 
     /// Any page script can post `progressionChanged`, with any numbers. They
@@ -1753,6 +1864,30 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
         try await page.load(servedFrom: baseURL)
         return page
+    }
+
+    /// A held page with an observation over its bridge and no document open.
+    private func makeObservedHeldPage() async throws -> ObservedHeldPage {
+        let scripts = HeldScripts()
+        let deadlines = ManualDeadlines()
+        let page = try await openProgressionPage(
+            .leftToRightPages,
+            invokeLocationScript: scripts.invocation,
+            deadlineScheduler: deadlines.scheduler
+        )
+        return try ObservedHeldPage(HeldProgressionPage(page: page, scripts: scripts, deadlines: deadlines))
+    }
+
+    /// An observed held page whose document is ready and registered: the
+    /// hand-off was location call 0, and the registration's read is call 1,
+    /// still held.
+    private func openObservedHeldPage() async throws -> ObservedHeldPage {
+        let observed = try await makeObservedHeldPage()
+        let capability = EPUBSpreadFrameCapability()
+        observed.open(capability)
+        observed.held.scripts.complete(0, with: .success(NSNull()))
+        try await observed.held.page.echo(capability)
+        return observed
     }
 
     /// A page whose location calls and deadlines the test controls, registered
@@ -2913,6 +3048,106 @@ private struct HeldProgressionPage {
             until: deadline ?? EPUBLocatorOperationDeadline(startingAt: deadlines.now, budget: Self.budget),
             reportingTo: outcomes
         )
+    }
+}
+
+/// A real observation reading a held page through its real bridge. The bridge's
+/// registrations and transport events reach it as `EPUBReflowableSpreadView`
+/// routes them (§ `frameDidRegister`, `locationTransportDidReport`); the test
+/// stands in for the spread's readiness, through `open(_:)` and `clear()`.
+@MainActor
+private final class ObservedHeldPage {
+    let held: HeldProgressionPage
+    private(set) var accepted: [EPUBAcceptedObservation] = []
+    /// The capability of the ready document, under which reads are eligible.
+    private var capability: EPUBSpreadFrameCapability?
+    /// Built once `self` exists, so its closures can reach it.
+    private var builtObservation: EPUBLocationObservation!
+
+    var observation: EPUBLocationObservation {
+        builtObservation
+    }
+
+    init(_ held: HeldProgressionPage) throws {
+        self.held = held
+        let bridge = held.page.bridge
+        let target = try XCTUnwrap(AnyURL(string: "chapter.xhtml"))
+        builtObservation = EPUBLocationObservation(
+            scheduler: held.deadlines.scheduler,
+            eligibility: { [weak self] in
+                self?.capability.map { .eligible($0) } ?? .unsettled
+            },
+            documentCapability: { [weak self] in
+                self?.capability
+            },
+            read: { deadline, completion in
+                bridge.readProgression(targetHREF: target, deadline: deadline, completion: completion)
+            },
+            reissueHandshake: { capability in
+                bridge.setFrameCapability(capability)
+            },
+            onAccepted: { [weak self] accepted in
+                self?.accepted.append(accepted)
+            }
+        )
+        let registered = bridge.onFrameRegistered
+        bridge.onFrameRegistered = { [weak self] capability in
+            registered?(capability)
+            self?.builtObservation.grant(.registration)
+        }
+        let reported = bridge.onLocationTransportEvent
+        bridge.onLocationTransportEvent = { [weak self] event in
+            reported?(event)
+            guard let observation = self?.builtObservation else {
+                return
+            }
+            switch event {
+            case let .handshakeFailed(capability, _):
+                observation.handshakeDidFail(for: capability)
+            case .lateCompletion:
+                observation.grant(.lateCompletion)
+            case .slotAvailable:
+                observation.slotAvailable()
+            }
+        }
+    }
+
+    /// A new document holding `capability` loads, hands it off and becomes
+    /// ready, as the spread's readiness reports each step.
+    func open(_ capability: EPUBSpreadFrameCapability) {
+        observation.reset()
+        held.page.bridge.beginDocument()
+        held.page.bridge.setFrameCapability(capability)
+        self.capability = capability
+        observation.invalidate()
+        observation.request()
+    }
+
+    /// The spread is cleared, as `EPUBReflowableSpreadView.clear()` clears it.
+    func clear() {
+        capability = nil
+        observation.invalidate()
+        held.page.bridge.revokeFrameCapability()
+        observation.reset()
+    }
+
+    /// Answers location call `index`, failing rather than trapping when no
+    /// such call was made.
+    func complete(
+        _ index: Int,
+        with result: Result<Any, any Error>,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) {
+        guard index < held.scripts.count else {
+            return XCTFail("Location call \(index) was never made", file: file, line: line)
+        }
+        held.scripts.complete(index, with: result)
+    }
+
+    /// What the page answers a read of the ready document with.
+    func answer(_ range: ClosedRange<Double>) -> [String: Any] {
+        ["capability": capability?.id.uuidString ?? "", "first": range.lowerBound, "last": range.upperBound]
     }
 }
 
