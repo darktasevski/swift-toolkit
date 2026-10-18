@@ -55,10 +55,10 @@ enum EPUBPageWorldLog: Loggable {
         case anchorTrackingReinjectionFailed = "anchor_tracking_reinjection_failed"
         case fixedViewportFailed = "fixed_viewport_failed"
         case fixedLayoutStabilityFailed = "fixed_layout_stability_failed"
-        case publicationCSSLoadFailed = "publication_c_s_s_load_failed"
+        case publicationCSSLoadFailed = "publication_css_load_failed"
         case anchorTrackingInitializationFailed = "anchor_tracking_initialization_failed"
         case reflowableLayoutStabilityFailed = "reflowable_layout_stability_failed"
-        case javaScriptEvaluationFailed = "java_script_evaluation_failed"
+        case javaScriptEvaluationFailed = "js_evaluation_failed"
         case webNavigationFailed = "web_navigation_failed"
         case provisionalWebNavigationFailed = "provisional_web_navigation_failed"
 
