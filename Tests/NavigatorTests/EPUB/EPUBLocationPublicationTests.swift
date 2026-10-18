@@ -151,7 +151,7 @@ final class EPUBLocationPublicationTests: XCTestCase {
         fixture.publication.setIdle(true)
         a.release()
 
-        try await fixture.waitUntil { b.started }
+        try await fixture.waitUntil { !fixture.committed.isEmpty || fixture.dispatched.last == "b" }
         XCTAssertEqual(fixture.committed, [], "A calculation outlived by a navigation committed")
         b.release()
         try await fixture.waitUntil { fixture.committed == ["b"] }
@@ -170,7 +170,7 @@ final class EPUBLocationPublicationTests: XCTestCase {
         let b = fixture.offer("b")
         a.release()
 
-        try await fixture.waitUntil { b.started }
+        try await fixture.waitUntil { !fixture.committed.isEmpty || fixture.dispatched.last == "b" }
         XCTAssertEqual(fixture.committed, [], "A result that was no longer current committed")
         b.release()
         try await fixture.waitUntil { fixture.committed == ["b"] }
