@@ -71,6 +71,30 @@ final class EPUBLocationObservationTests: XCTestCase {
         XCTAssertEqual(fixture.accepted.map(\.sample.range), [0.25 ... 0.5])
     }
 
+    /// Motion the spread cannot see, such as a page script scrolling itself,
+    /// keeps every answer stale. The first stale answer is read again at once
+    /// and each one after it at the end of a hint window, so such motion reads
+    /// at most twice per window.
+    func test_consecutiveStaleAnswersReadAgainAtOnceOnlyOncePerWindow() {
+        let fixture = ObservationFixture()
+        fixture.observation.request()
+
+        fixture.observation.invalidate()
+        fixture.answer(0, fixture.sample(0 ... 0.25))
+        XCTAssertEqual(fixture.startedReads, 2, "The first stale answer was not read again at once")
+        fixture.observation.invalidate()
+        fixture.answer(1, fixture.sample(0.25 ... 0.5))
+        XCTAssertEqual(fixture.startedReads, 2, "A second stale answer was read again at once")
+
+        fixture.deadlines.advance(by: EPUBLocationObservation.hintWindow)
+        XCTAssertEqual(fixture.startedReads, 3, "The window did not read the retained obligation")
+        fixture.observation.invalidate()
+        fixture.answer(2, fixture.sample(0.5 ... 0.75))
+        XCTAssertEqual(fixture.startedReads, 4, "The window did not restore the immediate re-read")
+        fixture.answer(3, fixture.sample(0.5 ... 0.75))
+        XCTAssertEqual(fixture.accepted.map(\.sample.range), [0.5 ... 0.75])
+    }
+
     func test_aSampleAnsweredWhileTheSpreadIsNoLongerEligibleIsNotAccepted() {
         let fixture = ObservationFixture()
         fixture.observation.request()

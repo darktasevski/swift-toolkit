@@ -198,6 +198,10 @@ final class EPUBLocationObservation {
     private var handshakeRetryDeadline: EPUBScheduledDeadline?
     private var lastStamp: UInt64 = 0
     private var latestAccepted: EPUBAcceptedObservation?
+    /// Stale answers since the last accepted sample or hint window. Motion the
+    /// spread cannot see, such as a page script's own scrolling, makes every
+    /// answer stale: only the first is read again at once.
+    private var consecutiveStaleAnswers = 0
 
     /// Whether a read this observation started is still awaiting its answer.
     var isReading: Bool {
@@ -316,6 +320,7 @@ final class EPUBLocationObservation {
         cancelReadTimers()
         endHandshakeRecovery()
         cycle = RecoveryCycle()
+        consecutiveStaleAnswers = 0
         unavailability = nil
         currentObservation = nil
         latestAccepted = nil
@@ -335,6 +340,7 @@ final class EPUBLocationObservation {
         hintWindowDeadline = scheduler.schedule(scheduler.now() + Self.hintWindow) { [weak self] in
             guard let self else { return }
             hintWindowDeadline = nil
+            consecutiveStaleAnswers = 0
             hasObligation = true
             attemptDispatch(waitingOutNativeMotion: false)
         }
@@ -439,10 +445,19 @@ final class EPUBLocationObservation {
     /// Authority changed under the read, the bridge cancelled it, or the spread
     /// stopped being eligible: its answer says nothing about what is shown now.
     /// That is not a failure: the cycle restarts and the obligation is tried
-    /// again when eligible.
+    /// again when eligible, at once for the first stale answer and at the end
+    /// of a hint window for each one after it, so motion that keeps every
+    /// answer stale reads at most twice per window.
     private func restartAfterStaleRead() {
         hasObligation = true
         cycle = RecoveryCycle()
+        consecutiveStaleAnswers += 1
+        guard consecutiveStaleAnswers == 1 else {
+            if hintWindowDeadline == nil {
+                armHintWindow()
+            }
+            return
+        }
         attemptDispatch(waitingOutNativeMotion: false)
     }
 
@@ -472,6 +487,7 @@ final class EPUBLocationObservation {
         latestAccepted = accepted
         currentObservation = accepted
         cycle = RecoveryCycle()
+        consecutiveStaleAnswers = 0
         onAccepted(accepted)
         attemptDispatch(waitingOutNativeMotion: false)
     }
