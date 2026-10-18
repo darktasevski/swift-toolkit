@@ -383,6 +383,42 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
     }
 
+    // MARK: - Writers
+
+    /// A writer that joins a turn's generation and outlives the turn's writer
+    /// keeps the turned page unread and unreported until it releases; then
+    /// the turned page, measured after the release, is all that is reported.
+    func test_aWriterHeldPastATurnDefersTheReportToTheLastRelease() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        let opening = try XCTUnwrap(reader.spy.locations.last)
+        let openingProgression = try XCTUnwrap(opening.locations.progression)
+        let before = try await reader.requireGeometry()
+        let transport = TransportEventTap(spread.locatorCommandBridge)
+        let joining = ExtraWriter(joiningTheNextGenerationOf: spread.readiness)
+        let early = reader.spy.expectNoLocation("a report before the last writer released") { _ in true }
+
+        let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
+
+        XCTAssertTrue(moved)
+        let extra = try XCTUnwrap(joining.lease, "Setup: no writer joined the turn's generation while its writer was held")
+        _ = try await reader.waitForOffset(differentFrom: before)
+        await fulfillment(of: [early], timeout: Self.quietWindow)
+        XCTAssertEqual(transport.events, [], "The turned page was read while a writer was held")
+
+        let report = reader.spy.expectLocation("report of the turned page") {
+            $0.href.isEquivalentTo(opening.href) && ($0.locations.progression ?? openingProgression) > openingProgression
+        }
+        spread.readiness.release(extra)
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        _ = try XCTUnwrap(reader.spy.matchedLocation, "No report of the turned page arrived")
+        let atMatch = try await reader.requireGeometry()
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        let settled = try await reader.requireGeometry()
+        assertSettledReports(reader.spy.locationsSinceArming, isIn: opening.href, matchedAt: atMatch, settled: settled)
+    }
+
     // MARK: - Publication currency
 
     /// A calculation still waiting on the table of contents when the page
@@ -1363,11 +1399,29 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// Any page script can post `progressionChanged`, with any numbers. They
     /// are never reported: the message only asks the spread to measure.
     func test_aPageWorldProgressionMessageIsMeasuredNotTrusted() async throws {
+        try await assertAPageWorldProgressionMessageIsMeasuredNotTrusted(holdingASample: false)
+    }
+
+    /// The same holds while the spread holds a sample it could publish at
+    /// once, before the message's own measurement replaces it.
+    func test_aPageWorldProgressionMessageBesideAPublishableSampleIsNotReported() async throws {
+        try await assertAPageWorldProgressionMessageIsMeasuredNotTrusted(holdingASample: true)
+    }
+
+    private func assertAPageWorldProgressionMessageIsMeasuredNotTrusted(
+        holdingASample: Bool,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
         let reader = try await openReader()
-        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView, file: file, line: line)
+        let observation = try XCTUnwrap(spread.builtLocationObservation, file: file, line: line)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let settled = try await reader.requireGeometry()
-        observation.invalidate()
+        if !holdingASample {
+            observation.invalidate()
+        }
+        let transport = TransportEventTap(spread.locatorCommandBridge)
         let forged = reader.spy.expectNoLocation("report of the page world's numbers") {
             ($0.locations.progression ?? 0) > 0.5
         }
@@ -1376,13 +1430,23 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             "webkit.messageHandlers.\(progressionMessageName).postMessage({first: 0.9, last: 0.95}); true"
         )
 
+        try await reader.waitFor("the measurement the message asked for") {
+            transport.events.contains(.slotAvailable)
+        }
         await fulfillment(of: [forged], timeout: Self.quietWindow)
-        try await reader.waitFor("the measurement the message asked for") { observation.currentObservation != nil }
+        let published = try XCTUnwrap(
+            spread.publicationInput()?.progressions[spread.spread.first.index],
+            "The spread has nothing to publish after its measurement",
+            file: file,
+            line: line
+        )
         XCTAssertEqual(
-            spread.progression(in: spread.spread.first.index).lowerBound,
+            published.lowerBound,
             settled.firstProgression,
             accuracy: 0.000_001,
-            "The spread reported the page world's numbers"
+            "The spread would publish the page world's numbers",
+            file: file,
+            line: line
         )
     }
 
@@ -2777,6 +2841,51 @@ private final class LoadObserver: NSObject, WKNavigationDelegate {
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         if let navigation {
             finished.append(ObjectIdentifier(navigation))
+        }
+    }
+}
+
+/// Records the location transport events a spread's bridge reports from now
+/// on, still passing each to the spread. A read reports `.slotAvailable` when
+/// it ends.
+@MainActor
+private final class TransportEventTap {
+    private(set) var events: [EPUBLocationTransportEvent] = []
+
+    init(_ bridge: EPUBLocatorCommandBridge) {
+        let forward = bridge.onLocationTransportEvent
+        bridge.onLocationTransportEvent = { [weak self] event in
+            self?.events.append(event)
+            forward?(event)
+        }
+    }
+}
+
+/// Joins the first initialization generation a spread's readiness enters from
+/// now on as an extra writer. It joins on the main actor's next turn, which
+/// comes at that generation's writer's first suspension: a readiness consumer
+/// must not mutate readiness from its state callback.
+@MainActor
+private final class ExtraWriter {
+    private(set) var lease: EPUBSpreadReadiness.WriterLease?
+    private var hasJoined = false
+
+    init(joiningTheNextGenerationOf readiness: EPUBSpreadReadiness) {
+        let forward = readiness.onStateChange
+        readiness.onStateChange = { [weak self, weak readiness] state in
+            forward?(state)
+            guard
+                let self,
+                let readiness,
+                !hasJoined,
+                case let .initializing(generation, _) = state
+            else {
+                return
+            }
+            hasJoined = true
+            Task { @MainActor in
+                self.lease = readiness.acquireWriterLease(for: generation)
+            }
         }
     }
 }
