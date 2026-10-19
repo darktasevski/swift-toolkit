@@ -1763,6 +1763,21 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         try await reader.waitFor("a fresh measurement") { observation.currentObservation != nil }
     }
 
+    /// The spread hears its scene's activation through the notification
+    /// center it registered with, not only through a direct call.
+    func test_theOwningScenesActivationNotificationMeasuresAgain() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        let scene = try XCTUnwrap(reader.window.windowScene, "Setup: the reader's window has no scene")
+        observation.invalidate()
+
+        NotificationCenter.default.post(name: UIScene.didActivateNotification, object: scene)
+
+        XCTAssertTrue(observation.isReading || observation.hasObligation, "The posted activation reached nothing")
+        try await reader.waitFor("a fresh measurement") { observation.currentObservation != nil }
+    }
+
     // MARK: - Page-world scroll hint
 
     /// Scroll events within one frame coalesce into a single hint carrying the

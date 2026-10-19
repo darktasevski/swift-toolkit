@@ -177,7 +177,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // The cleared bridge closed the transport, so a read already started
         // never answers.
         builtLocationObservation?.reset()
-        NotificationCenter.default.removeObserver(self, name: UIScene.didActivateNotification, object: nil)
         scrollAnimationCoordinator.finish()
     }
 
