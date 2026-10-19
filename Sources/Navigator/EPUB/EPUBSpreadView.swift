@@ -36,7 +36,8 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     ///   - domRange: The DOM range for anchoring highlights (optional)
     func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?)
 
-    /// Called when the pages visible in the spread changed.
+    /// Called when the pages visible in the spread changed: a reflowable
+    /// spread accepted a measurement, or a fixed spread became ready.
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView)
 
     /// Called when the spread view needs to present a view controller.
@@ -170,6 +171,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         locatorCommandBridge.onDecorationActivated = { [weak self] body in
             self?.decorationDidActivate(body)
         }
+        // Installed before the first load, so a subclass hears every readiness
+        // change and registration of its first document.
+        readiness.onStateChange = { [weak self] state in
+            self?.readinessDidChange(state)
+        }
+        locatorCommandBridge.onFrameRegistered = { [weak self] capability in
+            self?.frameDidRegister(capability)
+        }
+        locatorCommandBridge.onLocationTransportEvent = { [weak self] event in
+            self?.locationTransportDidReport(event)
+        }
         externalLinkActivationBridge.onActivation = { [weak self] body in
             self?.didActivateExternalLink(body)
         }
@@ -270,6 +282,17 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     func loadSpread() {
         fatalError("loadSpread() must be implemented in subclasses")
     }
+
+    /// Told of each readiness change. The base does nothing; each layout
+    /// overrides it.
+    func readinessDidChange(_ state: EPUBSpreadReadiness.State) {}
+
+    /// Told when a frame registering under the current capability becomes the
+    /// selected one.
+    func frameDidRegister(_ capability: EPUBSpreadFrameCapability) {}
+
+    /// Told of the location transport's outcomes.
+    func locationTransportDidReport(_ event: EPUBLocationTransportEvent) {}
 
     /// Starts the generation before issuing an owned main-frame load. WebKit's
     /// provisional-navigation callback then validates and associates the
@@ -834,10 +857,19 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
     // MARK: - Location and progression.
 
-    /// Current progression in the resource with given href.
-    func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
-        // To be overridden in subclasses if the resource supports a progression.
-        0 ... 1
+    /// What the navigator may publish from this spread now, or `nil` while
+    /// nothing current can be read. A ready fixed-layout spread shows each of
+    /// its resources whole; a reflowable spread overrides this to publish only
+    /// an accepted observation.
+    func publicationInput() -> EPUBSpreadPublicationInput? {
+        guard case let .ready(_, capability) = readiness.state else {
+            return nil
+        }
+        var progressions: [ReadingOrder.Index: ClosedRange<Double>] = [:]
+        for index in spread.readingOrderIndices {
+            progressions[index] = 0 ... 1
+        }
+        return EPUBSpreadPublicationInput(capability: capability, stamp: nil, progressions: progressions)
     }
 
     func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {

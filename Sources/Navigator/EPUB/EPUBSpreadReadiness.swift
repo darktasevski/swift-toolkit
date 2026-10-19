@@ -61,7 +61,7 @@ final class EPUBSpreadReadiness {
 
     /// One non-resetting budget shared by stylesheet, font and geometry
     /// stabilization during spread initialization.
-    static let initializationStabilityBudgetMilliseconds = 5000
+    nonisolated static let initializationStabilityBudgetMilliseconds = 5000
 
     /// Bounds controller waits after a page object is installed but before its
     /// exact render generation publishes command readiness.
@@ -122,7 +122,15 @@ final class EPUBSpreadReadiness {
         let continuation: CheckedContinuation<WaitOutcome, Never>
     }
 
-    private(set) var state: State = .unavailable(generation: 0)
+    /// Told of each assignment of the state once it is made, an equal one
+    /// included. A consumer must not mutate readiness from it.
+    var onStateChange: (@MainActor (State) -> Void)?
+
+    private(set) var state: State = .unavailable(generation: 0) {
+        didSet {
+            onStateChange?(state)
+        }
+    }
 
     private var activeWriterLeaseIDs: Set<UUID> = []
     private var initializingFrameCapability: EPUBSpreadFrameCapability?

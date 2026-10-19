@@ -168,6 +168,43 @@ final class EPUBLocatorFrameRegistryTests: XCTestCase {
         )
     }
 
+    /// A retried hand-off echoes the current capability from a new main-frame
+    /// handle. The registry keeps the newest handle rather than failing closed
+    /// on two, and a child frame holding the forwarded capability neither
+    /// replaces the main frame nor is replaced by it.
+    func test_reflowableMainFrameReRegistrationReplacesTheEarlierHandle() {
+        let capability = EPUBSpreadFrameCapability()
+        var registry = EPUBLocatorFrameRegistry(layout: .reflowable)
+        registry.register(
+            id: "first",
+            href: "chapter.xhtml",
+            capability: capability,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+        let childReplaced = registry.register(
+            id: "child",
+            href: "chapter.xhtml",
+            capability: capability,
+            isMainFrame: false,
+            isSameOrigin: true
+        )
+        let retryReplaced = registry.register(
+            id: "retry",
+            href: "chapter.xhtml",
+            capability: capability,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+
+        XCTAssertEqual(childReplaced, [])
+        XCTAssertEqual(retryReplaced, ["first"])
+        XCTAssertEqual(
+            registry.select(href: "chapter.xhtml", capability: capability),
+            .selected("retry")
+        )
+    }
+
     func test_repeatedReadyMessageForSameFrameDoesNotCreateDuplicate() {
         let capability = EPUBSpreadFrameCapability()
         var registry = EPUBLocatorFrameRegistry(layout: .reflowable)

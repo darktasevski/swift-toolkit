@@ -22,6 +22,38 @@ final class EPUBSpreadReadinessTests: XCTestCase {
         XCTAssertEqual(readiness.state, .loading(generation: second))
     }
 
+    /// Every transition reaches the observer, in order, as the state it left
+    /// readiness in.
+    func testEveryStateChangeIsReportedInOrder() throws {
+        let readiness = EPUBSpreadReadiness()
+        var reported: [EPUBSpreadReadiness.State] = []
+        readiness.onStateChange = { [unowned readiness] in
+            XCTAssertEqual(readiness.state, $0, "Reported before the change was made")
+            reported.append($0)
+        }
+        let capability = EPUBSpreadFrameCapability(id: UUID())
+
+        let generation = readiness.beginLoading()
+        let root = try XCTUnwrap(readiness.beginInitialization(for: generation, frameCapability: capability))
+        let joined = try XCTUnwrap(readiness.acquireWriterLease(for: generation))
+        readiness.release(joined)
+        readiness.finishInitialization(root, outcome: .succeeded)
+        let mutation = try XCTUnwrap(readiness.beginMutation())
+        readiness.finishMutation(mutation, outcome: .failed)
+        readiness.invalidate()
+
+        XCTAssertEqual(reported, [
+            .loading(generation: generation),
+            .initializing(generation: generation, activeWriterLeases: 1),
+            .initializing(generation: generation, activeWriterLeases: 2),
+            .initializing(generation: generation, activeWriterLeases: 1),
+            .ready(generation: generation, frameCapability: capability),
+            .initializing(generation: generation + 1, activeWriterLeases: 1),
+            .failed(generation: generation + 1),
+            .unavailable(generation: generation + 2),
+        ])
+    }
+
     func testDocumentAvailabilityDoesNotPublishCommandReadiness() async throws {
         let readiness = EPUBSpreadReadiness()
         let generation = readiness.beginLoading()

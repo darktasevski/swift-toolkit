@@ -4,6 +4,13 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getClientRectsNoOverlap } from "./rect";
+import {
+  isRTL,
+  isScrollModeEnabled,
+  isVerticalWritingMode,
+  measureProgression,
+  progressionScrollTarget,
+} from "./progression";
 
 const LIMITS = Object.freeze({
   payloadBytes: 64 * 1024,
@@ -41,6 +48,7 @@ const TEXT_KEYS = new Set(["before", "highlight", "after"]);
 const DOM_RANGE_KEYS = new Set(["start", "end"]);
 const DOM_POINT_KEYS = new Set(["cssSelector", "textNodeIndex", "charOffset"]);
 const NAVIGATE_KEYS = new Set(["kind", "payload", "animated"]);
+const NAVIGATE_PROGRESSION_KEYS = new Set(["kind", "progression", "animated"]);
 const VALIDATE_UNIQUE_TEXT_KEYS = new Set(["kind", "payload", "cssSelector"]);
 const REPLACE_DECORATIONS_KEYS = new Set([
   "kind",
@@ -997,26 +1005,6 @@ function restoreDecorationGroup(groupID, state) {
   }
 }
 
-function isScrollModeEnabled() {
-  return (
-    globalThis
-      .getComputedStyle(document.documentElement)
-      .getPropertyValue("--USER__view")
-      .trim() === "readium-scroll-on"
-  );
-}
-
-function isVerticalWritingMode() {
-  return globalThis
-    .getComputedStyle(document.documentElement)
-    .writingMode.startsWith("vertical");
-}
-
-function isRTL() {
-  const style = globalThis.getComputedStyle(document.documentElement);
-  return style.direction === "rtl" || style.writingMode === "vertical-rl";
-}
-
 function snapOffset(offset) {
   const viewportWidth = effectiveRootViewportSize().width;
   const delta = isRTL() ? -1 : 1;
@@ -1158,15 +1146,21 @@ async function scrollAndSettle(
 // by whatever remains of it, never by a fresh per-frame allowance — so a
 // starved rAF can no longer multiply a per-rung timeout across the viewport,
 // offset-settle, and correction rungs and overrun the total command budget.
+// A wait whose command is superseded or aborted by the time it ends answers
+// "stale", however it ends: a superseded command is cancelled, never a miss.
+// Callers do not re-check currency after the wait: a supersession or an abort
+// runs as its own task, so nothing changes currency before their continuation.
 function nextFrame(token, signal, deadlineAt) {
   return new Promise((resolve) => {
+    const timeoutStatus = () =>
+      isCurrent(token) && !(signal && signal.aborted) ? "timeout" : "stale";
     const remaining = deadlineAt - performance.now();
     if (!(remaining > 0)) {
       // Budget already spent (or a non-finite deadline): terminal now, before
       // any timer/rAF/listener is registered, so there is nothing to tear down.
       // Resolving here is what stops an exhausted command from buying one more
       // frame at every remaining rung.
-      resolve("timeout");
+      resolve(timeoutStatus());
       return;
     }
     let settled = false;
@@ -1187,7 +1181,7 @@ function nextFrame(token, signal, deadlineAt) {
     };
     const onAbort = () => finish("stale");
     const timeoutID = scheduleTimeout(
-      () => finish("timeout"),
+      () => finish(timeoutStatus()),
       Math.min(FRAME_DEADLINE_MILLISECONDS, remaining)
     );
     if (signal) {
@@ -1204,7 +1198,7 @@ function nextFrame(token, signal, deadlineAt) {
         )
       );
     } catch (_) {
-      finish("timeout");
+      finish(timeoutStatus());
     }
   });
 }
@@ -1568,11 +1562,25 @@ function frameChainVerdict(localSubRect) {
   }
 }
 
+// A frame wait that timed out with the command's deadline still ahead: the
+// frame came late rather than never.
+function isLateFrame(frameStatus, deadlineAt) {
+  return frameStatus === "timeout" && deadlineAt - performance.now() > 0;
+}
+
 // Waits, bounded, for the document to have a usable (non-zero) layout
 // viewport before any viewport-relative work runs. Returns "usable",
-// "notReady" (budget exhausted while still 0-sized), "timeout" (a frame
-// never arrived), or "stale".
-async function awaitUsableViewport(token, signal, deadlineAt) {
+// "notReady" (still 0-sized after `VIEWPORT_READY_FRAMES` frames), "timeout"
+// (a frame never arrived), or "stale". `toleratesLateFrames` counts a late
+// frame as a frame, for a command whose miss fails its document: a late frame
+// does not end a current command's wait, only the deadline or the frame cap
+// does; a command superseded meanwhile ends it as "stale" (see `nextFrame`).
+async function awaitUsableViewport(
+  token,
+  signal,
+  deadlineAt,
+  { toleratesLateFrames = false } = {}
+) {
   for (let frame = 0; frame <= VIEWPORT_READY_FRAMES; frame += 1) {
     const viewport = effectiveRootViewportSize();
     if (viewport.width > 0 && viewport.height > 0) {
@@ -1585,7 +1593,10 @@ async function awaitUsableViewport(token, signal, deadlineAt) {
       return "stale";
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
+    if (toleratesLateFrames && isLateFrame(frameStatus, deadlineAt)) {
+      continue;
+    }
+    if (frameStatus !== "current") {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
   }
@@ -1611,7 +1622,7 @@ async function awaitOffsetStability(
       return "stale";
     }
     const frameStatus = await nextFrame(token, signal, deadlineAt);
-    if (frameStatus !== "current" || signal?.aborted || !isCurrent(token)) {
+    if (frameStatus !== "current") {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
     if (belt && belt.fired()) {
@@ -1815,7 +1826,7 @@ async function navigateLocator(command, token, signal, deadlineAt) {
   if (preScrollFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (preScrollFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+  if (preScrollFrame !== "current") {
     return commandResult(token, "cancelled", "staleToken");
   }
   const landing = await landAndVerify(
@@ -1833,6 +1844,82 @@ async function navigateLocator(command, token, signal, deadlineAt) {
     return commandResult(token, "miss", landing.reason);
   }
   return commandResult(token, "applied", "none");
+}
+
+// How far from its target a progression jump's offset may be and still count as
+// there. Scroll offsets can be fractional; a page start is not.
+const PROGRESSION_LANDING_TOLERANCE = 1;
+
+// Scrolls to the page holding a progression and answers once the offset is there,
+// so a smooth scroll is answered when it lands, never while it is still moving. A
+// jump to where the viewport already is writes nothing: no scroll would start, so
+// nothing would end a wait for one. The landing is the target the scroll was asked
+// for, not a stable offset, which a smooth scroll that has not started yet also
+// has. The target must lie within the scrollport: the web process reports an
+// overscrolled write's offset unclamped until the UI process clamps it. A late
+// frame ends neither of its waits, because a failed position command fails its
+// document (a command superseded meanwhile answers `cancelled`): the deadline
+// ends it as `paintTimeout`, and the viewport wait's frame cap ends it as
+// `viewportNotReady`.
+async function navigateProgression(command, token, signal, deadlineAt) {
+  requireOnlyKeys(command, NAVIGATE_PROGRESSION_KEYS);
+  if (
+    command.kind !== "navigateProgression" ||
+    typeof command.animated !== "boolean"
+  ) {
+    reject("invalidCommand");
+  }
+  if (token.operationKind !== "navigation") {
+    reject("invalidToken");
+  }
+  requireProgression(command.progression);
+  if (signal?.aborted || !isCurrent(token)) {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt, {
+    toleratesLateFrames: true,
+  });
+  if (viewportStatus === "stale") {
+    return commandResult(token, "cancelled", "staleToken");
+  }
+  if (viewportStatus === "timeout") {
+    return commandResult(token, "miss", "paintTimeout");
+  }
+  if (viewportStatus === "notReady") {
+    return commandResult(token, "miss", "viewportNotReady");
+  }
+
+  const start = progressionScrollTarget(command.progression);
+  if (!start) {
+    return commandResult(token, "miss", "geometryUnverifiable");
+  }
+  const reached = (geometry) =>
+    Math.abs(geometry.offset - start.target) <= PROGRESSION_LANDING_TOLERANCE;
+  if (reached(start)) {
+    return commandResult(token, "applied", "none");
+  }
+  const position = start.isRTL && !start.useY ? -start.target : start.target;
+  const behavior = command.animated ? "smooth" : "instant";
+  document.scrollingElement.scrollTo(
+    start.useY ? { top: position, behavior } : { left: position, behavior }
+  );
+
+  for (;;) {
+    const current = progressionScrollTarget(command.progression);
+    if (!current) {
+      return commandResult(token, "miss", "geometryUnverifiable");
+    }
+    if (reached(current)) {
+      return commandResult(token, "applied", "none");
+    }
+    const frameStatus = await nextFrame(token, signal, deadlineAt);
+    if (frameStatus === "stale") {
+      return commandResult(token, "cancelled", "staleToken");
+    }
+    if (frameStatus === "timeout" && !isLateFrame(frameStatus, deadlineAt)) {
+      return commandResult(token, "miss", "paintTimeout");
+    }
+  }
 }
 
 async function replaceDecorationGroup(command, token, signal, deadlineAt) {
@@ -1857,7 +1944,7 @@ async function replaceDecorationGroup(command, token, signal, deadlineAt) {
   if (prePaintFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
-  if (prePaintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+  if (prePaintFrame !== "current") {
     return commandResult(token, "cancelled", "staleToken");
   }
 
@@ -1874,7 +1961,7 @@ async function replaceDecorationGroup(command, token, signal, deadlineAt) {
 
   for (let frame = 0; frame < 2; frame += 1) {
     const paintFrame = await nextFrame(token, signal, deadlineAt);
-    if (paintFrame !== "current" || signal?.aborted || !isCurrent(token)) {
+    if (paintFrame !== "current") {
       if (decorationGroups.get(value.groupID) === state) {
         restoreDecorationGroup(value.groupID, previous);
       }
@@ -1916,6 +2003,13 @@ async function execute(commandValue, tokenValue) {
     switch (commandValue.kind) {
       case "navigateLocator":
         return await navigateLocator(
+          commandValue,
+          token,
+          controller.signal,
+          deadlineAt
+        );
+      case "navigateProgression":
+        return await navigateProgression(
           commandValue,
           token,
           controller.signal,
@@ -2053,10 +2147,13 @@ document.addEventListener(
   true
 );
 
-// The unforgeable per-document capability the native side issues to THIS document
-// instance (via callAsyncJavaScript into the frame's current document). It starts
-// null: the document does not register as a command target until it has received a
-// capability, so a bare document-start href announcement can never register.
+// The per-document capability the native side issues to THIS document instance (via
+// callAsyncJavaScript into the frame's current document). It starts null: the
+// document does not register as a command target until it has received a
+// capability, so a bare document-start href announcement can never register. It is
+// unguessable, not secret: a capability forwarded to a fixed-layout resource frame
+// travels as a message that frame's page script can also read. What protects
+// registration is that only this isolated world can reach the native handler.
 let frameCapability = null;
 
 // The postMessage discriminator for a wrapper->child capability hand-off. Fixed
@@ -2108,23 +2205,53 @@ function forwardCapabilityToChildFrames(token) {
 // capability can register: a delayed old document, a same-URL reload, or a
 // nested/self-navigated frame never received it, so their announcements never
 // present the current capability and are rejected. Reflowable content is the main
-// frame and registers directly; a fixed-layout wrapper is the main frame and
-// forwards the capability to its child resource frame.
-function acceptFrameCapability(token) {
+// frame and registers directly, and keeps the capability out of its child frames,
+// which can never be its command target; a fixed-layout wrapper is the main frame
+// and forwards the capability to its child resource frame.
+function acceptFrameCapability(token, forwardToChildFrames = true) {
   if (typeof token !== "string" || token.length === 0) {
     return;
   }
   frameCapability = token;
   postFrameReady();
-  forwardCapabilityToChildFrames(token);
+  if (forwardToChildFrames === true) {
+    forwardCapabilityToChildFrames(token);
+  }
 }
 
-// Receives a capability forwarded by the parent wrapper frame. Accepts it only
-// from a direct child of the top frame, over the same origin, and never
-// re-forwards it — so the resource frame registers while a nested grandchild or a
-// self-navigated frame (whose parent is not the top frame) can never consume it.
+// Measures the viewport of the document holding `expectedCapability`, as
+// exactly `{ capability, first, last, scrollX, scrollY }`, or null. The page's
+// own scroll offset lets the native side check the answer against its scroll
+// view, which can move before the page learns it has. A document answers only while
+// it holds that capability and has not revoked it on pagehide. That does not
+// identify the resource frame on its own: a direct same-origin child frame that
+// holds the capability answers too, so the native side must read in the main frame
+// it selected. Read-only: it never scrolls, registers a frame, or touches a command.
+function readProgression(expectedCapability) {
+  if (frameCapability === null || expectedCapability !== frameCapability) {
+    return null;
+  }
+  const range = measureProgression();
+  if (!range) {
+    return null;
+  }
+  return {
+    capability: frameCapability,
+    first: range.first,
+    last: range.last,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY,
+  };
+}
+
+// Receives a capability forwarded by the parent wrapper frame. Accepts it only as
+// a real message, not one a page script dispatched itself, from a direct child of
+// the top frame, over the same origin, and never re-forwards it — so the resource
+// frame registers while a nested grandchild or a self-navigated frame (whose parent
+// is not the top frame) can never consume it.
 globalThis.addEventListener("message", (event) => {
   if (
+    !event.isTrusted ||
     globalThis.self === globalThis.top ||
     globalThis.parent !== globalThis.top ||
     event.source !== globalThis.parent ||
@@ -2165,7 +2292,14 @@ globalThis.addEventListener("message", (event) => {
 // interruption, and a miss would send the consumer down its fallback rungs
 // fighting a navigation that no longer exists. Each command clears its own
 // registry entry as it unwinds, so this only fires the signal.
-globalThis.addEventListener("pagehide", () => {
+//
+// Only the browser's own `pagehide` counts. Every content world receives a DOM
+// event, so a page script dispatching one would otherwise revoke the capability of
+// a document that stays current, and abort the command landing in it.
+globalThis.addEventListener("pagehide", (event) => {
+  if (!event.isTrusted) {
+    return;
+  }
   frameCapability = null;
   for (const entry of inFlightCommands.values()) {
     entry.controller.abort();
@@ -2176,5 +2310,10 @@ Object.defineProperty(globalThis, "readerLocatorCommands", {
   configurable: false,
   enumerable: false,
   writable: false,
-  value: Object.freeze({ execute, invalidate, acceptFrameCapability }),
+  value: Object.freeze({
+    execute,
+    invalidate,
+    acceptFrameCapability,
+    readProgression,
+  }),
 });

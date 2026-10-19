@@ -39,6 +39,21 @@ final class EPUBScrollAnimationCoordinator {
         pendingRequest != nil
     }
 
+    // Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`):
+    // lets a test tell the scroll-quiet signal from the fallback timer.
+    #if RENDER_FAITHFUL_NAV_TESTING
+        enum Settlement: Equatable {
+            /// `finish()` ended it: the scroll-quiet signal, or teardown.
+            case finished
+            /// The fallback timer ended it.
+            case fellBack
+        }
+
+        /// What ended the last wait that `finish()` or its own fallback
+        /// timer ended. A cancelled or superseded wait records nothing.
+        private(set) var lastSettlementForTesting: Settlement?
+    #endif
+
     func waitUntilSettled() async {
         let requestID = UUID()
         await withTaskCancellationHandler {
@@ -56,7 +71,7 @@ final class EPUBScrollAnimationCoordinator {
                 Task { @MainActor [weak self, weak request] in
                     try? await Task.sleep(seconds: 0.8)
                     guard let self, let request else { return }
-                    finish(request)
+                    fallBack(request)
                 }
             }
         } onCancel: {
@@ -82,8 +97,20 @@ final class EPUBScrollAnimationCoordinator {
         return pendingRequest
     }
 
-    func finish(_ request: Request? = nil) {
-        takePendingRequest(matching: request)?.resume()
+    func finish() {
+        guard let request = takePendingRequest() else { return }
+        #if RENDER_FAITHFUL_NAV_TESTING
+            lastSettlementForTesting = .finished
+        #endif
+        request.resume()
+    }
+
+    private func fallBack(_ request: Request) {
+        guard let request = takePendingRequest(matching: request) else { return }
+        #if RENDER_FAITHFUL_NAV_TESTING
+            lastSettlementForTesting = .fellBack
+        #endif
+        request.resume()
     }
 }
 
@@ -98,7 +125,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var bottomConstraint: NSLayoutConstraint!
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
-    private let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
+    /// Internal so `EPUBSpreadViewCommandOutcomeTests` and
+    /// `EPUBSettledLocationReportingTests` can read how an animation settled.
+    let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
     private final class PositionCommandOwnership {
         var isSupersessionAcknowledged = false
     }
@@ -109,6 +138,19 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     private var activePositionCommand: PositionCommandEntry?
+
+    /// Read by `observationEligibility` in
+    /// `EPUBReflowableSpreadView+LocationObservation.swift`.
+    var hasActivePositionCommand: Bool {
+        activePositionCommand != nil
+    }
+
+    /// Built on first use, by `locationObservation` in
+    /// `EPUBReflowableSpreadView+LocationObservation.swift`: the base
+    /// initializer's first load reports readiness before this class could
+    /// assign it. A `deinit` never builds it: its hooks capture the spread
+    /// weakly, and forming a weak reference to a deallocating object traps.
+    var builtLocationObservation: EPUBLocationObservation?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -132,6 +174,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             animatedLoad: animatedLoad,
             stabilityBudget: stabilityBudget
         )
+        NotificationCenter.default.addObserver(self, selector: #selector(sceneDidActivate), name: UIScene.didActivateNotification, object: nil)
     }
 
     override func clear() {
@@ -140,6 +183,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         activePositionCommand?.task.cancel()
         activePositionCommand = nil
         super.clear()
+        // The cleared bridge closed the transport, so a read already started
+        // never answers.
+        builtLocationObservation?.reset()
         scrollAnimationCoordinator.finish()
     }
 
@@ -275,16 +321,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     }
 
     // MARK: - Location and progression
-
-    override func progression(in index: ReadingOrder.Index) -> ClosedRange<Double> {
-        guard
-            spread.first.index == index,
-            let progression = progression
-        else {
-            return 0 ... 0
-        }
-        return progression
-    }
 
     override func initializeSpread() async -> EPUBSpreadReadiness.InitializationOutcome {
         let stabilityDeadline = resolveInitializationStabilityDeadline(for: .sharedInitialization)
@@ -614,6 +650,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private func runPositionCommand(
         _ command: PendingPositionCommand
     ) async -> PageTurnOutcome {
+        // Admission revokes the accepted sample before anything awaits.
+        locationObservation.invalidate()
         pendingPositionMutation.update(command)
 
         let predecessor = activePositionCommand?.task
@@ -627,8 +665,10 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             }
             guard let self else { return PageTurnOutcome.cancelled }
             let outcome = await self.executePositionCommand(ownership: ownership)
+            // Only the latest command's settlement asks for the final sample.
             if self.activePositionCommand?.ownership === ownership {
                 self.activePositionCommand = nil
+                self.locationObservation.grant(.commandSettlement)
             }
             return outcome
         }
@@ -860,11 +900,13 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             scrollView.contentOffset = contentOffset
             return true
         } else {
-            let dir = viewModel.readingProgression.rawValue
-            return await evaluateDocumentScriptBounded(
-                "readium.scrollToPosition(\'\(progression)\', \'\(dir)\', \(animated))",
-                until: deadline
+            let result = await locatorCommandBridge.navigate(
+                toProgression: progression,
+                targetHREF: viewModel.url(to: spread.first.link),
+                animated: animated,
+                deadline: EPUBLocatorOperationDeadline(expiringAt: deadline)
             )
+            return result.outcome == .applied
         }
     }
 
@@ -925,48 +967,52 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Progression
 
-    /// Current progression range in the page.
-    private var progression: ClosedRange<Double>?
-    /// To check if a progression change was cancelled or not.
-    private var previousProgression: ClosedRange<Double>?
-
-    /// Called by the javascript code to notify that scrolling ended.
-    private func progressionDidChange(_ body: Any) {
+    override func publicationInput() -> EPUBSpreadPublicationInput? {
         guard
-            isCommandReady,
-            let body = body as? [String: Any],
-            var firstProgression = body["first"] as? Double,
-            var lastProgression = body["last"] as? Double
+            let accepted = builtLocationObservation?.currentObservation,
+            case let .ready(_, capability) = readiness.state,
+            capability == accepted.sample.capability
         else {
-            return
+            return nil
         }
-        precondition(firstProgression <= lastProgression)
-        firstProgression = min(max(firstProgression, 0.0), 1.0)
-        lastProgression = min(max(lastProgression, 0.0), 1.0)
-
-        if previousProgression == nil {
-            previousProgression = progression
-        }
-        progression = firstProgression ... lastProgression
-
-        setNeedsNotifyPagesDidChange()
+        return EPUBSpreadPublicationInput(
+            capability: capability,
+            stamp: accepted.stamp,
+            progressions: [spread.first.index: accepted.sample.range]
+        )
     }
 
-    private func setNeedsNotifyPagesDidChange() {
+    override func readinessDidChange(_ state: EPUBSpreadReadiness.State) {
+        locationObservation.readinessDidChange(to: state)
+    }
+
+    override func frameDidRegister(_ capability: EPUBSpreadFrameCapability) {
+        locationObservation.grant(.registration)
+    }
+
+    override func locationTransportDidReport(_ event: EPUBLocationTransportEvent) {
+        locationObservation.transportDidReport(event)
+    }
+
+    /// The page posts this on scroll and after a resize. Its numbers are
+    /// page-world claims, so they are ignored: the message only asks for a
+    /// measurement.
+    private func progressionDidChange(_ body: Any) {
+        locationObservation.hint()
+        setNeedsScrollQuietSignal()
+    }
+
+    /// The trailing scroll-quiet signal that ends a smooth scroll's wait. It
+    /// is not a measurement, and fires whatever readiness is doing.
+    private func setNeedsScrollQuietSignal() {
         // Makes sure we always receive the "ending scroll" event.
         // ie. https://stackoverflow.com/a/1857162/1474476
-        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(notifyPagesDidChange), object: nil)
-        perform(#selector(notifyPagesDidChange), with: nil, afterDelay: 0.3)
+        NSObject.cancelPreviousPerformRequests(withTarget: self, selector: #selector(scrollDidBecomeQuiet), object: nil)
+        perform(#selector(scrollDidBecomeQuiet), with: nil, afterDelay: 0.3)
     }
 
-    @objc private func notifyPagesDidChange() {
-        guard previousProgression != progression else {
-            return
-        }
-        previousProgression = nil
-
+    @objc private func scrollDidBecomeQuiet() {
         scrollDidEnd()
-        delegate?.spreadViewPagesDidChange(self)
     }
 
     // MARK: - Scripts
@@ -1032,6 +1078,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     override func scrollViewDidScroll(_ scrollView: UIScrollView) {
         super.scrollViewDidScroll(scrollView)
-        setNeedsNotifyPagesDidChange()
+        locationObservation.invalidate()
+        setNeedsScrollQuietSignal()
     }
 }
