@@ -51,7 +51,8 @@ private func countedScrollWrites(in webView: WKWebView, world: WKContentWorld) a
 }
 
 /// Regressions for the location a reflowable spread reports once a navigation
-/// settles. The navigator tests host the public navigator in a key window and
+/// settles, and for the reload a layout preference change rebuilds from it.
+/// The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
 /// messages all come from the production lifecycle. The progression-read tests
 /// load documents of known geometry into a bare web view carrying the locator
@@ -183,117 +184,16 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_aScrollModeScrollReportsTheMeasuredProgression() async throws {
         let reader = try await openReader(minimumScreens: 1, preferences: EPUBPreferences(scroll: true))
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
-        let report = reader.spy.expectLocation("report of the scrolled page") {
-            ($0.locations.progression ?? opening) > opening
-        }
-
         let scrollView = spread.scrollView
-        scrollView.setContentOffset(CGPoint(x: 0, y: scrollView.contentOffset.y + scrollView.bounds.height), animated: false)
-        spread.scrollViewDidEndScrollingAnimation(scrollView)
 
-        await fulfillment(of: [report], timeout: Self.reportTimeout)
-        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
-        let measured = try await reader.requireVerticalProgression()
-        let reported = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
-        XCTAssertEqual(reported, measured, accuracy: 0.000_001)
-    }
-
-    // MARK: - Reload after a layout preference change
-
-    /// Turning scroll mode on rebuilds every spread at the location the
-    /// navigator last published. After a swipe to the middle of the chapter,
-    /// the rebuilt scroll view opens within a screen of that page, not at the
-    /// chapter start (#3230).
-    func test_aSwitchToScrollModeReloadsAtThePageASwipeSettledOn() async throws {
-        let reader = try await openReader(minimumScreens: 4)
-        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        let opening = try await reader.requireGeometry()
-        let middlePage = (opening.scrollWidth / opening.innerWidth / 2).rounded(.down)
-
-        try await assertTheSettledRangeIsReported(
-            by: reader,
-            in: Self.longChapterHREF.anyURL,
-            as: "report of the page the swipe ended on",
-            where: { ($0.locations.progression ?? 0) > 0 }
-        ) {
-            let scrollView = spread.scrollView
-            scrollView.setContentOffset(CGPoint(x: middlePage * scrollView.bounds.width, y: 0), animated: false)
-            spread.scrollViewDidEndScrollingAnimation(scrollView)
-        }
-        let settled = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
-
-        try await reader.reload(
-            applying: EPUBPreferences(scroll: true),
-            replacing: spread,
-            settlingFor: .seconds(Self.quietWindow)
+        let reported = try await reportedProgressionAfterScrolling(
+            spread,
+            toY: scrollView.contentOffset.y + scrollView.bounds.height,
+            in: reader
         )
 
-        let landing = try await reader.requireVerticalGeometry()
-        XCTAssertEqual(
-            landing.firstProgression,
-            settled,
-            accuracy: landing.screenFraction,
-            "Scroll mode opened at \(landing), more than a screen from the page published at progression \(settled)"
-        )
-    }
-
-    /// A reader reopened at a saved page and switched to scroll mode without
-    /// moving reloads from the opening publication, which must measure the
-    /// restored page. The scroll view opens within a screen of the page that
-    /// was showing, not at the chapter start (#3230).
-    func test_aSwitchToScrollModeRightAfterARestoreReloadsAtTheRestoredPage() async throws {
-        let reader = try await openReader(progression: 0.5, minimumScreens: 4)
-        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        let restored = try await reader.requireGeometry()
-        XCTAssertGreaterThan(restored.firstProgression, 0, "Setup: the restore did not open past the chapter start: \(restored)")
-
-        try await reader.reload(
-            applying: EPUBPreferences(scroll: true),
-            replacing: spread,
-            settlingFor: .seconds(Self.quietWindow)
-        )
-
-        let landing = try await reader.requireVerticalGeometry()
-        XCTAssertEqual(
-            landing.firstProgression,
-            restored.firstProgression,
-            accuracy: landing.screenFraction,
-            "Scroll mode opened at \(landing), more than a screen from the restored page at \(restored)"
-        )
-    }
-
-    /// Turning scroll mode off rebuilds every spread at the location the
-    /// navigator last published. After a scroll to the middle of the chapter,
-    /// the rebuilt pages open on the page holding the text that was at the
-    /// top of the screen, not at the chapter start (#3230).
-    func test_aSwitchToPagedModeReloadsAtThePageHoldingTheScrolledText() async throws {
-        let reader = try await openReader(minimumScreens: 1, preferences: EPUBPreferences(scroll: true))
-        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
-        let scrollView = spread.scrollView
-        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
-        let report = reader.spy.expectLocation("report of the scrolled-to middle of the chapter") {
-            ($0.locations.progression ?? opening) > opening
-        }
-
-        scrollView.setContentOffset(CGPoint(x: 0, y: (scrollView.contentSize.height / 2).rounded(.down)), animated: false)
-        spread.scrollViewDidEndScrollingAnimation(scrollView)
-
-        await fulfillment(of: [report], timeout: Self.reportTimeout)
-        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
-        let settled = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
-
-        try await reader.reload(
-            applying: EPUBPreferences(scroll: false),
-            replacing: spread,
-            settlingFor: .seconds(Self.quietWindow)
-        )
-
-        let landing = try await reader.requireGeometry()
-        XCTAssertTrue(
-            landing.firstProgression <= settled + 0.000_001 && settled < landing.lastProgression,
-            "Paged mode opened at \(landing), a page that does not hold progression \(settled)"
-        )
+        let measured = try await reader.requireVerticalGeometry()
+        XCTAssertEqual(reported, measured.firstProgression, accuracy: 0.000_001)
     }
 
     /// A jump to an element lands on the element, not on the progression the
@@ -394,6 +294,31 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             file: file,
             line: line
         )
+    }
+
+    /// Scrolls a scroll-mode `spread` natively to `offsetY`, checks that a
+    /// report of the move arrives, and returns the progression last reported
+    /// once reports go quiet.
+    private func reportedProgressionAfterScrolling(
+        _ spread: EPUBReflowableSpreadView,
+        toY offsetY: CGFloat,
+        in reader: Reader,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws -> Double {
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression, "Setup: no opening report", file: file, line: line)
+        let report = reader.spy.expectLocation("report of the scrolled page") {
+            ($0.locations.progression ?? opening) > opening
+        }
+
+        let scrollView = spread.scrollView
+        scrollView.setContentOffset(CGPoint(x: 0, y: offsetY), animated: false)
+        spread.scrollViewDidEndScrollingAnimation(scrollView)
+
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        _ = try XCTUnwrap(reader.spy.matchedLocation, "No report of the scrolled page arrived", file: file, line: line)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        return try XCTUnwrap(reader.spy.locations.last?.locations.progression, file: file, line: line)
     }
 
     /// An animated jump to the page already showing writes nothing and returns
@@ -597,6 +522,101 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
                 line: line
             )
         }
+    }
+
+    // MARK: - Reload after a layout preference change
+
+    /// Turning scroll mode on rebuilds every spread at the location the
+    /// navigator last published. After a swipe to the middle of the chapter,
+    /// the rebuilt scroll view opens within a screen of that page, not at the
+    /// chapter start (#3230).
+    func test_aSwitchToScrollModeReloadsAtThePageASwipeSettledOn() async throws {
+        let reader = try await openReader(minimumScreens: 4)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let opening = try await reader.requireGeometry()
+        let middlePage = (opening.scrollWidth / opening.innerWidth / 2).rounded(.down)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: Self.longChapterHREF.anyURL,
+            as: "report of the page the swipe ended on",
+            where: { ($0.locations.progression ?? 0) > 0 }
+        ) {
+            let scrollView = spread.scrollView
+            scrollView.setContentOffset(CGPoint(x: middlePage * scrollView.bounds.width, y: 0), animated: false)
+            spread.scrollViewDidEndDecelerating(scrollView)
+        }
+        let settled = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await reader.reload(applying: EPUBPreferences(scroll: true), quietFor: .seconds(Self.quietWindow))
+
+        let landing = try await reader.requireVerticalGeometry()
+        XCTAssertGreaterThanOrEqual(landing.scrollHeight, 2 * landing.innerHeight, "Scroll mode opened in a layout with no second screen: \(landing)")
+        XCTAssertLessThan(landing.screenFraction, settled, "Setup: a screen reaches back to the chapter start from \(settled), so a landing there would pass")
+        XCTAssertEqual(
+            landing.firstProgression,
+            settled,
+            accuracy: landing.screenFraction,
+            "Scroll mode opened at \(landing), more than a screen from the page published at progression \(settled)"
+        )
+    }
+
+    /// A reader reopened at a saved page must publish that page: a switch to
+    /// scroll mode without moving reloads from the publication, and the scroll
+    /// view opens within a screen of the page that was showing, not at the
+    /// chapter start (#3230).
+    func test_aSwitchToScrollModeRightAfterARestoreReloadsAtTheRestoredPage() async throws {
+        let reader = try await openReader(progression: 0.5, minimumScreens: 4)
+        let restored = try await reader.requireGeometry()
+        XCTAssertGreaterThan(restored.firstProgression, 0, "Setup: the restore did not open past the chapter start: \(restored)")
+        let published = try XCTUnwrap(reader.navigator.currentLocation?.locations.progression, "The restore published no location")
+        XCTAssertEqual(
+            published,
+            restored.firstProgression,
+            accuracy: 0.000_001,
+            "The restore published progression \(published), not the restored page at \(restored)"
+        )
+
+        try await reader.reload(applying: EPUBPreferences(scroll: true), quietFor: .seconds(Self.quietWindow))
+
+        let landing = try await reader.requireVerticalGeometry()
+        XCTAssertGreaterThanOrEqual(landing.scrollHeight, 2 * landing.innerHeight, "Scroll mode opened in a layout with no second screen: \(landing)")
+        XCTAssertLessThan(
+            landing.screenFraction,
+            restored.firstProgression,
+            "Setup: a screen reaches back to the chapter start from \(restored.firstProgression), so a landing there would pass"
+        )
+        XCTAssertEqual(
+            landing.firstProgression,
+            restored.firstProgression,
+            accuracy: landing.screenFraction,
+            "Scroll mode opened at \(landing), more than a screen from the restored page at \(restored)"
+        )
+    }
+
+    /// Turning scroll mode off rebuilds every spread at the location the
+    /// navigator last published. After a scroll to the middle of the chapter,
+    /// the rebuilt pages open on the page holding the text that was at the
+    /// top of the screen, not at the chapter start (#3230).
+    func test_aSwitchToPagedModeReloadsAtThePageHoldingTheScrolledText() async throws {
+        let reader = try await openReader(minimumScreens: 1, preferences: EPUBPreferences(scroll: true))
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let settled = try await reportedProgressionAfterScrolling(
+            spread,
+            toY: (spread.scrollView.contentSize.height / 2).rounded(.down),
+            in: reader
+        )
+
+        try await reader.reload(applying: EPUBPreferences(scroll: false), quietFor: .seconds(Self.quietWindow))
+
+        let landing = try await reader.requireGeometry()
+        XCTAssertGreaterThanOrEqual(landing.scrollWidth, 2 * landing.innerWidth, "Paged mode opened in a layout with no second page: \(landing)")
+        // A jump adds a pixel before snapping to a page (`progressionScrollTarget`),
+        // so a progression just short of a page boundary opens the next page.
+        XCTAssertTrue(
+            landing.firstProgression <= settled + 1 / landing.scrollWidth && settled < landing.lastProgression,
+            "Paged mode opened at \(landing), a page that does not hold progression \(settled)"
+        )
     }
 
     // MARK: - Writers
@@ -2295,22 +2315,7 @@ private struct Reader {
         isLoading=\(currentSpread.map { "\($0.webView.isLoading)" } ?? "no spread"), \
         geometry=\(lastGeometry.map { "\($0)" } ?? "unmeasured")
         """
-
-        // Skip only on the #1693 signature: a WebContent process that stopped
-        // answering mid-load leaves readiness `.loading` while WebKit still
-        // reports loading, and answers no script. A process that answers has a
-        // load the navigator left pending; that and every other expiry is a
-        // navigator defect.
-        if
-            let spread = currentSpread,
-            case .loading = spread.readiness.state,
-            spread.webView.isLoading,
-            try await !contentProcessAnswers(spread.webView)
-        {
-            throw XCTSkip(
-                "Setup: WebContent process is not answering (see #1693). \(diagnosis)"
-            )
-        }
+        try await skipIfTheContentProcessHung(diagnosis)
         XCTFail("Setup: the reader never reached a usable paginated viewport with an opening report. \(diagnosis)")
         throw SetupTimeout()
     }
@@ -2336,60 +2341,56 @@ private struct Reader {
     }
 
     /// Submits layout-changing `preferences` and waits until the spread that
-    /// replaces `previous` has finished positioning and its reports have gone
-    /// quiet for `window`, so the landing is measured where it came to rest.
-    func reload(
-        applying preferences: EPUBPreferences,
-        replacing previous: EPUBSpreadView,
-        settlingFor window: Duration
-    ) async throws {
+    /// replaces the current one has finished positioning and its reports have
+    /// gone quiet for `window`, so the landing is measured where it came to
+    /// rest.
+    func reload(applying preferences: EPUBPreferences, quietFor window: Duration) async throws {
+        // Held strongly, so the replacement cannot reuse its address.
+        let previous = try XCTUnwrap(currentSpread, "Setup: no spread to replace")
         navigator.submitPreferences(preferences)
-        try await waitFor("the spread rebuilt by the preference change to be command-ready") {
-            guard let spread = currentSpread else {
-                return false
+
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while clock.now < deadline {
+            if let spread = currentSpread, spread !== previous, spread.readiness.isCommandReady {
+                try await waitForReportsToSettle(quietFor: window)
+                return
             }
-            return spread !== previous && spread.readiness.isCommandReady
+            try await clock.sleep(for: .milliseconds(20))
         }
-        try await waitForReportsToSettle(quietFor: window)
+        // An inactive application defers the rebuild until it is active again.
+        let diagnosis = """
+        replaced=\(currentSpread.map { $0 !== previous } ?? false), \
+        state=\(currentSpread.map { "\($0.readiness.state)" } ?? "no spread"), \
+        isLoading=\(currentSpread.map { "\($0.webView.isLoading)" } ?? "no spread"), \
+        applicationActive=\(UIApplication.shared.applicationState == .active)
+        """
+        try await skipIfTheContentProcessHung(diagnosis)
+        XCTFail("Setup: the spread rebuilt by the preference change never became command-ready. \(diagnosis)")
+        throw SetupTimeout()
     }
 
-    /// The current spread's vertical scroll progression, `scrollY` against
-    /// `scrollHeight`.
-    func requireVerticalProgression() async throws -> Double {
-        let webView = try XCTUnwrap(currentSpread?.webView, "Setup: no current spread")
-        let value = try await webView.callAsyncJavaScript(
-            "const root = document.scrollingElement; return root ? window.scrollY / root.scrollHeight : null;",
-            arguments: [:],
-            in: nil,
-            contentWorld: .defaultClient
-        )
-        return try XCTUnwrap((value as? NSNumber)?.doubleValue, "Setup: the vertical progression is not measurable")
+    /// Skips only on the #1693 signature: a WebContent process that stopped
+    /// answering mid-load leaves readiness `.loading` while WebKit still
+    /// reports loading, and answers no script. A process that answers has a
+    /// load the navigator left pending; that and every other expiry is a
+    /// navigator defect.
+    private func skipIfTheContentProcessHung(_ diagnosis: String) async throws {
+        if
+            let spread = currentSpread,
+            case .loading = spread.readiness.state,
+            spread.webView.isLoading,
+            try await !contentProcessAnswers(spread.webView)
+        {
+            throw XCTSkip(
+                "Setup: WebContent process is not answering (see #1693). \(diagnosis)"
+            )
+        }
     }
 
     func requireVerticalGeometry() async throws -> VerticalPageGeometry {
-        let webView = try XCTUnwrap(currentSpread?.webView, "Setup: no current spread")
-        let value = try await webView.callAsyncJavaScript(
-            """
-            const root = document.scrollingElement;
-            return root ? [window.scrollY, window.innerHeight, root.scrollHeight] : null;
-            """,
-            arguments: [:],
-            in: nil,
-            contentWorld: .defaultClient
-        )
-        let geometry = (value as? [NSNumber]).flatMap { numbers in
-            numbers.count == 3
-                ? VerticalPageGeometry(
-                    scrollY: numbers[0].doubleValue,
-                    innerHeight: numbers[1].doubleValue,
-                    scrollHeight: numbers[2].doubleValue
-                )
-                : nil
-        }
-        return try XCTUnwrap(
-            geometry.flatMap { $0.scrollHeight > $0.innerHeight ? $0 : nil },
-            "Setup: the current spread does not scroll vertically: \(geometry.map { "\($0)" } ?? "unmeasured")"
-        )
+        let measured = try await verticalGeometry()
+        return try XCTUnwrap(measured, "Setup: the current spread's vertical geometry is not measurable")
     }
 
     func requireGeometry() async throws -> PageGeometry {
@@ -2424,6 +2425,29 @@ private struct Reader {
         }
         XCTFail("The turn returned success but the viewport offset never changed from \(before.scrollX)")
         throw SetupTimeout()
+    }
+
+    private func verticalGeometry() async throws -> VerticalPageGeometry? {
+        guard let webView = currentSpread?.webView else {
+            return nil
+        }
+        let value = try await webView.callAsyncJavaScript(
+            """
+            const root = document.scrollingElement;
+            return root ? [window.scrollY, window.innerHeight, root.scrollHeight] : null;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+        guard let numbers = value as? [NSNumber], numbers.count == 3 else {
+            return nil
+        }
+        return VerticalPageGeometry(
+            scrollY: numbers[0].doubleValue,
+            innerHeight: numbers[1].doubleValue,
+            scrollHeight: numbers[2].doubleValue
+        )
     }
 
     private func geometry() async throws -> PageGeometry? {
