@@ -125,6 +125,30 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
     }
 
+    /// UIKit moves the scroll view and calls the end delegate in one pass,
+    /// while WebKit tells the page its new offset afterwards. The read that a
+    /// scroll's end starts must still measure where the page came to rest.
+    /// With the page's hints silenced, a read of the previous offset would
+    /// equal the opening report and publish nothing.
+    func test_aScrollEndReportsTheOffsetTheScrollViewEndedAt() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        spread.webView.configuration.userContentController.removeScriptMessageHandler(forName: progressionMessageName)
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+        let report = reader.spy.expectLocation("report of the page the scroll ended on") {
+            ($0.locations.progression ?? opening) > opening
+        }
+
+        let scrollView = spread.scrollView
+        scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x + scrollView.bounds.width, y: 0), animated: false)
+        spread.scrollViewDidEndScrollingAnimation(scrollView)
+
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        let settled = try await reader.requireGeometry()
+        let reported = try XCTUnwrap(reader.spy.matchedLocation?.locations.progression, "No report of the page the scroll ended on")
+        XCTAssertEqual(reported, settled.firstProgression, accuracy: 0.000_001)
+    }
+
     private func assertATurnReportsTheMeasuredProgression(
         in reader: Reader,
         animated: Bool = false,
@@ -1396,7 +1420,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         page.bridge.setFrameCapability(capability)
         held.complete(0, with: .success(NSNull()))
         try await page.echo(capability)
-        let answer: [String: Any] = ["capability": capability.id.uuidString, "first": 0, "last": 0.5]
+        let answer: [String: Any] = ["capability": capability.id.uuidString, "first": 0, "last": 0.5, "scrollX": 0, "scrollY": 0]
 
         let unchanged = BridgeReadOutcomes()
         XCTAssertEqual(try page.startBridgeRead(reportingTo: unchanged), .started)
@@ -1809,7 +1833,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             XCTFail("Expected a progression sample, got \(String(describing: value))", file: file, line: line)
             return
         }
-        let expectedKeys: Set<String> = capability == nil ? ["first", "last"] : ["capability", "first", "last"]
+        let expectedKeys: Set<String> = capability == nil ? ["first", "last"] : ["capability", "first", "last", "scrollX", "scrollY"]
         XCTAssertEqual(Set(sample.keys), expectedKeys, file: file, line: line)
         XCTAssertEqual(sample["capability"] as? String, capability, file: file, line: line)
         XCTAssertEqual((sample["first"] as? NSNumber)?.doubleValue ?? -1, first, accuracy: 0.000_001, "first", file: file, line: line)
@@ -3244,6 +3268,7 @@ private final class ObservedHeldPage {
             documentCapability: { [weak self] in
                 self?.capability
             },
+            nativeScrollOffset: { nil },
             read: { deadline, completion in
                 bridge.readProgression(targetHREF: target, deadline: deadline, completion: completion)
             },
@@ -3303,7 +3328,7 @@ private final class ObservedHeldPage {
 
     /// What the page answers a read of the ready document with.
     func answer(_ range: ClosedRange<Double>) -> [String: Any] {
-        ["capability": capability?.id.uuidString ?? "", "first": range.lowerBound, "last": range.upperBound]
+        ["capability": capability?.id.uuidString ?? "", "first": range.lowerBound, "last": range.upperBound, "scrollX": 0, "scrollY": 0]
     }
 }
 

@@ -312,24 +312,36 @@ final class EPUBLocationTransportTests: XCTestCase {
     func test_aReadAnswerDecodesOnlyAnExactSampleForTheExpectedCapability() {
         let capability = EPUBSpreadFrameCapability()
         let id = capability.id.uuidString
-        let sample: [String: Any] = ["capability": id, "first": 0.25, "last": 0.5]
+        let sample: [String: Any] = ["capability": id, "first": 0.25, "last": 0.5, "scrollX": -600, "scrollY": 0]
 
-        XCTAssertEqual(
-            EPUBProgressionReadOutcome.decoding(sample, expecting: capability),
-            .sample(EPUBProgressionSample(capability: capability, range: 0.25 ... 0.5))
-        )
+        let decoded = EPUBProgressionReadOutcome.decoding(sample, expecting: capability)
+        XCTAssertEqual(decoded, .sample(EPUBProgressionSample(capability: capability, range: 0.25 ... 0.5)))
+        guard case let .sample(decodedSample) = decoded else {
+            return XCTFail("Expected a sample, got \(decoded)")
+        }
+        XCTAssertEqual(decodedSample.pageOffset, EPUBScrollOffset(x: -600, y: 0))
 
+        func answer(_ changes: [String: Any?]) -> [String: Any] {
+            var answer = sample
+            for (key, value) in changes {
+                answer[key] = value
+            }
+            return answer
+        }
         let malformed: [(String, Any)] = [
-            ("another capability", ["capability": UUID().uuidString, "first": 0.25, "last": 0.5]),
-            ("a non-string capability", ["capability": 1, "first": 0.25, "last": 0.5]),
-            ("an extra key", ["capability": id, "first": 0.25, "last": 0.5, "href": "x"]),
-            ("a missing key", ["capability": id, "first": 0.25]),
-            ("a Boolean end", ["capability": id, "first": NSNumber(value: false), "last": 0.5]),
-            ("a string end", ["capability": id, "first": "0.25", "last": 0.5]),
-            ("a non-finite end", ["capability": id, "first": Double.nan, "last": 0.5]),
-            ("an end above 1", ["capability": id, "first": 0.25, "last": 1.5]),
-            ("an end below 0", ["capability": id, "first": -0.25, "last": 0.5]),
-            ("a reversed range", ["capability": id, "first": 0.5, "last": 0.25]),
+            ("another capability", answer(["capability": UUID().uuidString])),
+            ("a non-string capability", answer(["capability": 1])),
+            ("an extra key", answer(["href": "x"])),
+            ("a missing end", answer(["last": nil])),
+            ("a Boolean end", answer(["first": NSNumber(value: false)])),
+            ("a string end", answer(["first": "0.25"])),
+            ("a non-finite end", answer(["first": Double.nan])),
+            ("an end above 1", answer(["last": 1.5])),
+            ("an end below 0", answer(["first": -0.25])),
+            ("a reversed range", answer(["first": 0.5, "last": 0.25])),
+            ("a missing scroll offset", answer(["scrollY": nil])),
+            ("a non-finite scroll offset", answer(["scrollX": Double.infinity])),
+            ("a Boolean scroll offset", answer(["scrollY": NSNumber(value: true)])),
             ("a bare number", 0.25),
         ]
         for (label, value) in malformed {

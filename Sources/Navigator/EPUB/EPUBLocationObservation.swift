@@ -7,11 +7,26 @@
 import CoreFoundation
 import Foundation
 
+/// A scroll offset in points: the page's own `scrollX` and `scrollY`, or the
+/// native scroll view's content offset.
+struct EPUBScrollOffset: Equatable, Sendable {
+    let x: Double
+    let y: Double
+}
+
 /// A measured viewport range of one reflowable document, tagged with the frame
 /// capability that document held when it answered.
 struct EPUBProgressionSample: Equatable, Sendable {
     let capability: EPUBSpreadFrameCapability
     let range: ClosedRange<Double>
+    /// Where the page was scrolled when it measured, which lets the answer be
+    /// checked against the native scroll view. Not part of the sample's
+    /// identity: one range of one document is one sample.
+    var pageOffset: EPUBScrollOffset?
+
+    static func == (lhs: Self, rhs: Self) -> Bool {
+        lhs.capability == rhs.capability && lhs.range == rhs.range
+    }
 }
 
 /// The closed result of one progression read. These are observation results,
@@ -34,9 +49,10 @@ enum EPUBProgressionReadOutcome: Equatable, Sendable {
     case failed
 
     /// Decodes a `readProgression` answer for the document issued `capability`.
-    /// A sample has exactly `capability`, `first` and `last`; the capability must
-    /// be the expected one, and both ends ordered, finite, non-Boolean numbers
-    /// in 0...1.
+    /// A sample has exactly `capability`, `first`, `last`, `scrollX` and
+    /// `scrollY`; the capability must be the expected one, both ends ordered,
+    /// finite, non-Boolean numbers in 0...1, and the offset finite,
+    /// non-Boolean numbers.
     static func decoding(
         _ value: Any,
         expecting capability: EPUBSpreadFrameCapability
@@ -48,29 +64,39 @@ enum EPUBProgressionReadOutcome: Equatable, Sendable {
         }
         guard
             let payload = value as? [String: Any],
-            Set(payload.keys) == ["capability", "first", "last"],
+            Set(payload.keys) == ["capability", "first", "last", "scrollX", "scrollY"],
             payload["capability"] as? String == capability.id.uuidString,
             let first = unitInterval(payload["first"]),
             let last = unitInterval(payload["last"]),
-            first <= last
+            first <= last,
+            let scrollX = finiteNumber(payload["scrollX"]),
+            let scrollY = finiteNumber(payload["scrollY"])
         else {
             return .invalid
         }
-        return .sample(EPUBProgressionSample(capability: capability, range: first ... last))
+        return .sample(EPUBProgressionSample(
+            capability: capability,
+            range: first ... last,
+            pageOffset: EPUBScrollOffset(x: scrollX, y: scrollY)
+        ))
     }
 
     private static func unitInterval(_ value: Any?) -> Double? {
-        guard
-            let number = value as? NSNumber,
-            CFGetTypeID(number) != CFBooleanGetTypeID()
-        else {
-            return nil
-        }
-        let double = number.doubleValue
-        guard (0 ... 1).contains(double) else {
+        guard let double = finiteNumber(value), (0 ... 1).contains(double) else {
             return nil
         }
         return double
+    }
+
+    private static func finiteNumber(_ value: Any?) -> Double? {
+        guard
+            let number = value as? NSNumber,
+            CFGetTypeID(number) != CFBooleanGetTypeID(),
+            number.doubleValue.isFinite
+        else {
+            return nil
+        }
+        return number.doubleValue
     }
 }
 
@@ -183,6 +209,7 @@ final class EPUBLocationObservation {
     private let scheduler: EPUBDeadlineScheduler
     private let eligibility: @MainActor () -> EPUBObservationEligibility
     private let documentCapability: @MainActor () -> EPUBSpreadFrameCapability?
+    private let nativeScrollOffset: @MainActor () -> EPUBScrollOffset?
     private let read: Read
     private let reissueHandshake: @MainActor (EPUBSpreadFrameCapability) -> Void
     private let onAccepted: @MainActor (EPUBAcceptedObservation) -> Void
@@ -198,6 +225,13 @@ final class EPUBLocationObservation {
     private var handshakeRetryDeadline: EPUBScheduledDeadline?
     private var lastStamp: UInt64 = 0
     private var latestAccepted: EPUBAcceptedObservation?
+    /// The page's and the native scroll view's offsets when the last sample
+    /// was accepted: a later answer has moved with the scroll view since.
+    private var calibration: (page: EPUBScrollOffset, native: EPUBScrollOffset)?
+    /// An answer behind the scroll view was read again. A second one is
+    /// accepted and calibrates anew, so a layout the calibration no longer
+    /// describes cannot keep every answer out.
+    private var answeredBehindTheScrollView = false
     /// Stale answers since the last accepted sample or hint window. Motion the
     /// spread cannot see, such as a page script's own scrolling, makes every
     /// answer stale: only the first is read again at once.
@@ -218,6 +252,8 @@ final class EPUBLocationObservation {
     /// - Parameters:
     ///   - eligibility: read from the live spread at every decision; never cached.
     ///   - documentCapability: the capability of the current document, ready or not.
+    ///   - nativeScrollOffset: the scroll view's content offset now, or `nil`
+    ///     when there is none to check an answer against.
     ///   - read: starts one bridge read, calling `completion` at most once.
     ///   - reissueHandshake: hands `capability` to the document again.
     ///   - onAccepted: told of each accepted sample, equal ones included.
@@ -225,6 +261,7 @@ final class EPUBLocationObservation {
         scheduler: EPUBDeadlineScheduler,
         eligibility: @escaping @MainActor () -> EPUBObservationEligibility,
         documentCapability: @escaping @MainActor () -> EPUBSpreadFrameCapability?,
+        nativeScrollOffset: @escaping @MainActor () -> EPUBScrollOffset?,
         read: @escaping Read,
         reissueHandshake: @escaping @MainActor (EPUBSpreadFrameCapability) -> Void,
         onAccepted: @escaping @MainActor (EPUBAcceptedObservation) -> Void
@@ -232,6 +269,7 @@ final class EPUBLocationObservation {
         self.scheduler = scheduler
         self.eligibility = eligibility
         self.documentCapability = documentCapability
+        self.nativeScrollOffset = nativeScrollOffset
         self.read = read
         self.reissueHandshake = reissueHandshake
         self.onAccepted = onAccepted
@@ -249,6 +287,8 @@ final class EPUBLocationObservation {
             invalidate()
             request()
         case .unavailable, .initializing, .failed:
+            // A writer can lay the document out anew.
+            calibration = nil
             invalidate()
         }
     }
@@ -349,6 +389,8 @@ final class EPUBLocationObservation {
         endHandshakeRecovery()
         cycle = RecoveryCycle()
         consecutiveStaleAnswers = 0
+        calibration = nil
+        answeredBehindTheScrollView = false
         unavailability = nil
         currentObservation = nil
         latestAccepted = nil
@@ -451,6 +493,11 @@ final class EPUBLocationObservation {
                 restartAfterStaleRead()
                 return
             }
+            guard !trailsTheScrollView(sample) else {
+                answeredBehindTheScrollView = true
+                restartAfterStaleRead()
+                return
+            }
             accept(sample)
         case .cancelled:
             restartAfterStaleRead()
@@ -489,6 +536,24 @@ final class EPUBLocationObservation {
         attemptDispatch(waitingOutNativeMotion: false)
     }
 
+    /// UIKit moves the scroll view and calls its delegate before WebKit tells
+    /// the page the new offset, so a read the delegate starts can measure the
+    /// offset the page is leaving. Such an answer has not moved as far as the
+    /// scroll view since the last accepted sample.
+    private func trailsTheScrollView(_ sample: EPUBProgressionSample) -> Bool {
+        guard
+            !answeredBehindTheScrollView,
+            let calibration,
+            let page = sample.pageOffset,
+            let native = nativeScrollOffset()
+        else {
+            return false
+        }
+        let tolerance = 1.0
+        return abs((page.x - calibration.page.x) - (native.x - calibration.native.x)) > tolerance
+            || abs((page.y - calibration.page.y) - (native.y - calibration.native.y)) > tolerance
+    }
+
     /// The retry's own dispatch applies the cycle's ceiling.
     private func retryOrGiveUp() {
         guard !cycle.retryUsed else {
@@ -516,6 +581,12 @@ final class EPUBLocationObservation {
         currentObservation = accepted
         cycle = RecoveryCycle()
         consecutiveStaleAnswers = 0
+        answeredBehindTheScrollView = false
+        if let page = sample.pageOffset, let native = nativeScrollOffset() {
+            calibration = (page, native)
+        } else {
+            calibration = nil
+        }
         onAccepted(accepted)
         attemptDispatch(waitingOutNativeMotion: false)
     }

@@ -971,6 +971,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             documentCapability: { [weak self] in
                 self?.readiness.currentFrameCapability
             },
+            nativeScrollOffset: { [weak self] in
+                self.map { EPUBScrollOffset(x: Double($0.scrollView.contentOffset.x), y: Double($0.scrollView.contentOffset.y)) }
+            },
             read: { [weak self] deadline, completion in
                 guard let self else {
                     return .frameUnavailable

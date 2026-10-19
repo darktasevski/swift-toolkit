@@ -2220,7 +2220,9 @@ function acceptFrameCapability(token, forwardToChildFrames = true) {
 }
 
 // Measures the viewport of the document holding `expectedCapability`, as
-// exactly `{ capability, first, last }`, or null. A document answers only while
+// exactly `{ capability, first, last, scrollX, scrollY }`, or null. The page's
+// own scroll offset lets the native side check the answer against its scroll
+// view, which can move before the page learns it has. A document answers only while
 // it holds that capability and has not revoked it on pagehide. That does not
 // identify the resource frame on its own: a direct same-origin child frame that
 // holds the capability answers too, so the native side must read in the main frame
@@ -2233,7 +2235,13 @@ function readProgression(expectedCapability) {
   if (!range) {
     return null;
   }
-  return { capability: frameCapability, first: range.first, last: range.last };
+  return {
+    capability: frameCapability,
+    first: range.first,
+    last: range.last,
+    scrollX: globalThis.scrollX,
+    scrollY: globalThis.scrollY,
+  };
 }
 
 // Receives a capability forwarded by the parent wrapper frame. Accepts it only as

@@ -95,6 +95,65 @@ final class EPUBLocationObservationTests: XCTestCase {
         XCTAssertEqual(fixture.accepted.map(\.sample.range), [0.5 ... 0.75])
     }
 
+    /// UIKit moves the scroll view before WebKit tells the page, so a read can
+    /// measure the offset the page is leaving. An answer that has not moved
+    /// with the scroll view since the last accepted sample is read again.
+    func test_anAnswerBehindTheScrollViewIsReadAgain() {
+        let fixture = ObservationFixture()
+        fixture.nativeOffset = EPUBScrollOffset(x: 0, y: 0)
+        fixture.observation.request()
+        fixture.answer(0, fixture.sample(0 ... 0.25, at: EPUBScrollOffset(x: 0, y: 0)))
+        fixture.nativeOffset = EPUBScrollOffset(x: 600, y: 0)
+
+        fixture.observation.request()
+        fixture.answer(1, fixture.sample(0 ... 0.25, at: EPUBScrollOffset(x: 0, y: 0)))
+
+        XCTAssertEqual(fixture.accepted.count, 1, "An answer behind the scroll view was accepted")
+        XCTAssertEqual(fixture.startedReads, 3, "The answer behind the scroll view was not read again")
+        fixture.answer(2, fixture.sample(0.25 ... 0.5, at: EPUBScrollOffset(x: 600, y: 0)))
+        XCTAssertEqual(fixture.accepted.map(\.sample.range), [0 ... 0.25, 0.25 ... 0.5])
+    }
+
+    /// A second answer behind the scroll view is accepted and calibrates
+    /// anew, so a layout the last calibration no longer describes cannot keep
+    /// every answer out; the next answer is checked against the new one.
+    func test_aSecondAnswerBehindTheScrollViewIsAcceptedAndCalibratesAnew() {
+        let fixture = ObservationFixture()
+        fixture.nativeOffset = EPUBScrollOffset(x: 0, y: 0)
+        fixture.observation.request()
+        fixture.answer(0, fixture.sample(0 ... 0.25, at: EPUBScrollOffset(x: 0, y: 0)))
+        fixture.nativeOffset = EPUBScrollOffset(x: 600, y: 0)
+        fixture.observation.request()
+        fixture.answer(1, fixture.sample(0 ... 0.25, at: EPUBScrollOffset(x: 0, y: 0)))
+
+        fixture.answer(2, fixture.sample(0 ... 0.3, at: EPUBScrollOffset(x: 0, y: 0)))
+        XCTAssertEqual(fixture.accepted.map(\.sample.range), [0 ... 0.25, 0 ... 0.3], "A second answer behind the scroll view was read again")
+
+        fixture.nativeOffset = EPUBScrollOffset(x: 1200, y: 0)
+        fixture.observation.request()
+        fixture.answer(3, fixture.sample(0.3 ... 0.6, at: EPUBScrollOffset(x: 600, y: 0)))
+        XCTAssertEqual(fixture.accepted.count, 3, "The new calibration rejected an answer that moved with the scroll view")
+    }
+
+    /// A writer can lay the document out anew, which moves the page's offset
+    /// without the scroll view: the first answer after it is not checked
+    /// against the calibration from before.
+    func test_aWriterClearsTheScrollViewCalibration() {
+        let fixture = ObservationFixture()
+        let capability = fixture.capability
+        fixture.nativeOffset = EPUBScrollOffset(x: 0, y: 0)
+        fixture.observation.request()
+        fixture.answer(0, fixture.sample(0 ... 0.25, at: EPUBScrollOffset(x: 0, y: 0)))
+
+        fixture.observation.readinessDidChange(to: .initializing(generation: 1, activeWriterLeases: 1))
+        fixture.nativeOffset = EPUBScrollOffset(x: 600, y: 0)
+        fixture.observation.readinessDidChange(to: .ready(generation: 1, frameCapability: capability))
+        fixture.answer(1, fixture.sample(0 ... 0.5, at: EPUBScrollOffset(x: 0, y: 0)))
+
+        XCTAssertEqual(fixture.accepted.map(\.sample.range), [0 ... 0.25, 0 ... 0.5], "The relaid-out answer was checked against the old calibration")
+        XCTAssertEqual(fixture.startedReads, 2)
+    }
+
     func test_aSampleAnsweredWhileTheSpreadIsNoLongerEligibleIsNotAccepted() {
         let fixture = ObservationFixture()
         fixture.observation.request()
@@ -838,6 +897,8 @@ private final class ObservationFixture {
     let capability = EPUBSpreadFrameCapability()
     var eligibility: EPUBObservationEligibility
     var documentCapability: EPUBSpreadFrameCapability?
+    /// The native scroll view's offset, `nil` for none.
+    var nativeOffset: EPUBScrollOffset?
     /// What each read start reports from now on.
     var nextStart: EPUBLocatorCommandBridge.ProgressionReadStart = .started
     private(set) var reads: [Read] = []
@@ -848,6 +909,7 @@ private final class ObservationFixture {
         scheduler: deadlines.scheduler,
         eligibility: { [unowned self] in eligibility },
         documentCapability: { [unowned self] in documentCapability },
+        nativeScrollOffset: { [unowned self] in nativeOffset },
         read: { [unowned self] deadline, completion in
             let start = nextStart
             reads.append(Read(deadline: deadline, start: start, completion: completion))
@@ -871,8 +933,8 @@ private final class ObservationFixture {
         reads.filter { $0.start == .started }.count
     }
 
-    func sample(_ range: ClosedRange<Double>) -> EPUBProgressionReadOutcome {
-        .sample(EPUBProgressionSample(capability: capability, range: range))
+    func sample(_ range: ClosedRange<Double>, at pageOffset: EPUBScrollOffset? = nil) -> EPUBProgressionReadOutcome {
+        .sample(EPUBProgressionSample(capability: capability, range: range, pageOffset: pageOffset))
     }
 
     /// Answers the `index`th started read, failing rather than trapping when
