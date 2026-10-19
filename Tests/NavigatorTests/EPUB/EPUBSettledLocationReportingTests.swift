@@ -149,6 +149,96 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual(reported, settled.firstProgression, accuracy: 0.000_001)
     }
 
+    // MARK: - Geometry and routes through the delegate
+
+    /// A right-to-left book pages from offset 0 towards negative offsets; a
+    /// turn still reports the measured progression.
+    func test_aRightToLeftTurnReportsTheMeasuredProgression() async throws {
+        let reader = try await openReader(preferences: EPUBPreferences(readingProgression: .rtl))
+
+        try await assertATurnReportsTheMeasuredProgression(in: reader)
+    }
+
+    /// Vertical writing scrolls horizontally, right to left; a native scroll
+    /// one screen on reports where it came to rest.
+    func test_aVerticalWritingScrollReportsTheMeasuredProgression() async throws {
+        let reader = try await openReader(minimumScreens: 2, preferences: EPUBPreferences(readingProgression: .rtl, verticalText: true))
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: Self.longChapterHREF.anyURL,
+            as: "report of the scrolled vertical text",
+            where: { ($0.locations.progression ?? opening) > opening }
+        ) {
+            let scrollView = spread.scrollView
+            scrollView.setContentOffset(CGPoint(x: scrollView.contentOffset.x - scrollView.bounds.width, y: 0), animated: false)
+            spread.scrollViewDidEndScrollingAnimation(scrollView)
+        }
+    }
+
+    /// Scroll mode advances down; a native scroll one screen on reports the
+    /// progression measured along the vertical axis.
+    func test_aScrollModeScrollReportsTheMeasuredProgression() async throws {
+        let reader = try await openReader(minimumScreens: 1, preferences: EPUBPreferences(scroll: true))
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let opening = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+        let report = reader.spy.expectLocation("report of the scrolled page") {
+            ($0.locations.progression ?? opening) > opening
+        }
+
+        let scrollView = spread.scrollView
+        scrollView.setContentOffset(CGPoint(x: 0, y: scrollView.contentOffset.y + scrollView.bounds.height), animated: false)
+        spread.scrollViewDidEndScrollingAnimation(scrollView)
+
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        let measured = try await reader.requireVerticalProgression()
+        let reported = try XCTUnwrap(reader.spy.locations.last?.locations.progression)
+        XCTAssertEqual(reported, measured, accuracy: 0.000_001)
+    }
+
+    /// A jump to an element lands on the element, not on the progression the
+    /// locator also carries, and reports where it landed.
+    func test_aJumpToAnElementReportsWhereItLands() async throws {
+        let reader = try await openReader()
+        let href = Self.longChapterHREF.anyURL
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: href,
+            as: "report of the element's page",
+            where: { ($0.locations.progression ?? 0) > 0.3 }
+        ) {
+            let target = Locator(
+                href: href,
+                mediaType: .html,
+                locations: Locator.Locations(progression: 0.15, otherLocations: ["cssSelector": .string("p:nth-of-type(80)")])
+            )
+            let jumped = await reader.navigator.go(to: target, options: NavigatorGoOptions(animated: false))
+            XCTAssertTrue(jumped)
+        }
+    }
+
+    /// A jump into another resource reports the destination measured where
+    /// the jump settled, from the destination spread's own observation.
+    func test_aJumpIntoAnotherResourceReportsTheMeasuredDestination() async throws {
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1)
+        let href = Self.longChapterHREF.anyURL
+
+        try await assertTheSettledRangeIsReported(
+            by: reader,
+            in: href,
+            as: "report of the destination page",
+            where: { ($0.locations.progression ?? 0) > 0.3 }
+        ) {
+            let target = Locator(href: href, mediaType: .html, locations: Locator.Locations(progression: 0.5))
+            let jumped = await reader.navigator.go(to: target, options: NavigatorGoOptions(animated: false))
+            XCTAssertTrue(jumped)
+        }
+    }
+
     private func assertATurnReportsTheMeasuredProgression(
         in reader: Reader,
         animated: Bool = false,
@@ -672,6 +762,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         (.leftToRightPages, 599.5 / 1800, [600, 0]),
         (.rightToLeftPages, 0.5, [-600, 0]),
         (.verticalScroll, 0.4, [0, 1280]),
+        (.verticalScroll, 0.9, [0, 2400]),
         (.rightToLeftScroll, 0.4, [0, 1280]),
         (.verticalWritingScroll, 0.5, [-900, 0]),
         (.verticalLeftToRightWritingScroll, 0.5, [900, 0]),
@@ -1567,7 +1658,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let capability = EPUBSpreadFrameCapability()
         try await page.register(capability)
 
-        try await page.register(capability)
+        page.bridge.setFrameCapability(capability)
+        try await waitUntil("the repeated echo is selected") { page.registrations == [capability, capability] }
         let outcome = try await page.readThroughBridge()
 
         XCTAssertEqual(page.registrations, [capability, capability])
@@ -1880,7 +1972,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         at href: RelativeURL = longChapterHREF,
         layout: ReadiumShared.Layout = .reflowable,
         minimumScreens: Int = 3,
-        tableOfContents: HeldTableOfContents? = nil
+        tableOfContents: HeldTableOfContents? = nil,
+        preferences: EPUBPreferences = EPUBPreferences()
     ) async throws -> Reader {
         let initialLocation = Locator(
             href: href.anyURL,
@@ -1890,7 +1983,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let navigator = try EPUBNavigatorViewController(
             publication: makePublication(layout: layout, tableOfContents: tableOfContents),
             initialLocation: initialLocation,
-            config: EPUBNavigatorViewController.Configuration()
+            config: EPUBNavigatorViewController.Configuration(preferences: preferences)
         )
         let spy = LocationReportSpy()
         navigator.delegate = spy
@@ -2142,6 +2235,19 @@ private struct Reader {
         }
         XCTFail("Location reports never went quiet for \(window); reports=\(spy.locations.count)")
         throw SetupTimeout()
+    }
+
+    /// The current spread's vertical scroll progression, `scrollY` against
+    /// `scrollHeight`.
+    func requireVerticalProgression() async throws -> Double {
+        let webView = try XCTUnwrap(currentSpread?.webView, "Setup: no current spread")
+        let value = try await webView.callAsyncJavaScript(
+            "const root = document.scrollingElement; return root ? window.scrollY / root.scrollHeight : null;",
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+        return try XCTUnwrap((value as? NSNumber)?.doubleValue, "Setup: the vertical progression is not measurable")
     }
 
     func requireGeometry() async throws -> PageGeometry {
