@@ -125,6 +125,8 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     private var bottomConstraint: NSLayoutConstraint!
     private var contentInsetConfiguration: ContentInsetConfiguration?
     private var settingsLayoutTask: Task<Void, Never>?
+    /// Internal so `EPUBSpreadViewCommandOutcomeTests` and
+    /// `EPUBSettledLocationReportingTests` can read how an animation settled.
     let scrollAnimationCoordinator = EPUBScrollAnimationCoordinator()
     private final class PositionCommandOwnership {
         var isSupersessionAcknowledged = false
@@ -137,11 +139,18 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     private var activePositionCommand: PositionCommandEntry?
 
-    /// Built on first use: the base initializer's first load reports readiness
-    /// before this class could assign it. A `deinit` never builds it: its hooks
-    /// capture the spread weakly, and forming a weak reference to a deallocating
-    /// object traps.
-    private(set) var builtLocationObservation: EPUBLocationObservation?
+    /// Read by `observationEligibility` in
+    /// `EPUBReflowableSpreadView+LocationObservation.swift`.
+    var hasActivePositionCommand: Bool {
+        activePositionCommand != nil
+    }
+
+    /// Built on first use, by `locationObservation` in
+    /// `EPUBReflowableSpreadView+LocationObservation.swift`: the base
+    /// initializer's first load reports readiness before this class could
+    /// assign it. A `deinit` never builds it: its hooks capture the spread
+    /// weakly, and forming a weak reference to a deallocating object traps.
+    var builtLocationObservation: EPUBLocationObservation?
 
     private static let reflowableScript = loadScript(named: "readium-reflowable")
 
@@ -958,56 +967,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     // MARK: - Progression
 
-    private var locationObservation: EPUBLocationObservation {
-        if let builtLocationObservation {
-            return builtLocationObservation
-        }
-        let observation = EPUBLocationObservation(
-            scheduler: locatorCommandBridge.deadlineScheduler,
-            eligibility: { [weak self] in
-                self?.observationEligibility ?? .unsettled
-            },
-            documentCapability: { [weak self] in
-                self?.readiness.currentFrameCapability
-            },
-            nativeScrollOffset: { [weak self] in
-                self.map { EPUBScrollOffset(x: Double($0.scrollView.contentOffset.x), y: Double($0.scrollView.contentOffset.y)) }
-            },
-            read: { [weak self] deadline, completion in
-                guard let self else {
-                    return .frameUnavailable
-                }
-                return locatorCommandBridge.readProgression(
-                    targetHREF: viewModel.url(to: spread.first.link),
-                    deadline: deadline,
-                    completion: completion
-                )
-            },
-            reissueHandshake: { [weak self] capability in
-                self?.locatorCommandBridge.setFrameCapability(capability)
-            },
-            onAccepted: { [weak self] _ in
-                self?.observationDidAccept()
-            }
-        )
-        builtLocationObservation = observation
-        return observation
-    }
-
-    /// Read live at every decision: ready, commanded by nothing, and at rest.
-    private var observationEligibility: EPUBObservationEligibility {
-        guard
-            case let .ready(_, capability) = readiness.state,
-            activePositionCommand == nil
-        else {
-            return .unsettled
-        }
-        if scrollView.isDragging || scrollView.isDecelerating {
-            return .nativeMotion
-        }
-        return .eligible(capability)
-    }
-
     override func publicationInput() -> EPUBSpreadPublicationInput? {
         guard
             let accepted = builtLocationObservation?.currentObservation,
@@ -1021,12 +980,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             stamp: accepted.stamp,
             progressions: [spread.first.index: accepted.sample.range]
         )
-    }
-
-    private func observationDidAccept() {
-        // An equal range is reported too: pending navigator work may be
-        // waiting for it.
-        delegate?.spreadViewPagesDidChange(self)
     }
 
     override func readinessDidChange(_ state: EPUBSpreadReadiness.State) {
@@ -1060,20 +1013,6 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
 
     @objc private func scrollDidBecomeQuiet() {
         scrollDidEnd()
-    }
-
-    // MARK: - Owning scene
-
-    /// Only the scene showing this spread grants recovery when it becomes
-    /// active again; other windows and scenes are ignored.
-    @objc func sceneDidActivate(_ notification: Notification) {
-        guard
-            let scene = window?.windowScene,
-            notification.object as AnyObject? === scene
-        else {
-            return
-        }
-        locationObservation.grant(.visibility)
     }
 
     // MARK: - Scripts
@@ -1141,22 +1080,5 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         super.scrollViewDidScroll(scrollView)
         locationObservation.invalidate()
         setNeedsScrollQuietSignal()
-    }
-
-    override func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
-        super.scrollViewDidEndDragging(scrollView, willDecelerate: decelerate)
-        if !decelerate {
-            locationObservation.request()
-        }
-    }
-
-    override func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        super.scrollViewDidEndDecelerating(scrollView)
-        locationObservation.request()
-    }
-
-    override func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        super.scrollViewDidEndScrollingAnimation(scrollView)
-        locationObservation.request()
     }
 }
