@@ -36,6 +36,11 @@ set -euo pipefail
 if [[ -n "${FAKE_XCODEBUILD_ARGS:-}" ]]; then
 	printf '%s\n' "$@" >"$FAKE_XCODEBUILD_ARGS"
 fi
+if [[ -n "${FAKE_XCODEBUILD_TERM_RUNNER:-}" ]]; then
+	# The runner is this process's parent: the pipeline forks xcodebuild from test.sh itself.
+	kill -TERM "$PPID"
+	sleep 1
+fi
 if [[ "${FAKE_XCODEBUILD_STREAM:-stdout}" == stderr ]]; then
     printf '%s\n' "${FAKE_XCODEBUILD_OUTPUT:?missing fake output}" >&2
 else
@@ -47,6 +52,19 @@ EOF
 cat >"$FAKE_BIN/xcrun" <<'EOF'
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ "${1:-}" == xcresulttool ]]; then
+	case "$*" in
+	"xcresulttool get test-results summary --path "*) fixture="${FAKE_XCRESULT_SUMMARY:-summary-green}" ;;
+	"xcresulttool get test-results tests --path "*) fixture="${FAKE_XCRESULT_TESTS:-tests-default}" ;;
+	*)
+		echo "unexpected fake xcresulttool invocation: $*" >&2
+		exit 98
+		;;
+	esac
+	[[ "$fixture" != fail ]] || exit 1
+	cat "${FAKE_XCRESULT_DIR:?missing fake xcresult fixtures}/$fixture.json"
+	exit 0
+fi
 printf '%s\n' "$*" >>"${FAKE_XCRUN_LOG:?missing fake xcrun log}"
 
 if [[ "$*" == "simctl list devices available -j" ]]; then
@@ -113,6 +131,75 @@ EOF
 chmod +x "$FAKE_BIN/xcodebuild" "$FAKE_BIN/xcbeautify" "$FAKE_BIN/grep" \
 	"$FAKE_BIN/xcrun" "$FAKE_BIN/git"
 
+# Result-bundle fixtures the fake xcresulttool serves by name. The defaults are green and select
+# what the scoped CLI cases below request, so those cases keep exercising argument handling.
+XCRESULT_FIXTURES="$SCRATCH/xcresult"
+mkdir -p "$XCRESULT_FIXTURES"
+xctest_node() { # <bundle> <Suite/testName()> <result>
+	local url_tail="${2%()}"
+	printf '{"nodeType":"Test Case","name":"%s","nodeIdentifier":"%s","nodeIdentifierURL":"test://com.apple.xcode/TestApp/%s/%s","result":"%s"}' \
+		"${2##*/}" "$2" "$1" "$url_tail" "$3"
+}
+bundle_node() { # <bundle> <case json>...
+	local name="$1" cases
+	shift
+	cases="$(
+		IFS=,
+		printf '%s' "$*"
+	)"
+	printf '{"name":"%s","nodeType":"Unit test bundle","children":[%s]}' "$name" "$cases"
+}
+write_tree() { # <fixture name> <bundle json>...
+	local name="$1" bundles
+	shift
+	bundles="$(
+		IFS=,
+		printf '%s' "$*"
+	)"
+	printf '{"testNodes":[{"name":"TestApp","nodeType":"Test Plan","children":[%s]}]}\n' "$bundles" \
+		>"$XCRESULT_FIXTURES/$name.json"
+}
+printf '%s\n' '{"totalTestCount":2,"passedTests":2,"failedTests":0,"skippedTests":0}' >"$XCRESULT_FIXTURES/summary-green.json"
+printf '%s\n' '{"totalTestCount":2,"passedTests":0,"failedTests":0,"skippedTests":2}' >"$XCRESULT_FIXTURES/summary-all-skipped.json"
+printf '%s\n' '{"totalTestCount":3,"passedTests":2,"failedTests":0,"skippedTests":1}' >"$XCRESULT_FIXTURES/summary-mixed.json"
+printf '%s\n' '{"totalTestCount":0,"passedTests":0,"failedTests":0,"skippedTests":0}' >"$XCRESULT_FIXTURES/summary-zero.json"
+printf '%s\n' 'not json' >"$XCRESULT_FIXTURES/summary-bad.json"
+printf '%s\n' '{"testNodes": 5}' >"$XCRESULT_FIXTURES/tests-bad.json"
+printf '%s\n' '{"testNodes":[]}' >"$XCRESULT_FIXTURES/tests-empty.json"
+write_tree tests-default \
+	"$(bundle_node ReadiumNavigatorTests "$(xctest_node ReadiumNavigatorTests 'First/testA()' Passed)")" \
+	"$(bundle_node ReadiumSharedTests "$(xctest_node ReadiumSharedTests 'Second/testB()' Passed)")"
+write_tree tests-all-skipped \
+	"$(bundle_node ReadiumNavigatorTests \
+		"$(xctest_node ReadiumNavigatorTests 'OutcomeTests/testOne()' Skipped)" \
+		"$(xctest_node ReadiumNavigatorTests 'OutcomeTests/testTwo()' Skipped)")"
+write_tree tests-warmup \
+	"$(bundle_node ReadiumNavigatorTests \
+		"$(xctest_node ReadiumNavigatorTests 'WarmUpTests/testWarm()' Passed)" \
+		"$(xctest_node ReadiumNavigatorTests 'OutcomeTests/testTarget()' Skipped)")"
+write_tree tests-mixed \
+	"$(bundle_node ReadiumNavigatorTests \
+		"$(xctest_node ReadiumNavigatorTests 'First/testA()' Passed)" \
+		"$(xctest_node ReadiumNavigatorTests 'First/testB()' Passed)" \
+		"$(xctest_node ReadiumNavigatorTests 'First/testC()' Skipped)")"
+python3 -c 'import json, sys; [json.load(open(path)) for path in sys.argv[1:]]' \
+	"$XCRESULT_FIXTURES"/tests-{default,all-skipped,warmup,mixed}.json ||
+	fail "a result-bundle tree fixture is not valid JSON"
+mkdir -p "$SCRATCH/tmp"
+
+# The classifier's own suite, with its count asserted: a suite whose `__main__` block went missing
+# would exit 0 having run nothing. A floor, not an equality; raise it as the suite grows.
+COVERAGE_SUITE_TEST_FLOOR=31
+coverage_suite_output="$SCRATCH/coverage-suite.out"
+python3 "$SCRIPT_DIR/xcresult-coverage-tests.py" >"$coverage_suite_output" 2>&1 || {
+	cat "$coverage_suite_output" >&2
+	fail "the classifier suite failed"
+}
+coverage_ran="$(sed -n 's/^Ran \([0-9][0-9]*\) tests.*/\1/p' "$coverage_suite_output")"
+[[ "${coverage_ran:-0}" -ge "$COVERAGE_SUITE_TEST_FLOOR" ]] ||
+	fail "the classifier suite ran ${coverage_ran:-0} tests, under the floor of $COVERAGE_SUITE_TEST_FLOOR"
+echo "  PASS: classifier suite ($coverage_ran tests)"
+
 run_runner_case() {
 	local name="$1"
 	local expected_exit="$2"
@@ -132,6 +219,8 @@ run_runner_case() {
 		FAKE_XCODEBUILD_ARGS="$SCRATCH/$name.args" \
 		FAKE_XCBEAUTIFY_STATUS="$xcbeautify_exit" \
 		FAKE_GREP_STATUS="$grep_exit" \
+		FAKE_XCRESULT_DIR="$XCRESULT_FIXTURES" \
+		TMPDIR="$SCRATCH/tmp" \
 		"$RUNNER" >"$output" 2>&1; then
 		actual_exit=0
 	else
@@ -162,6 +251,8 @@ run_cli_case() {
 		"FAKE_XCODEBUILD_STREAM=stdout"
 		"FAKE_XCODEBUILD_ARGS=$args_log"
 		"FAKE_XCRUN_LOG=$xcrun_log"
+		"FAKE_XCRESULT_DIR=$XCRESULT_FIXTURES"
+		"TMPDIR=$SCRATCH/tmp"
 		"FAKE_SIMCTL_DEVICES_JSON=${CASE_SIMCTL_DEVICES_JSON:-}"
 		"FAKE_CREATED_UDID=${CASE_CREATED_UDID:-11111111-2222-3333-4444-555555555555}"
 		"FAKE_SUPERPROJECT_ROOT=${CASE_SUPERPROJECT_ROOT:-/tmp/reader-app-worktree-a}"
@@ -343,6 +434,139 @@ grep -Fq -- '--only-testing IDENTIFIER' "$SCRATCH/help exits without testing.out
 	fail "help omitted scoped-filter usage"
 [[ ! -s "$SCRATCH/help exits without testing.args" ]] ||
 	fail "help unexpectedly invoked xcodebuild"
+
+# Case I: the verdict. xcodebuild exits 0 when every selected test skipped or an identifier
+# matched nothing, so the runner reads the bundle and maps it: xcodebuild's failure first, then 75
+# for an unreadable bundle; for a scoped run whose tree holds no case, 1 when the summary agrees
+# and 75 when it does not; 1 for an unmatched identifier, 75 for a skipped-only selection (or an
+# unscoped run with nothing that did not skip), else 0.
+VERDICT_TMP="$SCRATCH/verdict-tmp"
+mkdir -p "$VERDICT_TMP"
+NO_PYTHON_BIN="$SCRATCH/no-python-bin"
+mkdir -p "$NO_PYTHON_BIN"
+printf '#!/bin/sh\nexit 127\n' >"$NO_PYTHON_BIN/python3"
+chmod +x "$NO_PYTHON_BIN/python3"
+
+run_verdict_case() {
+	local name="$1" expected_exit="$2"
+	shift 2
+	local actual_exit=0
+	local output="$SCRATCH/$name.out"
+	rm -rf "${VERDICT_TMP:?}"/*
+	if [[ -n "${CASE_STALE_BUNDLE:-}" ]]; then
+		mkdir "$VERDICT_TMP/readium-test.stale"
+		touch -t 202001010000 "$VERDICT_TMP/readium-test.stale"
+	fi
+	if env -u READIUM_TEST_RESULT_BUNDLE -u READIUM_SKIP_TESTING \
+		PATH="${CASE_PATH_PREFIX:+$CASE_PATH_PREFIX:}$FAKE_BIN:$PATH" \
+		TMPDIR="$VERDICT_TMP" \
+		READIUM_TEST_DESTINATION="platform=iOS Simulator,id=VERDICT-UDID" \
+		FAKE_XCODEBUILD_STATUS="${CASE_XCODEBUILD_STATUS:-0}" \
+		FAKE_XCODEBUILD_OUTPUT="Test Succeeded" \
+		FAKE_XCODEBUILD_ARGS="$SCRATCH/$name.args" \
+		FAKE_XCODEBUILD_TERM_RUNNER="${CASE_TERM_RUNNER:-}" \
+		FAKE_XCRESULT_DIR="$XCRESULT_FIXTURES" \
+		FAKE_XCRESULT_SUMMARY="${CASE_SUMMARY:-summary-green}" \
+		FAKE_XCRESULT_TESTS="${CASE_TESTS:-tests-default}" \
+		${CASE_RESULT_BUNDLE:+"READIUM_TEST_RESULT_BUNDLE=$CASE_RESULT_BUNDLE"} \
+		"$RUNNER" "$@" >"$output" 2>&1; then
+		actual_exit=0
+	else
+		actual_exit=$?
+	fi
+	if [[ "$actual_exit" -ne "$expected_exit" ]]; then
+		cat "$output" >&2
+		fail "$name — expected exit=$expected_exit, got $actual_exit"
+	fi
+	echo "  PASS: $name"
+}
+
+assert_output() { # <case name> <fixed string>
+	grep -Fq -- "$2" "$SCRATCH/$1.out" || {
+		cat "$SCRATCH/$1.out" >&2
+		fail "$1 — output lacks: $2"
+	}
+}
+
+refute_output() { # <case name> <fixed string>
+	if grep -Fq -- "$2" "$SCRATCH/$1.out"; then
+		cat "$SCRATCH/$1.out" >&2
+		fail "$1 — output unexpectedly holds: $2"
+	fi
+}
+
+CASE_SUMMARY=summary-all-skipped CASE_TESTS=tests-all-skipped \
+	run_verdict_case "every selected test skipped" 75 --only-testing ReadiumNavigatorTests/OutcomeTests
+assert_output "every selected test skipped" "NOT PROVEN: ReadiumNavigatorTests/OutcomeTests"
+assert_output "every selected test skipped" "ReadiumNavigatorTests/OutcomeTests/testOne()"
+assert_output "every selected test skipped" "VERDICT: NOT PROVEN (exit 75)"
+assert_output "every selected test skipped" "Executed 0 — passed 0, failed 0, skipped 2"
+assert_output "every selected test skipped" "Result bundle kept: $VERDICT_TMP/"
+[[ -z "$(find "$VERDICT_TMP" -maxdepth 1 -name 'readium-verdict.*' -print -quit)" ]] ||
+	fail "a not-proven run left its verdict scratch behind"
+
+CASE_SUMMARY=summary-mixed CASE_TESTS=tests-warmup \
+	run_verdict_case "a passing warm-up does not cover a skipped target" 75 \
+	--only-testing ReadiumNavigatorTests/WarmUpTests \
+	--only-testing ReadiumNavigatorTests/OutcomeTests/testTarget
+assert_output "a passing warm-up does not cover a skipped target" "NOT PROVEN: ReadiumNavigatorTests/OutcomeTests/testTarget"
+refute_output "a passing warm-up does not cover a skipped target" "NOT PROVEN: ReadiumNavigatorTests/WarmUpTests"
+
+CASE_SUMMARY=summary-mixed CASE_TESTS=tests-mixed \
+	run_verdict_case "passes beside skips stay green and count the skips" 0 --only-testing ReadiumNavigatorTests/First
+assert_output "passes beside skips stay green and count the skips" "Executed 2 — passed 2, failed 0, skipped 1"
+assert_output "passes beside skips stay green and count the skips" "VERDICT: PASSED"
+
+run_verdict_case "an identifier that matched nothing fails" 1 --only-testing ReadiumNavigatorTests/Typo
+assert_output "an identifier that matched nothing fails" "NO MATCH: ReadiumNavigatorTests/Typo"
+assert_output "an identifier that matched nothing fails" "VERDICT: FAILED (exit 1)"
+
+CASE_SUMMARY=summary-all-skipped CASE_TESTS=tests-all-skipped \
+	run_verdict_case "an unmatched identifier outranks a skipped one" 1 \
+	--only-testing ReadiumNavigatorTests/OutcomeTests --only-testing ReadiumNavigatorTests/Typo
+
+CASE_SUMMARY=summary-zero CASE_TESTS=tests-empty \
+	run_verdict_case "a scoped run that executed nothing fails" 1 --only-testing ReadiumNavigatorTests/Typo
+assert_output "a scoped run that executed nothing fails" "VERDICT: FAILED (exit 1)"
+
+CASE_TESTS=tests-empty \
+	run_verdict_case "an empty tree beside a positive total is not proven" 75 --only-testing ReadiumNavigatorTests/First
+assert_output "an empty tree beside a positive total is not proven" "the summary counts tests the test tree does not hold"
+refute_output "an empty tree beside a positive total is not proven" "NO MATCH:"
+
+CASE_SUMMARY=fail run_verdict_case "an unreadable summary is not proven" 75 --only-testing ReadiumNavigatorTests/First
+assert_output "an unreadable summary is not proven" "Could not read the result bundle"
+CASE_SUMMARY=summary-bad run_verdict_case "a malformed summary is not proven" 75
+CASE_TESTS=tests-bad run_verdict_case "a malformed tree is not proven" 75 --only-testing ReadiumNavigatorTests/First
+CASE_TESTS=fail run_verdict_case "a tree that cannot be read is not proven" 75 --only-testing ReadiumNavigatorTests/First
+CASE_PATH_PREFIX="$NO_PYTHON_BIN" run_verdict_case "a classifier that cannot run is not proven" 75 \
+	--only-testing ReadiumNavigatorTests/First
+
+CASE_XCODEBUILD_STATUS=65 CASE_SUMMARY=summary-all-skipped CASE_TESTS=tests-all-skipped \
+	run_verdict_case "an xcodebuild failure keeps its own status" 65 --only-testing ReadiumNavigatorTests/OutcomeTests
+
+CASE_SUMMARY=summary-all-skipped run_verdict_case "an unscoped run with nothing unskipped is not proven" 75
+assert_output "an unscoped run with nothing unskipped is not proven" "executed no test that did not skip"
+assert_output "an unscoped run with nothing unskipped is not proven" "Result bundle kept: $VERDICT_TMP/"
+[[ -n "$(find "$VERDICT_TMP" -maxdepth 1 -name 'readium-test.*' -print -quit)" ]] ||
+	fail "a not-proven run deleted its temporary result bundle"
+
+CASE_STALE_BUNDLE=1 run_verdict_case "an unscoped green run passes and prints its counts" 0
+assert_output "an unscoped green run passes and prints its counts" "Executed 2 — passed 2, failed 0, skipped 0"
+refute_output "an unscoped green run passes and prints its counts" "Result bundle kept"
+[[ -z "$(find "$VERDICT_TMP" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+	fail "a green run left its temporary result bundle or verdict scratch behind"
+grep -Eq "^$VERDICT_TMP/readium-test\.[^/]+/run\.xcresult\$" "$SCRATCH/an unscoped green run passes and prints its counts.args" ||
+	fail "a run with no caller bundle did not hand xcodebuild a temporary one"
+
+CASE_RESULT_BUNDLE="$SCRATCH/caller.xcresult" CASE_SUMMARY=summary-all-skipped \
+	run_verdict_case "a caller's bundle is the caller's" 75
+assert_arg_pair "$SCRATCH/a caller's bundle is the caller's.args" -resultBundlePath "$SCRATCH/caller.xcresult"
+refute_output "a caller's bundle is the caller's" "Result bundle kept"
+
+CASE_TERM_RUNNER=1 run_verdict_case "an interrupted run leaves no scratch behind" 143
+[[ -z "$(find "$VERDICT_TMP" -mindepth 1 -maxdepth 1 -print -quit)" ]] ||
+	fail "an interrupted run left its temporary bundle or verdict scratch behind"
 
 # Case H: the unfiltered TestApp plan structurally includes ReadiumSharedTests.
 if ! grep -Eq '"identifier"[[:space:]]*:[[:space:]]*"ReadiumSharedTests"' "$TEST_PLAN"; then

@@ -26,12 +26,14 @@
 #                             that quarantines a class is responsible for saying
 #                             so in its own output; this script does not.
 #   READIUM_TEST_RESULT_BUNDLE
-#                             Path to write the xcresult bundle to. Without it
-#                             this script's entire output on a green run is the
-#                             word "Test Succeeded" — xcbeautify --quieter plus
-#                             the filter below strip every count — so a caller
-#                             cannot tell a full run from one that executed or
-#                             skipped almost nothing. Pass this to assert counts.
+#                             Path to write the xcresult bundle to; the caller
+#                             owns it. Without it the runner writes a temporary
+#                             one, deleted on a pass and kept on any other exit.
+#
+# Exit: xcodebuild's non-zero status; 75 when the bundle cannot be read, or when
+# every test a selection chose skipped (for an unscoped run, when nothing ran
+# unskipped); 1 when an --only-testing identifier matched nothing; otherwise 0.
+# Every run prints its counts and a final VERDICT line (scripts/test-verdict.sh).
 # =============================================================================
 
 set -euo pipefail
@@ -40,6 +42,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=./scripts/test-simulator-isolation.sh
 source "$SCRIPT_DIR/test-simulator-isolation.sh"
+# shellcheck source=./scripts/test-verdict.sh
+source "$SCRIPT_DIR/test-verdict.sh"
 
 DEVICE="${SIMULATOR_NAME:-iPad (A16)}"
 DEVICE_EXPLICITLY_SET=false
@@ -110,12 +114,8 @@ for identifier in ${ONLY_TESTING+"${ONLY_TESTING[@]}"}; do
 	ARGS+=(-only-testing:"$identifier")
 done
 
-RESULT_BUNDLE="${READIUM_TEST_RESULT_BUNDLE:-}"
-if [ -n "$RESULT_BUNDLE" ]; then
-	# xcodebuild refuses to overwrite an existing bundle.
-	rm -rf "$RESULT_BUNDLE"
-	ARGS+=(-resultBundlePath "$RESULT_BUNDLE")
-fi
+readium_verdict_prepare_bundle "${READIUM_TEST_RESULT_BUNDLE:-}"
+ARGS+=(-resultBundlePath "$READIUM_VERDICT_BUNDLE")
 
 # Word-split deliberately: the variable carries a list of identifiers.
 # shellcheck disable=SC2206
@@ -144,4 +144,4 @@ else
 	status=0
 fi
 
-exit "$status"
+readium_verdict_finish "$status" ${ONLY_TESTING+"${ONLY_TESTING[@]}"}

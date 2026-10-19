@@ -128,7 +128,7 @@ A click on a link in a reflowable EPUB started a main-frame navigation, and WebK
 
 ## Upstream-rebase guidance
 
-When merging upstream `develop` into `fork-extensions`:
+The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
 
 1. Conflicts in `EPUBNavigatorViewController.swift` are most likely — the file has multiple modification points. Resolve by preserving the `VisibleAnchorObservingNavigator` conformance and the new orchestrator method.
 2. Conflicts in `EPUBReflowableSpreadView.swift` — preserve the `registerJSMessages` second registration and the `spreadDidLoad` cancellation checkpoints + anchor-tracking init block. Upstream may rework `spreadDidLoad` independently; the cancellation checkpoints are themselves a defensive improvement worth keeping even if the rest of the body changes.
