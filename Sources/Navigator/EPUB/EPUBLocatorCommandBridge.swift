@@ -434,7 +434,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     ///     deadlines; derived from `clock` unless a test supplies its own.
     ///   - invokeLocationScript: reaches WebKit for location reporting; replaced
     ///     by a test to hold a call open and complete it on demand.
-    @MainActor
     init(
         layout: EPUBLocatorFrameLayout,
         publicationBaseURL: AbsoluteURL,
@@ -519,7 +518,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
     /// Starts a new document. An outstanding location call keeps the transport
     /// until WebKit completes it; a read's answer then reports `.cancelled`.
-    @MainActor
     func beginDocument() {
         documentEpoch += 1
         currentFrameCapability = nil
@@ -531,14 +529,15 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         endHandshake(failed: false)
     }
 
-    @MainActor
     func invalidateDocument() {
         beginDocument()
     }
 
     /// Revokes the current frame capability and drops all frame registration so a
     /// delayed, reloaded, or self-navigated document can never register or be
-    /// selected as the command target after the spread is torn down.
+    /// selected as the command target after the spread is torn down. It also
+    /// ends any hand-off and closes the location transport, so a read or
+    /// injection already in flight never answers.
     ///
     /// Wired to `EPUBSpreadView.clear()` (removal, disappearance, deinit). Unlike
     /// `beginDocument()` it does not advance the command epoch: `clear()` is a
@@ -547,7 +546,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// The JavaScript side self-revokes its own copy on `pagehide` (see
     /// `reader-locator-commands.js`), covering a child self-navigation or reload
     /// the native spread load never observes.
-    @MainActor
     func revokeFrameCapability() {
         currentFrameCapability = nil
         framesByID.removeAll(keepingCapacity: true)
@@ -572,7 +570,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// capability once the slot frees, and reports an attempt that ends without
     /// a registration through `onLocationTransportEvent`. Registration, not the
     /// injection's completion, is what authorizes the frame.
-    @MainActor
     func setFrameCapability(_ capability: EPUBSpreadFrameCapability) {
         currentFrameCapability = capability
         guard let webView else {
@@ -603,7 +600,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
     }
 
-    /// Why a progression read did not start. When it does start, its
+    /// Whether a progression read started, and why not. A started read's
     /// completion receives exactly one outcome unless the spread is cleared
     /// first.
     enum ProgressionReadStart: Equatable {
@@ -622,7 +619,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     /// same-origin child holds it too), so the read runs in the frame the
     /// registry selected, and its answer counts only if the capability and that
     /// selection are both unchanged when it arrives.
-    @MainActor
     func readProgression(
         targetHREF: AnyURL,
         deadline: EPUBLocatorOperationDeadline,
@@ -665,10 +661,11 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         return started ? .started : .deadlinePassed
     }
 
-    /// Currency outranks the answer: a read that completes after its capability
-    /// or selected frame changed is `.cancelled`, whatever it says. A new
-    /// document clears the registry, so the selection check covers it too.
-    @MainActor
+    /// A read WebKit answered after its deadline is `.expired`, decided first.
+    /// Otherwise currency outranks the answer: a read that completes after its
+    /// capability or selected frame changed is `.cancelled`, whatever it says.
+    /// A new document clears the registry, so the selection check covers it
+    /// too.
     private func progressionReadOutcome(
         _ delivery: EPUBLocationTransport.Delivery,
         targetKey: String,
@@ -694,7 +691,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
     /// Replaces any earlier attempt: only the latest capability is worth
     /// injecting, and it waits for the transport if a call is outstanding.
-    @MainActor
     private func beginHandshake(for capability: EPUBSpreadFrameCapability) {
         endHandshake(failed: false)
         lastHandshakeID += 1
@@ -716,7 +712,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         startPendingHandshake()
     }
 
-    @MainActor
     private func startPendingHandshake() {
         guard
             let attempt = handshake,
@@ -754,7 +749,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
 
     /// The attempt's own deadline reports an injection that never answered, so
     /// the transport's `.expired` is not a second verdict here.
-    @MainActor
     private func handshakeInjectionDidFinish(
         _ delivery: EPUBLocationTransport.Delivery,
         attempt id: Int
@@ -768,7 +762,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         endHandshake(failed: true)
     }
 
-    @MainActor
     private func handshakeDeadlineDidPass(attempt id: Int) {
         guard handshake?.id == id else {
             return
@@ -776,7 +769,6 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         endHandshake(failed: true)
     }
 
-    @MainActor
     private func endHandshake(failed: Bool) {
         guard let attempt = handshake else {
             return

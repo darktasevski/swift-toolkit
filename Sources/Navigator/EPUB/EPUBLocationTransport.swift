@@ -114,10 +114,6 @@ final class EPUBLocationTransport {
         operation != nil
     }
 
-    var now: ContinuousClock.Instant {
-        scheduler.now()
-    }
-
     /// Starts `invocation` when the slot is free and `deadline` is still ahead,
     /// and returns whether it did. `deliver` then receives exactly one of the
     /// call's completion or `.expired` at the deadline, whichever comes first,
@@ -143,8 +139,10 @@ final class EPUBLocationTransport {
         return true
     }
 
-    /// Cancels the outstanding call's deadline and silences its callbacks. The
-    /// slot stays occupied until WebKit actually completes the call.
+    /// Cancels the outstanding call's deadline and silences its delivery and
+    /// late-completion report. The slot stays occupied until WebKit actually
+    /// completes the call, and that completion still reports the freed slot
+    /// (`onSlotFreed`, `onSlotAvailable`).
     func close() {
         guard var current = operation else {
             return

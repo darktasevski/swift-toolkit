@@ -170,7 +170,8 @@ struct EPUBAcceptedObservation: Equatable, Sendable {
 /// window. A returned transient failure gets one retry after 300 ms, within
 /// 10,300 ms of the first attempt; after that, or after a read outlives its
 /// deadline or answers with invalid provenance, observation waits unavailable,
-/// with no read timer and ignoring hints, for a grant. A hand-off that fails
+/// with no read timer and ignoring hints: a failed read for any grant, an
+/// expired one for its late completion, invalid provenance for a registration. A hand-off that fails
 /// twice waits the same way, apart from any read's reason. Physical occupancy
 /// stays the transport's: a refused start keeps the obligation until the slot
 /// frees or a frame registers.
