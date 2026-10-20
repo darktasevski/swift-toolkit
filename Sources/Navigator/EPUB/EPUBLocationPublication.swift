@@ -57,6 +57,11 @@ struct EPUBPublicationCapture {
 /// in between. A calculation that outlives its deadline keeps the slot until it
 /// actually exits: its result is discarded, and its exit lets the latest
 /// obligation run.
+///
+/// It also keeps where a rebuild starts. Wherever a calculation could start,
+/// it records the current spread's measured position, so a rebuild lands where
+/// the reader moved even while the calculation that will publish it is still
+/// running, and never behind what was published.
 @MainActor
 final class EPUBLocationPublication {
     /// How long one calculation may take before its result can no longer commit.
@@ -72,8 +77,10 @@ final class EPUBLocationPublication {
     }
 
     private let scheduler: EPUBDeadlineScheduler
+    private let position: @MainActor () -> Locator?
     private let capture: @MainActor () -> EPUBPublicationCapture?
     private let commit: @MainActor (EPUBPublicationOutput) -> Void
+    private var recordedLocation: Locator?
 
     /// Advanced by every `setIdle(false)` and `hold()`.
     private var revision: UInt64 = 0
@@ -94,17 +101,45 @@ final class EPUBLocationPublication {
     }
 
     /// - Parameters:
+    ///   - initialLocation: where a rebuild starts until a position is recorded.
+    ///   - position: where the current spread measured it shows, derived
+    ///     without suspending, or `nil` while it has no current measurement.
     ///   - capture: the current spread's inputs, or `nil` while there is no
     ///     current spread or nothing current to read.
     ///   - commit: assigns a current result.
     init(
         scheduler: EPUBDeadlineScheduler,
+        initialLocation: Locator?,
+        position: @escaping @MainActor () -> Locator?,
         capture: @escaping @MainActor () -> EPUBPublicationCapture?,
         commit: @escaping @MainActor (EPUBPublicationOutput) -> Void
     ) {
         self.scheduler = scheduler
+        recordedLocation = initialLocation
+        self.position = position
         self.capture = capture
         self.commit = commit
+    }
+
+    /// Where a rebuild starts: records the current position where a
+    /// calculation could start, then answers the last one recorded. So a
+    /// rebuild before the rebuilt spread measures anything starts where the
+    /// previous one did, and one before any measurement at the initial
+    /// location.
+    func rebuildLocation() -> Locator? {
+        recordPosition()
+        return recordedLocation
+    }
+
+    /// Only where a calculation could start: while the navigator navigates or
+    /// an operation holds publication, the current spread can show a place
+    /// that is not the result, such as a neighbour passed on the way or the
+    /// approximate hop of a locator navigation.
+    private func recordPosition() {
+        guard isIdle, holds == 0, let current = position() else {
+            return
+        }
+        recordedLocation = current
     }
 
     /// The navigator settled (`true`) or started navigating (`false`). Leaving
@@ -144,7 +179,10 @@ final class EPUBLocationPublication {
         attemptDispatch()
     }
 
+    /// Records the position first, whether or not a calculation starts, so
+    /// what a calculation publishes has always been recorded.
     private func attemptDispatch() {
+        recordPosition()
         guard hasObligation, isIdle, holds == 0, active == nil, let capture = capture() else {
             return
         }

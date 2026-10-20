@@ -780,7 +780,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // for a process-termination rebuild (spreadViewDidTerminate → reload).
         locatorNavigationTaskQueue.cancelPending()
 
-        let locator = currentLocation
+        let locator = locationPublication.rebuildLocation()
 
         guard
             let paginationView = paginationView,
@@ -865,6 +865,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// (`EPUBNavigatorViewController+LocatorCommands.swift`) can hold it.
     lazy var locationPublication = EPUBLocationPublication(
         scheduler: .clock(locatorClock),
+        // First read before any commit, since only this publication commits:
+        // the initial location.
+        initialLocation: currentLocation,
+        position: { [weak self] in (self?.paginationView?.currentView as? EPUBSpreadView)?.measuredPosition() },
         capture: { [weak self] in self?.capturePublication() },
         commit: { [weak self] in self?.commitPublication($0) }
     )
