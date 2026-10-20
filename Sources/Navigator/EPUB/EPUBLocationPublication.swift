@@ -101,7 +101,7 @@ final class EPUBLocationPublication {
     }
 
     /// - Parameters:
-    ///   - initialLocation: where a rebuild starts until a position is measured.
+    ///   - initialLocation: where a rebuild starts until a position is recorded.
     ///   - position: where the current spread measured it shows, derived
     ///     without suspending, or `nil` while it has no current measurement.
     ///   - capture: the current spread's inputs, or `nil` while there is no
@@ -121,10 +121,11 @@ final class EPUBLocationPublication {
         self.commit = commit
     }
 
-    /// Where a rebuild starts: records the current position, then answers the
-    /// last one recorded. So a rebuild before the rebuilt spread measures
-    /// anything starts where the previous one did, and one before any
-    /// measurement at the initial location.
+    /// Where a rebuild starts: records the current position where a
+    /// calculation could start, then answers the last one recorded. So a
+    /// rebuild before the rebuilt spread measures anything starts where the
+    /// previous one did, and one before any measurement at the initial
+    /// location.
     func rebuildLocation() -> Locator? {
         recordPosition()
         return recordedLocation

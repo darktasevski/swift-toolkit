@@ -51,8 +51,8 @@ private func countedScrollWrites(in webView: WKWebView, world: WKContentWorld) a
 }
 
 /// Regressions for the location a reflowable spread reports once a navigation
-/// settles, and for where a layout reload rebuilds: the position the spread
-/// last measured.
+/// settles, and for where a layout reload rebuilds: the position recorded
+/// while the navigator was at rest.
 /// The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
 /// messages all come from the production lifecycle. The progression-read tests
@@ -818,7 +818,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     /// Suspends `reader`'s locator navigations after their hop's spread is
     /// ready and before their landing starts, until the returned gate
-    /// releases. The gate holds one navigation at a time.
+    /// releases. The gate holds the first navigation that reaches it.
     private func holdLocatorNavigationsAfterTheirHop(in reader: Reader) throws -> HopGate {
         let gate = HopGate()
         reader.navigator.locatorCommandState.afterHopForTesting = { await gate.wait() }
