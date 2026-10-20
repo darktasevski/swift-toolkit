@@ -619,6 +619,93 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         )
     }
 
+    /// A reload that starts while a move's location is still unpublished
+    /// rebuilds at the page the reader moved to, and that page is what the
+    /// navigator publishes once it can (#3758). The held table of contents
+    /// keeps every calculation from committing, so nothing has been published
+    /// since the opening when the reload starts.
+    func test_aReloadBeforeAMoveIsPublishedRebuildsAtTheMovedToPage() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(minimumScreens: 4, tableOfContents: contents)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let moved = try await measuredProgressionAfterSwipingToTheMiddlePage(spread, in: reader)
+        XCTAssertEqual(reader.navigator.currentLocation?.locations.progression ?? -1, 0, "Setup: the move was published before the reload")
+
+        try await reader.reload(applying: EPUBPreferences(scroll: true), quietFor: .seconds(Self.quietWindow))
+
+        let landing = try await reader.requireVerticalGeometry()
+        XCTAssertGreaterThanOrEqual(landing.scrollHeight, 2 * landing.innerHeight, "Scroll mode opened in a layout with no second screen: \(landing)")
+        XCTAssertLessThan(landing.screenFraction, moved, "Setup: a screen reaches back to the chapter start from \(moved), so a landing there would pass")
+        XCTAssertEqual(
+            landing.firstProgression,
+            moved,
+            accuracy: landing.screenFraction,
+            "Scroll mode opened at \(landing), more than a screen from the page moved to at progression \(moved)"
+        )
+
+        let report = reader.spy.expectLocation("report of the rebuilt page") { _ in true }
+        contents.release()
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        for published in reader.spy.locationsSinceArming {
+            XCTAssertTrue(published.href.isEquivalentTo(Self.longChapterHREF.anyURL), "Published \(published.href) after the rebuild")
+            XCTAssertEqual(
+                published.locations.progression ?? -1,
+                moved,
+                accuracy: landing.screenFraction,
+                "Published progression \(published.locations.progression ?? -1) after the rebuild, more than a screen from the page moved to"
+            )
+        }
+    }
+
+    /// A second reload that starts before the first one's spread has measured
+    /// anything rebuilds where the first one did, not at the location last
+    /// published (#3758).
+    func test_aSecondReloadBeforeTheRebuiltSpreadMeasuresRebuildsWhereTheFirstDid() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(minimumScreens: 4, tableOfContents: contents)
+        let original = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let moved = try await measuredProgressionAfterSwipingToTheMiddlePage(original, in: reader)
+
+        reader.navigator.submitPreferences(EPUBPreferences(scroll: true))
+        await reader.waitForQueuedRebuilds()
+        XCTAssertFalse(reader.currentSpread === original, "Setup: the first reload did not replace the spread")
+        XCTAssertNil(
+            (reader.currentSpread as? EPUBReflowableSpreadView)?.builtLocationObservation?.currentObservation,
+            "Setup: the rebuilt spread measured before the second reload"
+        )
+        reader.navigator.submitPreferences(EPUBPreferences(scroll: false))
+        await reader.waitForQueuedRebuilds()
+
+        try await reader.waitForASpread(replacing: original, quietFor: .seconds(Self.quietWindow))
+
+        let landing = try await reader.requireGeometry()
+        XCTAssertGreaterThanOrEqual(landing.scrollWidth, 2 * landing.innerWidth, "Paged mode opened in a layout with no second page: \(landing)")
+        XCTAssertTrue(
+            landing.firstProgression <= moved + 1 / landing.scrollWidth && moved < landing.lastProgression,
+            "Paged mode opened at \(landing), a page that does not hold progression \(moved)"
+        )
+    }
+
+    /// Swipes `spread` natively to the middle page of its chapter and returns
+    /// the progression the spread measured there.
+    private func measuredProgressionAfterSwipingToTheMiddlePage(
+        _ spread: EPUBReflowableSpreadView,
+        in reader: Reader
+    ) async throws -> Double {
+        let opening = try await reader.requireGeometry()
+        let middlePage = (opening.scrollWidth / opening.innerWidth / 2).rounded(.down)
+        let scrollView = spread.scrollView
+        scrollView.setContentOffset(CGPoint(x: middlePage * scrollView.bounds.width, y: 0), animated: false)
+        spread.scrollViewDidEndDecelerating(scrollView)
+        try await reader.waitFor("the swiped-to page's measurement") {
+            (spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound ?? 0) > 0
+        }
+        return try XCTUnwrap(spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound)
+    }
+
     // MARK: - Writers
 
     /// A writer that joins a turn's generation and outlives the turn's writer
@@ -2348,7 +2435,21 @@ private struct Reader {
         // Held strongly, so the replacement cannot reuse its address.
         let previous = try XCTUnwrap(currentSpread, "Setup: no spread to replace")
         navigator.submitPreferences(preferences)
+        try await waitForASpread(replacing: previous, quietFor: window)
+    }
 
+    /// Returns once the main queue has run the rebuild a layout preference
+    /// change queues there (`setNeedsInvalidatePagination`). The rebuilt
+    /// spreads then load on their own.
+    func waitForQueuedRebuilds() async {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.main.async { continuation.resume() }
+        }
+    }
+
+    /// Waits until a spread other than `previous` has finished positioning and
+    /// its reports have gone quiet for `window`.
+    func waitForASpread(replacing previous: EPUBSpreadView, quietFor window: Duration) async throws {
         let clock = ContinuousClock()
         let deadline = clock.now.advanced(by: Self.setupTimeout)
         while clock.now < deadline {

@@ -780,7 +780,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         // for a process-termination rebuild (spreadViewDidTerminate → reload).
         locatorNavigationTaskQueue.cancelPending()
 
-        let locator = currentLocation
+        let locator = locationPublication.rebuildLocation()
 
         guard
             let paginationView = paginationView,
@@ -865,6 +865,9 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     /// (`EPUBNavigatorViewController+LocatorCommands.swift`) can hold it.
     lazy var locationPublication = EPUBLocationPublication(
         scheduler: .clock(locatorClock),
+        // Still the initial location: only this publication commits another.
+        initialLocation: currentLocation,
+        position: { [weak self] in self?.livePosition() },
         capture: { [weak self] in self?.capturePublication() },
         commit: { [weak self] in self?.commitPublication($0) }
     )
@@ -885,6 +888,25 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             stamp: input.stamp
         )
         return (key, spreadView, input)
+    }
+
+    /// Where the current spread measured it shows: its first resource at the
+    /// progression it measured there, which is all a rebuild positions by.
+    private func livePosition() -> Locator? {
+        guard let live = livePublication() else {
+            return nil
+        }
+        let index = live.spreadView.spread.readingOrderIndices.lowerBound
+        let link = readingOrder[index]
+        guard let mediaType = link.mediaType else {
+            return nil
+        }
+        let progression = live.input.progressions[index]?.lowerBound ?? 0
+        return Locator(
+            href: link.url(),
+            mediaType: mediaType,
+            locations: Locator.Locations(progression: min(max(progression, 0), 1))
+        )
     }
 
     private func capturePublication() -> EPUBPublicationCapture? {

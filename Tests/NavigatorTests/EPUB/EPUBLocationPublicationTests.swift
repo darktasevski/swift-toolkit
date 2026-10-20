@@ -233,6 +233,59 @@ final class EPUBLocationPublicationTests: XCTestCase {
         try await fixture.waitUntil { fixture.committed == ["b"] }
     }
 
+    // MARK: - Rebuild location
+
+    func test_aRebuildStartsAtTheInitialLocationUntilAPositionIsMeasured() throws {
+        let fixture = try PublicationFixture()
+
+        XCTAssertEqual(fixture.rebuildTitle, PublicationFixture.initialTitle)
+    }
+
+    /// A rebuild starts at the measured position, and one started before the
+    /// rebuilt spread measures anything starts there too.
+    func test_aRebuildStartsAtTheCurrentPositionUntilAnotherIsMeasured() throws {
+        let fixture = try PublicationFixture()
+        fixture.measure("a")
+
+        XCTAssertEqual(fixture.rebuildTitle, "a")
+        fixture.measure(nil)
+        XCTAssertEqual(fixture.rebuildTitle, "a")
+    }
+
+    /// A request records the position measured then, so a rebuild after that
+    /// measurement is revoked, as motion revokes it, still starts there.
+    func test_aRequestRecordsThePositionARebuildStartsAt() throws {
+        let fixture = try PublicationFixture()
+        fixture.measure("a")
+        fixture.publication.request()
+
+        fixture.measure(nil)
+
+        XCTAssertEqual(fixture.rebuildTitle, "a")
+    }
+
+    /// What shows while an operation holds publication is not its result: a
+    /// rebuild meanwhile starts at the position recorded before the hold, and
+    /// only the last release records the current one.
+    func test_aHoldKeepsTheRebuildLocationUntilTheLastRelease() throws {
+        let fixture = try PublicationFixture()
+        fixture.measure("before")
+        fixture.publication.request()
+        fixture.publication.hold()
+        fixture.publication.hold()
+
+        fixture.measure("hop")
+        fixture.publication.request()
+        XCTAssertEqual(fixture.rebuildTitle, "before", "A rebuild during a hold started at the held position")
+        fixture.measure("landing")
+        fixture.publication.release()
+        XCTAssertEqual(fixture.rebuildTitle, "before", "A rebuild during the remaining hold started at the held position")
+
+        fixture.publication.release()
+        fixture.measure(nil)
+        XCTAssertEqual(fixture.rebuildTitle, "landing", "The last release did not record the position")
+    }
+
     // MARK: - Deadline and actual exit
 
     /// A calculation past its deadline keeps the slot: no replacement starts
@@ -268,6 +321,8 @@ final class EPUBLocationPublicationTests: XCTestCase {
         let commits = CommitRecorder()
         var publication: EPUBLocationPublication? = EPUBLocationPublication(
             scheduler: deadlines.scheduler,
+            initialLocation: nil,
+            position: { nil },
             capture: { EPUBPublicationCapture(isCurrent: { true }, calculate: { await calculation.run() }) },
             commit: { commits.titles.append($0.locator?.title ?? "nil") }
         )
@@ -338,15 +393,21 @@ private final class Calculation {
 /// A publication whose inputs, calculations and commits the test controls.
 @MainActor
 private final class PublicationFixture {
+    static let initialTitle = "initial"
+
     let deadlines = ManualDeadlines()
     private let href: AnyURL
     /// What the navigator would capture now; `nil` while it cannot publish.
     var current: Calculation?
+    /// The position the current spread measured; `nil` while it has none.
+    private var position: Locator?
     private(set) var dispatched: [String] = []
     private(set) var committed: [String] = []
 
     lazy var publication = EPUBLocationPublication(
         scheduler: deadlines.scheduler,
+        initialLocation: Locator(href: href, mediaType: .html, title: Self.initialTitle),
+        position: { [unowned self] in position },
         capture: { [unowned self] in
             guard let calculation = current else {
                 return nil
@@ -369,6 +430,17 @@ private final class PublicationFixture {
         let calculation = Calculation(name: name, href: href)
         current = calculation
         return calculation
+    }
+
+    /// Makes the current spread's measured position the one titled `name`, or
+    /// leaves it without one.
+    func measure(_ name: String?) {
+        position = name.map { Locator(href: href, mediaType: .html, title: $0) }
+    }
+
+    /// The title of the location a rebuild would start at now.
+    var rebuildTitle: String? {
+        publication.rebuildLocation()?.title
     }
 
     func waitUntil(
