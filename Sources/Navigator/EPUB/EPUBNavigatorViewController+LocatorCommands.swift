@@ -33,6 +33,15 @@ final class EPUBLocatorCommandState {
     fileprivate var currentInFlightBridge: EPUBLocatorCommandBridge? {
         inFlightLocatorBridge
     }
+
+    // Compiled ONLY under `RENDER_FAITHFUL_NAV_TESTING` (see `Package.swift`):
+    // nothing in production suspends a navigation between its hop and its
+    // landing, so without this a test cannot reach the window a hold covers.
+    #if RENDER_FAITHFUL_NAV_TESTING
+        /// Awaited once a hop's spread is ready, before the landing takes its
+        /// position writer.
+        var afterHopForTesting: (@MainActor () async -> Void)?
+    #endif
 }
 
 /// The locator-command surface: the bridge navigation this fork added, the
@@ -212,6 +221,9 @@ extension EPUBNavigatorViewController {
             case .cancelled:
                 return .cancelled
             }
+            #if RENDER_FAITHFUL_NAV_TESTING
+                await locatorCommandState.afterHopForTesting?()
+            #endif
         }
 
         guard let writerLease = spreadView.readiness.acquirePositionWriter() else {

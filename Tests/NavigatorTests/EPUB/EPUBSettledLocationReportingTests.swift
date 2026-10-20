@@ -706,6 +706,80 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return try XCTUnwrap(spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound)
     }
 
+    // MARK: - Locator navigation into another resource
+
+    /// The navigator settles at a hop into another resource, and the hopped-to
+    /// spread measures where the hop placed it, but that placement is only
+    /// approximate: nothing is published until the landing ends, and the
+    /// landing is what is published (#3749).
+    func test_aNavigationIntoAnotherResourcePublishesNothingBetweenItsHopAndItsLanding() async throws {
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1)
+        let gate = try holdLocatorNavigationsAfterTheirHop(in: reader)
+        let early = reader.spy.expectNoLocation("a report before the landing") { _ in true }
+
+        let navigation = Task { await reader.navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false) }
+        try await waitForTheMeasuredHop(held: gate, in: reader)
+        await fulfillment(of: [early], timeout: Self.quietWindow)
+
+        let landing = reader.spy.expectLocation("report of the landing") {
+            $0.href.isEquivalentTo(Self.longChapterHREF.anyURL) && ($0.locations.progression ?? 0) > 0.3
+        }
+        gate.release()
+        let outcome = await navigation.value.outcome
+        XCTAssertEqual(outcome, .landed)
+        await fulfillment(of: [landing], timeout: Self.reportTimeout)
+    }
+
+    /// A reload while a navigation into another resource is held between its
+    /// hop and its landing cancels the navigation, and rebuilds where the
+    /// reader was before it rather than at the approximate hop (#3758).
+    func test_aReloadBetweenAHopAndItsLandingRebuildsWhereTheNavigationStarted() async throws {
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1)
+        let gate = try holdLocatorNavigationsAfterTheirHop(in: reader)
+        let navigation = Task { await reader.navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false) }
+        try await waitForTheMeasuredHop(held: gate, in: reader)
+
+        try await reader.reload(applying: EPUBPreferences(scroll: true), quietFor: .seconds(Self.quietWindow))
+
+        let rebuilt = try XCTUnwrap(reader.currentSpread)
+        XCTAssertTrue(
+            rebuilt.spread.first.link.url().isEquivalentTo(Self.nextChapterHREF.anyURL),
+            "The reload rebuilt at \(rebuilt.spread.first.link.url()), the hop's resource, not where the navigation started"
+        )
+        gate.release()
+        _ = await navigation.value
+    }
+
+    /// Suspends every locator navigation of `reader` after its hop's spread is
+    /// ready and before its landing starts, until the returned gate releases.
+    private func holdLocatorNavigationsAfterTheirHop(in reader: Reader) throws -> HopGate {
+        let gate = HopGate()
+        reader.navigator.locatorCommandState.afterHopForTesting = { await gate.wait() }
+        addTeardownBlock { @MainActor in gate.release() }
+        return gate
+    }
+
+    /// Waits until a navigation from the next chapter is held after its hop,
+    /// with the navigator settled and the hopped-to spread measured: the window
+    /// in which the hop could be published.
+    private func waitForTheMeasuredHop(held gate: HopGate, in reader: Reader) async throws {
+        try await reader.waitFor("the navigation's hop") { gate.isWaiting }
+        let hopped = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        XCTAssertTrue(
+            hopped.spread.first.link.url().isEquivalentTo(Self.longChapterHREF.anyURL),
+            "Setup: the navigation hopped to \(hopped.spread.first.link.url())"
+        )
+        XCTAssertEqual(reader.navigator.paginationView?.isUserInteractionEnabled, true, "Setup: the navigator did not settle at the hop")
+        try await reader.waitFor("the hopped-to spread's measurement") {
+            hopped.builtLocationObservation?.currentObservation != nil
+        }
+    }
+
+    /// The locator command lands on an element, a quote or a DOM range, never
+    /// on a bare progression.
+    private static let middleOfTheLongChapterJSON =
+        #"{"href":"long.html","type":"text/html","locations":{"progression":0.5,"cssSelector":"p:nth-of-type(80)"}}"#
+
     // MARK: - Writers
 
     /// A writer that joins a turn's generation and outlives the turn's writer
@@ -3916,6 +3990,28 @@ private final class LocationReportSpy: EPUBNavigatorDelegate {
     }
 
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
+}
+
+/// Holds a locator navigation after its hop until the test releases it.
+@MainActor
+private final class HopGate {
+    private(set) var isWaiting = false
+    private var isReleased = false
+    private var continuation: CheckedContinuation<Void, Never>?
+
+    func wait() async {
+        guard !isReleased else {
+            return
+        }
+        isWaiting = true
+        await withCheckedContinuation { continuation = $0 }
+    }
+
+    func release() {
+        isReleased = true
+        continuation?.resume()
+        continuation = nil
+    }
 }
 
 /// A table of contents that answers only once the test releases it.
