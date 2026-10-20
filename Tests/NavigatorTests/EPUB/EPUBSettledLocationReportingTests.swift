@@ -51,7 +51,8 @@ private func countedScrollWrites(in webView: WKWebView, world: WKContentWorld) a
 }
 
 /// Regressions for the location a reflowable spread reports once a navigation
-/// settles, and for the reload a layout preference change rebuilds from it.
+/// settles, and for where a layout reload rebuilds: the position the spread
+/// last measured.
 /// The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
 /// messages all come from the production lifecycle. The progression-read tests
@@ -526,10 +527,10 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     // MARK: - Reload after a layout preference change
 
-    /// Turning scroll mode on rebuilds every spread at the location the
-    /// navigator last published. After a swipe to the middle of the chapter,
-    /// the rebuilt scroll view opens within a screen of that page, not at the
-    /// chapter start (#3230).
+    /// Turning scroll mode on rebuilds every spread at the position the
+    /// current spread last measured. After a swipe to the middle of the
+    /// chapter, the rebuilt scroll view opens within a screen of that page, not
+    /// at the chapter start (#3230).
     func test_aSwitchToScrollModeReloadsAtThePageASwipeSettledOn() async throws {
         let reader = try await openReader(minimumScreens: 4)
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
@@ -561,10 +562,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         )
     }
 
-    /// A reader reopened at a saved page must publish that page: a switch to
-    /// scroll mode without moving reloads from the publication, and the scroll
-    /// view opens within a screen of the page that was showing, not at the
-    /// chapter start (#3230).
+    /// A reader reopened at a saved page must publish that page, and a switch
+    /// to scroll mode without moving opens within a screen of the page that was
+    /// showing, not at the chapter start (#3230).
     func test_aSwitchToScrollModeRightAfterARestoreReloadsAtTheRestoredPage() async throws {
         let reader = try await openReader(progression: 0.5, minimumScreens: 4)
         let restored = try await reader.requireGeometry()
@@ -594,10 +594,10 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         )
     }
 
-    /// Turning scroll mode off rebuilds every spread at the location the
-    /// navigator last published. After a scroll to the middle of the chapter,
-    /// the rebuilt pages open on the page holding the text that was at the
-    /// top of the screen, not at the chapter start (#3230).
+    /// Turning scroll mode off rebuilds every spread at the position the
+    /// current spread last measured. After a scroll to the middle of the
+    /// chapter, the rebuilt pages open on the page holding the text that was at
+    /// the top of the screen, not at the chapter start (#3230).
     func test_aSwitchToPagedModeReloadsAtThePageHoldingTheScrolledText() async throws {
         let reader = try await openReader(minimumScreens: 1, preferences: EPUBPreferences(scroll: true))
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
@@ -625,7 +625,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// keeps every calculation from committing, so nothing has been published
     /// since the opening when the reload starts.
     func test_aReloadBeforeAMoveIsPublishedRebuildsAtTheMovedToPage() async throws {
-        let contents = HeldTableOfContents()
+        let contents = heldTableOfContents()
         let reader = try await openReader(minimumScreens: 4, tableOfContents: contents)
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
         try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
@@ -661,17 +661,19 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     /// A second reload that starts before the first one's spread has measured
     /// anything rebuilds where the first one did, not at the location last
-    /// published (#3758).
+    /// published, and that page is what the navigator publishes once it can
+    /// (#3758).
     func test_aSecondReloadBeforeTheRebuiltSpreadMeasuresRebuildsWhereTheFirstDid() async throws {
-        let contents = HeldTableOfContents()
+        let contents = heldTableOfContents()
         let reader = try await openReader(minimumScreens: 4, tableOfContents: contents)
         let original = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
         try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
         let moved = try await measuredProgressionAfterSwipingToTheMiddlePage(original, in: reader)
+        XCTAssertEqual(reader.navigator.currentLocation?.locations.progression ?? -1, 0, "Setup: the move was published before the reloads")
 
         reader.navigator.submitPreferences(EPUBPreferences(scroll: true))
         await reader.waitForQueuedRebuilds()
-        XCTAssertFalse(reader.currentSpread === original, "Setup: the first reload did not replace the spread")
+        XCTAssertFalse(reader.currentSpread === original, "Setup: the first reload did not run")
         XCTAssertNil(
             (reader.currentSpread as? EPUBReflowableSpreadView)?.builtLocationObservation?.currentObservation,
             "Setup: the rebuilt spread measured before the second reload"
@@ -687,6 +689,55 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             landing.firstProgression <= moved + 1 / landing.scrollWidth && moved < landing.lastProgression,
             "Paged mode opened at \(landing), a page that does not hold progression \(moved)"
         )
+
+        let report = reader.spy.expectLocation("report of the rebuilt page") { _ in true }
+        contents.release()
+        await fulfillment(of: [report], timeout: Self.reportTimeout)
+        try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
+        for published in reader.spy.locationsSinceArming {
+            XCTAssertTrue(
+                (published.locations.progression ?? -1) >= landing.firstProgression - 1 / landing.scrollWidth
+                    && (published.locations.progression ?? -1) < landing.lastProgression,
+                "Published progression \(published.locations.progression ?? -1) after the rebuilds, off the page at \(landing)"
+            )
+        }
+    }
+
+    /// A fixed-layout reload rebuilds at the page the reader turned to, though
+    /// no calculation has published it (#3758).
+    func test_aFixedLayoutReloadBeforeATurnIsPublishedRebuildsAtTheTurnedToPage() async throws {
+        let contents = heldTableOfContents()
+        let reader = try await openReader(layout: .fixed, minimumScreens: 0, tableOfContents: contents)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+
+        let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        try await reader.waitFor("the turned-to page, ready") {
+            guard let spread = reader.currentSpread else {
+                return false
+            }
+            return spread.spread.first.link.url().isEquivalentTo(Self.nextChapterHREF.anyURL) && spread.publicationInput() != nil
+        }
+        XCTAssertTrue(
+            reader.navigator.currentLocation?.href.isEquivalentTo(Self.longChapterHREF.anyURL) == true,
+            "Setup: the turn was published before the reload"
+        )
+
+        try await reader.reload(applying: EPUBPreferences(fit: .width), quietFor: .seconds(Self.quietWindow))
+
+        let rebuilt = try XCTUnwrap(reader.currentSpread)
+        XCTAssertTrue(
+            rebuilt.spread.first.link.url().isEquivalentTo(Self.nextChapterHREF.anyURL),
+            "The reload rebuilt at \(rebuilt.spread.first.link.url()), not the page turned to"
+        )
+    }
+
+    /// A table of contents held until the test releases it, released at
+    /// teardown whatever the test reached.
+    private func heldTableOfContents() -> HeldTableOfContents {
+        let contents = HeldTableOfContents()
+        addTeardownBlock { @MainActor in contents.release() }
+        return contents
     }
 
     /// Swipes `spread` natively to the middle page of its chapter and returns
@@ -718,8 +769,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let early = reader.spy.expectNoLocation("a report before the landing") { _ in true }
 
         let navigation = Task { await reader.navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false) }
-        try await waitForTheMeasuredHop(held: gate, in: reader)
-        await fulfillment(of: [early], timeout: Self.quietWindow)
+        try await waitForTheMeasuredHop(to: Self.longChapterHREF, held: gate, in: reader)
+        await fulfillment(of: [early], timeout: Self.heldHopWatch)
 
         let landing = reader.spy.expectLocation("report of the landing") {
             $0.href.isEquivalentTo(Self.longChapterHREF.anyURL) && ($0.locations.progression ?? 0) > 0.3
@@ -732,26 +783,42 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
     /// A reload while a navigation into another resource is held between its
     /// hop and its landing cancels the navigation, and rebuilds where the
-    /// reader was before it rather than at the approximate hop (#3758).
+    /// reader was before it: neither at the approximate hop nor at the
+    /// location last published, which the held table of contents keeps at the
+    /// chapter start (#3758).
     func test_aReloadBetweenAHopAndItsLandingRebuildsWhereTheNavigationStarted() async throws {
-        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1)
+        let contents = heldTableOfContents()
+        let reader = try await openReader(minimumScreens: 4, tableOfContents: contents)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let moved = try await measuredProgressionAfterSwipingToTheMiddlePage(spread, in: reader)
         let gate = try holdLocatorNavigationsAfterTheirHop(in: reader)
-        let navigation = Task { await reader.navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false) }
-        try await waitForTheMeasuredHop(held: gate, in: reader)
+        let navigation = Task { await reader.navigator.navigateToLocatorJSON(Self.nextChapterJSON, animated: false) }
+        try await waitForTheMeasuredHop(to: Self.nextChapterHREF, held: gate, in: reader)
 
         try await reader.reload(applying: EPUBPreferences(scroll: true), quietFor: .seconds(Self.quietWindow))
 
         let rebuilt = try XCTUnwrap(reader.currentSpread)
         XCTAssertTrue(
-            rebuilt.spread.first.link.url().isEquivalentTo(Self.nextChapterHREF.anyURL),
+            rebuilt.spread.first.link.url().isEquivalentTo(Self.longChapterHREF.anyURL),
             "The reload rebuilt at \(rebuilt.spread.first.link.url()), the hop's resource, not where the navigation started"
         )
+        let landing = try await reader.requireVerticalGeometry()
+        XCTAssertLessThan(landing.screenFraction, moved, "Setup: a screen reaches back to the chapter start from \(moved), so a landing there would pass")
+        XCTAssertEqual(
+            landing.firstProgression,
+            moved,
+            accuracy: landing.screenFraction,
+            "Scroll mode opened at \(landing), more than a screen from the page the navigation started at, progression \(moved)"
+        )
         gate.release()
-        _ = await navigation.value
+        let outcome = await navigation.value.outcome
+        XCTAssertEqual(outcome, .cancelled, "The reload did not cancel the held navigation")
     }
 
-    /// Suspends every locator navigation of `reader` after its hop's spread is
-    /// ready and before its landing starts, until the returned gate releases.
+    /// Suspends `reader`'s locator navigations after their hop's spread is
+    /// ready and before their landing starts, until the returned gate
+    /// releases. The gate holds one navigation at a time.
     private func holdLocatorNavigationsAfterTheirHop(in reader: Reader) throws -> HopGate {
         let gate = HopGate()
         reader.navigator.locatorCommandState.afterHopForTesting = { await gate.wait() }
@@ -759,14 +826,14 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return gate
     }
 
-    /// Waits until a navigation from the next chapter is held after its hop,
-    /// with the navigator settled and the hopped-to spread measured: the window
-    /// in which the hop could be published.
-    private func waitForTheMeasuredHop(held gate: HopGate, in reader: Reader) async throws {
+    /// Waits until a navigation is held after its hop to `href`, with the
+    /// navigator settled and the hopped-to spread measured: the window in which
+    /// the hop could be published.
+    private func waitForTheMeasuredHop(to href: RelativeURL, held gate: HopGate, in reader: Reader) async throws {
         try await reader.waitFor("the navigation's hop") { gate.isWaiting }
         let hopped = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
         XCTAssertTrue(
-            hopped.spread.first.link.url().isEquivalentTo(Self.longChapterHREF.anyURL),
+            hopped.spread.first.link.url().isEquivalentTo(href.anyURL),
             "Setup: the navigation hopped to \(hopped.spread.first.link.url())"
         )
         XCTAssertEqual(reader.navigator.paginationView?.isUserInteractionEnabled, true, "Setup: the navigator did not settle at the hop")
@@ -775,10 +842,18 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         }
     }
 
-    /// The locator command lands on an element, a quote or a DOM range, never
-    /// on a bare progression.
+    /// How long nothing may be published while a hop is held. Unheld, the hop
+    /// would publish within a few main-actor turns of its measurement, the
+    /// table of contents having answered; holding it spends the navigation's
+    /// deadline, which the landing still needs.
+    private static let heldHopWatch: TimeInterval = 0.5
+
+    /// Locators anchored on an element, so the locator command takes its
+    /// anchored path.
     private static let middleOfTheLongChapterJSON =
         #"{"href":"long.html","type":"text/html","locations":{"progression":0.5,"cssSelector":"p:nth-of-type(80)"}}"#
+    private static let nextChapterJSON =
+        #"{"href":"next.html","type":"text/html","locations":{"progression":0,"cssSelector":"p"}}"#
 
     // MARK: - Writers
 
@@ -3992,7 +4067,7 @@ private final class LocationReportSpy: EPUBNavigatorDelegate {
     func navigator(_ navigator: Navigator, presentError error: NavigatorError) {}
 }
 
-/// Holds a locator navigation after its hop until the test releases it.
+/// Holds one locator navigation after its hop until the test releases it.
 @MainActor
 private final class HopGate {
     private(set) var isWaiting = false
