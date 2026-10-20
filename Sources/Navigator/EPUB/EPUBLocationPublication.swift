@@ -58,9 +58,10 @@ struct EPUBPublicationCapture {
 /// actually exits: its result is discarded, and its exit lets the latest
 /// obligation run.
 ///
-/// It also keeps where a rebuild starts, which follows the current spread's
-/// measurement rather than the calculation, so a rebuild never starts from a
-/// location a calculation has yet to commit.
+/// It also keeps where a rebuild starts. Wherever a calculation could start,
+/// it records the current spread's measured position, so a rebuild lands where
+/// the reader moved even while the calculation that will publish it is still
+/// running, and never behind what was published.
 @MainActor
 final class EPUBLocationPublication {
     /// How long one calculation may take before its result can no longer commit.
@@ -120,20 +121,21 @@ final class EPUBLocationPublication {
         self.commit = commit
     }
 
-    /// Where a rebuild starts: the current spread's measured position unless
-    /// an operation holds publication, else the last one recorded. So a
-    /// rebuild before the rebuilt spread measures anything starts where the
-    /// previous one did, and one before any measurement at the initial
-    /// location.
+    /// Where a rebuild starts: records the current position, then answers the
+    /// last one recorded. So a rebuild before the rebuilt spread measures
+    /// anything starts where the previous one did, and one before any
+    /// measurement at the initial location.
     func rebuildLocation() -> Locator? {
         recordPosition()
         return recordedLocation
     }
 
-    /// Not while an operation holds publication: what shows meanwhile is not
-    /// its result.
+    /// Only where a calculation could start: while the navigator navigates or
+    /// an operation holds publication, the current spread can show a place
+    /// that is not the result, such as a neighbour passed on the way or the
+    /// approximate hop of a locator navigation.
     private func recordPosition() {
-        guard holds == 0, let current = position() else {
+        guard isIdle, holds == 0, let current = position() else {
             return
         }
         recordedLocation = current
@@ -161,25 +163,25 @@ final class EPUBLocationPublication {
         revision &+= 1
     }
 
-    /// Ends one hold; the last records the position and runs retained work.
+    /// Ends one hold; the last runs retained work.
     func release() {
         guard holds > 0 else {
             return
         }
         holds -= 1
-        recordPosition()
         attemptDispatch()
     }
 
-    /// Records the position and asks for a publication, coalesced with any
-    /// already retained.
+    /// Asks for a publication, coalesced with any already retained.
     func request() {
-        recordPosition()
         hasObligation = true
         attemptDispatch()
     }
 
+    /// Records the position first, whether or not a calculation starts, so
+    /// what a calculation publishes has always been recorded.
     private func attemptDispatch() {
+        recordPosition()
         guard hasObligation, isIdle, holds == 0, active == nil, let capture = capture() else {
             return
         }

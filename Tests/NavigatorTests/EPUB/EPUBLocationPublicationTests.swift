@@ -237,25 +237,31 @@ final class EPUBLocationPublicationTests: XCTestCase {
 
     func test_aRebuildStartsAtTheInitialLocationUntilAPositionIsMeasured() throws {
         let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
 
         XCTAssertEqual(fixture.rebuildTitle, PublicationFixture.initialTitle)
     }
 
-    /// A rebuild starts at the measured position, and one started before the
-    /// rebuilt spread measures anything starts there too.
+    /// A rebuild starts at the measured position, one started before the
+    /// rebuilt spread measures anything starts there too, and the next
+    /// measurement replaces it.
     func test_aRebuildStartsAtTheCurrentPositionUntilAnotherIsMeasured() throws {
         let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
         fixture.measure("a")
 
         XCTAssertEqual(fixture.rebuildTitle, "a")
         fixture.measure(nil)
         XCTAssertEqual(fixture.rebuildTitle, "a")
+        fixture.measure("b")
+        XCTAssertEqual(fixture.rebuildTitle, "b")
     }
 
     /// A request records the position measured then, so a rebuild after that
     /// measurement is revoked, as motion revokes it, still starts there.
     func test_aRequestRecordsThePositionARebuildStartsAt() throws {
         let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
         fixture.measure("a")
         fixture.publication.request()
 
@@ -264,11 +270,54 @@ final class EPUBLocationPublicationTests: XCTestCase {
         XCTAssertEqual(fixture.rebuildTitle, "a")
     }
 
+    /// A calculation can start with no request, when the one before it exits
+    /// stale; what it publishes is recorded too, so a rebuild never starts
+    /// behind the published location.
+    func test_aCalculationStartedWithoutARequestRecordsThePositionItPublishes() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        let a = fixture.offer("a")
+        fixture.measure("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+
+        a.isCurrent = false
+        fixture.offer("b").release()
+        fixture.measure("b")
+        a.release()
+        try await fixture.waitUntil { fixture.committed == ["b"] }
+        fixture.measure(nil)
+
+        XCTAssertEqual(fixture.rebuildTitle, "b", "A rebuild would start behind the published location")
+    }
+
+    /// While the navigator navigates, the current spread can be one it is
+    /// passing through, such as a neighbour shown before its landing: no
+    /// calculation would publish it, so it is not recorded until the navigator
+    /// settles.
+    func test_aPositionMeasuredWhileNavigatingIsRecordedOnlyOnceTheNavigatorSettles() throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.measure("before")
+        fixture.publication.request()
+        fixture.publication.setIdle(false)
+
+        fixture.measure("passing")
+        fixture.publication.request()
+        XCTAssertEqual(fixture.rebuildTitle, "before", "A rebuild while navigating started at a position measured mid-navigation")
+
+        fixture.measure("landed")
+        fixture.publication.setIdle(true)
+        fixture.measure(nil)
+        XCTAssertEqual(fixture.rebuildTitle, "landed", "Settling did not record the position")
+    }
+
     /// What shows while an operation holds publication is not its result: a
     /// rebuild meanwhile starts at the position recorded before the hold, and
     /// only the last release records the current one.
     func test_aHoldKeepsTheRebuildLocationUntilTheLastRelease() throws {
         let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
         fixture.measure("before")
         fixture.publication.request()
         fixture.publication.hold()
