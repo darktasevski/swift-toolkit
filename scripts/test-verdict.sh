@@ -104,11 +104,19 @@ PY
 	READIUM_VERDICT_WORK=""
 	[[ "$pipeline_status" -eq 0 ]] || verdict="$pipeline_status"
 
-	case "$verdict" in
-	0) echo "VERDICT: PASSED" ;;
-	75) echo "VERDICT: NOT PROVEN (exit 75) — a skipped or unread selection is not a pass." ;;
-	*) echo "VERDICT: FAILED (exit $verdict)" ;;
-	esac
+	# Only the classifier can attest uncertainty; a pipeline failure with the
+	# same numeric status must remain a failure to callers.
+	if [[ "$pipeline_status" -eq 0 && "$verdict" -eq 75 ]]; then
+		if [[ -n "${TEST_RUNNER_UNPROVEN_REPORT:-}" ]]; then
+			printf '%s\0' UNPROVEN "$READIUM_VERDICT_BUNDLE" >"$TEST_RUNNER_UNPROVEN_REPORT" || exit 74
+		fi
+		echo "VERDICT: NOT PROVEN (exit 75) — a skipped or unread selection is not a pass."
+	else
+		case "$verdict" in
+		0) echo "VERDICT: PASSED" ;;
+		*) echo "VERDICT: FAILED (exit $verdict)" ;;
+		esac
+	fi
 	if [[ -n "$READIUM_VERDICT_TEMP_DIR" ]]; then
 		if [[ "$verdict" -eq 0 ]]; then
 			rm -rf "$READIUM_VERDICT_TEMP_DIR"
