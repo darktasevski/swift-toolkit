@@ -461,6 +461,7 @@ run_verdict_case() {
 		PATH="${CASE_PATH_PREFIX:+$CASE_PATH_PREFIX:}$FAKE_BIN:$PATH" \
 		TMPDIR="$VERDICT_TMP" \
 		READIUM_TEST_DESTINATION="platform=iOS Simulator,id=VERDICT-UDID" \
+		TEST_RUNNER_UNPROVEN_REPORT="$SCRATCH/$name.unproven" \
 		FAKE_XCODEBUILD_STATUS="${CASE_XCODEBUILD_STATUS:-0}" \
 		FAKE_XCODEBUILD_OUTPUT="Test Succeeded" \
 		FAKE_XCODEBUILD_ARGS="$SCRATCH/$name.args" \
@@ -504,6 +505,15 @@ assert_output "every selected test skipped" "Executed 0 — passed 0, failed 0, 
 assert_output "every selected test skipped" "Result bundle kept: $VERDICT_TMP/"
 [[ -z "$(find "$VERDICT_TMP" -maxdepth 1 -name 'readium-verdict.*' -print -quit)" ]] ||
 	fail "a not-proven run left its verdict scratch behind"
+
+python3 - "$SCRATCH/every selected test skipped.unproven" <<'PYTEST'
+import pathlib, sys
+fields = pathlib.Path(sys.argv[1]).read_bytes().split(b'\0')
+assert len(fields) == 3 and fields[0] == b'UNPROVEN' and fields[1] and fields[2] == b''
+PYTEST
+CASE_XCODEBUILD_STATUS=75 run_verdict_case "raw command 75 is failure" 75
+assert_output "raw command 75 is failure" "VERDICT: FAILED (exit 75)"
+[[ ! -e "$SCRATCH/raw command 75 is failure.unproven" ]] || fail "raw 75 forged provenance"
 
 CASE_SUMMARY=summary-mixed CASE_TESTS=tests-warmup \
 	run_verdict_case "a passing warm-up does not cover a skipped target" 75 \
