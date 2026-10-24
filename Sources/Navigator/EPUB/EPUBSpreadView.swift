@@ -32,9 +32,11 @@ protocol EPUBSpreadViewDelegate: AnyObject {
     /// Called when the text selection changes.
     /// - Parameters:
     ///   - text: The selected text with context
+    ///   - resource: The reading-order index of the resource holding the
+    ///     selection, `nil` without one or for a resource outside the reading order
     ///   - frame: The bounding rectangle of the selection
     ///   - domRange: The DOM range for anchoring highlights (optional)
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?)
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, in resource: ReadingOrder.Index?, frame: CGRect, domRange: DOMRange?)
 
     /// Called when the pages visible in the spread changed: a reflowable
     /// spread accepted a measurement, or a fixed spread became ready.
@@ -727,7 +729,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     private func selectionDidChange(_ body: Any) {
         if body is NSNull {
             focusedResource = nil
-            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
+            delegate?.spreadView(self, selectionDidChange: nil, in: nil, frame: .zero, domRange: nil)
             return
         }
 
@@ -739,7 +741,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             var frame = CGRect(json: selection["rect"])
         else {
             focusedResource = nil
-            delegate?.spreadView(self, selectionDidChange: nil, frame: .zero, domRange: nil)
+            delegate?.spreadView(self, selectionDidChange: nil, in: nil, frame: .zero, domRange: nil)
             EPUBPageWorldLog.report(.malformedSelectionBody, withholding: body)
             return
         }
@@ -755,7 +757,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
 
         focusedResource = viewModel.readingOrder.firstIndexWithHREF(href)
         frame.origin = convertPointToNavigatorSpace(frame.origin)
-        delegate?.spreadView(self, selectionDidChange: text, frame: frame, domRange: domRange)
+        delegate?.spreadView(self, selectionDidChange: text, in: focusedResource, frame: frame, domRange: domRange)
     }
 
     /// Update webview style to userSettings.

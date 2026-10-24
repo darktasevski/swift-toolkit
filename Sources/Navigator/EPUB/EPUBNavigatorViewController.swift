@@ -410,12 +410,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         }
     }
 
-    // Not `private`: read from EPUBNavigatorViewController+LocatorCommands.swift, and
-    // `private` is file-scoped. See that file's header for why the split is worth it.
+    // Not `private`: read from EPUBNavigatorViewController+LocatorCommands.swift and
+    // EPUBNavigatorViewController+Selection.swift, and `private` is file-scoped. See the
+    // first file's header for why the split is worth it.
     let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
-    private var positionsByReadingOrder: [[Locator]] = []
+    /// Not `private`: read from EPUBNavigatorViewController+Selection.swift.
+    private(set) var positionsByReadingOrder: [[Locator]] = []
 
     private let viewModel: EPUBNavigatorViewModel
     public var publication: Publication {
@@ -648,9 +650,14 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         get async { await tableOfContentsTitleByHrefTask.value }
     }
 
-    /// Captures the publication, not `self`: a closed reader must not stay
-    /// alive until the table of contents answers, which it may never do.
-    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task { [publication] in
+    /// The table of contents titles once loaded, for a read that cannot wait
+    /// on them (EPUBNavigatorViewController+Selection.swift); `nil` before.
+    private(set) var loadedTableOfContentsTitleByHref: [AnyURL: String]?
+
+    /// Holds the publication strongly and `self` weakly: a closed reader must
+    /// not stay alive until the table of contents answers, which it may never
+    /// do.
+    private lazy var tableOfContentsTitleByHrefTask: Task<[AnyURL: String], Never> = Task { [publication, weak self] in
         func fulfill(linkList: [Link]) -> [AnyURL: String] {
             var result = [AnyURL: String]()
 
@@ -666,11 +673,12 @@ open class EPUBNavigatorViewController: InputObservableViewController,
             return result
         }
 
-        guard let toc = try? await publication.tableOfContents().get() else {
-            return [:]
+        var titles: [AnyURL: String] = [:]
+        if let toc = try? await publication.tableOfContents().get() {
+            titles = fulfill(linkList: toc)
         }
-
-        return fulfill(linkList: toc)
+        self?.loadedTableOfContentsTitleByHref = titles
+        return titles
     }
 
     /// Goes to the next or previous page in the given scroll direction.
@@ -1631,10 +1639,11 @@ extension EPUBNavigatorViewController: EPUBSpreadViewDelegate {
         delegate?.navigator(self, didActivateImageAt: url, altText: altText, caption: caption, attribution: attribution)
     }
 
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, in resource: ReadingOrder.Index?, frame: CGRect, domRange: DOMRange?) {
         guard
-            let locator = currentLocation,
-            let text = text
+            let text = text,
+            let resource = resource,
+            let locator = selectionLocation(of: resource, in: spreadView)
         else {
             viewModel.editingActions.selection = nil
             return

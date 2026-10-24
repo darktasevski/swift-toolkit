@@ -357,6 +357,14 @@ extension EPUBNavigatorViewController {
     /// Extracts a bounded visible excerpt through fixed source in the isolated
     /// content world. Publisher content is returned only to the local caller.
     public func extractVisibleText(maximumLength: Int) async -> String? {
+        await extractVisibleExcerpt(maximumLength: maximumLength)?.text
+    }
+
+    /// The bounded visible excerpt of the showing spread's first resource,
+    /// with that resource, so a caller can tell whether it is the resource
+    /// `currentLocation` names: the published location lags a move whose
+    /// calculation has not committed yet.
+    public func extractVisibleExcerpt(maximumLength: Int) async -> EPUBVisibleTextExcerpt? {
         guard
             let paginationView,
             let spreadView = paginationView.currentView as? EPUBSpreadView,
@@ -364,15 +372,16 @@ extension EPUBNavigatorViewController {
         else {
             return nil
         }
-        let targetHREF = currentLocation?.href ?? spreadView.spread.first.link.url()
-        return await spreadView.locatorCommandBridge.visibleText(
-            targetHREF: targetHREF,
+        let href = spreadView.spread.first.link.url()
+        let text = await spreadView.locatorCommandBridge.visibleText(
+            targetHREF: href,
             maximumLength: maximumLength,
             deadline: EPUBLocatorOperationDeadline(
                 startingAt: locatorClock.now(),
                 budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
             )
         )
+        return text.map { EPUBVisibleTextExcerpt(href: href, text: $0) }
     }
 
     private enum ReadySpreadWaitResult {

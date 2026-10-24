@@ -121,6 +121,37 @@ final class EPUBLocationTransportTests: XCTestCase {
         XCTAssertEqual(caller.log, ["slotFreed", "completed"], "The caller's next call took the slot")
     }
 
+    /// A completion WebKit repeats after its call finished belongs to that
+    /// call, never to the call that took its slot.
+    func test_aRepeatedCompletionLeavesTheNextCallOutstanding() {
+        let fixture = TransportFixture()
+        fixture.start()
+        fixture.calls.complete(0, with: .success("answer"))
+        fixture.start()
+
+        fixture.calls.complete(0, with: .success("repeated answer"))
+
+        XCTAssertEqual(fixture.log, ["slotFreed", "completed", "slotAvailable"], "The repeated completion completed the next call")
+        XCTAssertTrue(fixture.transport.isOccupied, "The repeated completion freed the next call's slot")
+    }
+
+    /// A finished call's deadline that still fires, as one whose cancellation
+    /// lost the race with its sleep can, does not expire the next call.
+    func test_aFinishedCallsDeadlineLeavesTheNextCallWaiting() {
+        let deadlines = ManualDeadlines()
+        let fixture = TransportFixture(deadlines: deadlines, scheduler: deadlines.uncancellableScheduler)
+        fixture.start()
+        fixture.calls.complete(0, with: .success("answer"))
+        deadlines.advance(by: .seconds(1))
+        fixture.start()
+
+        deadlines.advance(by: fixture.budget - .seconds(1))
+
+        XCTAssertEqual(fixture.log, ["slotFreed", "completed", "slotAvailable"], "The finished call's deadline expired the next call")
+        deadlines.advance(by: .seconds(1))
+        XCTAssertEqual(fixture.log.last, "expired", "The next call never expired at its own deadline")
+    }
+
     func test_aSpentDeadlineStartsNothing() {
         let fixture = TransportFixture()
         let spent = EPUBLocatorOperationDeadline(startingAt: fixture.deadlines.now, budget: .zero)
@@ -328,6 +359,13 @@ final class EPUBLocationTransportTests: XCTestCase {
             }
             return answer
         }
+        // The last page of a document that ends exactly at a page boundary.
+        XCTAssertEqual(
+            EPUBProgressionReadOutcome.decoding(answer(["first": 1, "last": 1]), expecting: capability),
+            .sample(EPUBProgressionSample(capability: capability, range: 1 ... 1)),
+            "A zero-width range at the end was refused"
+        )
+
         let malformed: [(String, Any)] = [
             ("another capability", answer(["capability": UUID().uuidString])),
             ("a non-string capability", answer(["capability": 1])),
@@ -441,6 +479,18 @@ final class ManualDeadlines {
         )
     }
 
+    /// A binding whose cancellation disarms nothing, as a cancellation that
+    /// reaches a deadline's task after its sleep ended cannot.
+    var uncancellableScheduler: EPUBDeadlineScheduler {
+        EPUBDeadlineScheduler(
+            now: { self.now },
+            schedule: { instant, action in
+                _ = self.arm(at: instant, action)
+                return EPUBScheduledDeadline(cancel: {})
+            }
+        )
+    }
+
     /// Moves time on and fires, earliest first, every deadline due by then.
     func advance(by duration: Duration) {
         now = now.advanced(by: duration)
@@ -533,14 +583,17 @@ private final class HeldCalls {
 
 @MainActor
 private final class TransportFixture {
-    let deadlines = ManualDeadlines()
+    let deadlines: ManualDeadlines
     let calls = HeldCalls()
     let transport: EPUBLocationTransport
     let budget: Duration = .seconds(5)
     var log: [String] = []
 
-    init() {
-        transport = EPUBLocationTransport(scheduler: deadlines.scheduler)
+    /// - Parameter scheduler: a binding of `deadlines`; its own by default.
+    init(deadlines: ManualDeadlines? = nil, scheduler: EPUBDeadlineScheduler? = nil) {
+        let deadlines = deadlines ?? ManualDeadlines()
+        self.deadlines = deadlines
+        transport = EPUBLocationTransport(scheduler: scheduler ?? deadlines.scheduler)
         transport.onSlotFreed = { [unowned self] in log.append("slotFreed") }
         transport.onLateCompletion = { [unowned self] in log.append("lateCompletion") }
         transport.onSlotAvailable = { [unowned self] in log.append("slotAvailable") }
@@ -573,6 +626,7 @@ final class HeldScripts {
     private struct Call {
         let script: String
         let arguments: [String: Any]
+        let frame: WKFrameInfo?
         let completion: @MainActor @Sendable (Result<Any, any Error>) -> Void
     }
 
@@ -598,13 +652,19 @@ final class HeldScripts {
     }
 
     var invocation: EPUBLocatorCommandBridge.LocationScriptInvocation {
-        { _, script, arguments, _, completion in
-            self.calls.append(Call(script: script, arguments: arguments, completion: completion))
+        { _, script, arguments, frame, completion in
+            self.calls.append(Call(script: script, arguments: arguments, frame: frame, completion: completion))
             if let answer = self.synchronousAnswer {
                 self.synchronousAnswer = nil
                 completion(answer)
             }
         }
+    }
+
+    /// The frame call `index` was asked to run in; `nil` is the main frame's
+    /// current document.
+    func frame(_ index: Int) -> WKFrameInfo? {
+        calls.indices.contains(index) ? calls[index].frame : nil
     }
 
     func complete(_ index: Int, with result: Result<Any, any Error>) {

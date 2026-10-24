@@ -21,10 +21,51 @@ final class EPUBSpreadViewCommandOutcomeTests: XCTestCase {
         spread.delegate = navigator
         spread.scrollViewWillBeginDragging(spread.scrollView)
         XCTAssertEqual(delegate.inputs, 1)
-        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), frame: .zero, domRange: nil)
+        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), in: 0, frame: .zero, domRange: nil)
         XCTAssertNotNil(navigator.currentSelection)
         spread.scrollViewWillBeginDragging(spread.scrollView)
         XCTAssertEqual(delegate.inputs, 1, "Selection dragging must not admit navigation")
+    }
+
+    /// A spread that has measured nothing yet, as one mid-reflow, leaves a
+    /// selection in its resource to the published location of that resource.
+    func testASelectionBeforeAnyMeasurementLocatesThePublishedLocation() throws {
+        let fixture = makeFixture(layout: .reflowable)
+        let locator = Locator(
+            href: RelativeURL(path: "chapter.html")!.anyURL,
+            mediaType: .html,
+            locations: Locator.Locations(progression: 0.5)
+        )
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: locator)
+        let spread = makeReflowableSpreadView()
+        XCTAssertNil(spread.measuredPosition(), "Setup: the spread measured a position")
+
+        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), in: 0, frame: .zero, domRange: nil)
+
+        let selection = try XCTUnwrap(navigator.currentSelection, "The selection was dropped")
+        XCTAssertTrue(selection.locator.href.isEquivalentTo(locator.href))
+        XCTAssertEqual(selection.locator.locations.progression, 0.5)
+    }
+
+    /// A spread that has measured nothing, while the published location names
+    /// another resource, keeps the selection and locates its own resource
+    /// without a progression.
+    func testASelectionBeforeAnyMeasurementWhileAnotherResourceIsPublishedLocatesItsResource() throws {
+        let fixture = makeFixture(layout: .reflowable, double: true)
+        let facing = Locator(
+            href: RelativeURL(path: "facing.html")!.anyURL,
+            mediaType: .html,
+            locations: Locator.Locations(progression: 0.5)
+        )
+        let navigator = try EPUBNavigatorViewController(publication: fixture.viewModel.publication, initialLocation: facing)
+        let spread = makeReflowableSpreadView()
+        XCTAssertNil(spread.measuredPosition(), "Setup: the spread measured a position")
+
+        navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "selected"), in: 0, frame: .zero, domRange: nil)
+
+        let selection = try XCTUnwrap(navigator.currentSelection, "The selection was dropped")
+        XCTAssertTrue(selection.locator.href.isEquivalentTo(RelativeURL(path: "chapter.html")!.anyURL), "The selection locates \(selection.locator.href)")
+        XCTAssertNil(selection.locator.locations.progression)
     }
 
     func testVoiceOverPageScrollAdmitsBeforeTurningPages() throws {
@@ -1758,7 +1799,7 @@ private final class TestSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadView(_ spreadView: EPUBSpreadView, didTapOnInternalLink href: String, clickEvent: ClickEvent?) {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?) {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {}
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, in resource: ReadingOrder.Index?, frame: CGRect, domRange: DOMRange?) {}
     var pageChanges = 0
     /// The first resource's published range at each page change, in order;
     /// `nil` when the spread had nothing to publish.

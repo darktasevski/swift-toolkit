@@ -423,8 +423,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
     private var handshake: HandshakeAttempt?
     private var lastHandshakeID = 0
 
-    /// Called after a frame registering under the current capability becomes
-    /// the selected one.
+    /// Called after each registration under the current capability that
+    /// leaves its frame the one commands and reads select, a repeated one
+    /// included, once the hand-off that issued that capability has ended.
     var onFrameRegistered: (@MainActor (EPUBSpreadFrameCapability) -> Void)?
     /// Called with the location transport's closed, content-free outcomes.
     var onLocationTransportEvent: (@MainActor (EPUBLocationTransportEvent) -> Void)?
@@ -516,8 +517,11 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         isMessageHandlerEnabled = false
     }
 
-    /// Starts a new document. An outstanding location call keeps the transport
-    /// until WebKit completes it; a read's answer then reports `.cancelled`.
+    /// Starts a new document: forgets the capability and every registered
+    /// frame, and ends a pending hand-off without a verdict. An outstanding
+    /// location call keeps the transport until WebKit completes it, and its
+    /// deadline still runs: a read reports `.expired` if that passes before
+    /// the answer, and `.cancelled` otherwise.
     func beginDocument() {
         documentEpoch += 1
         currentFrameCapability = nil
@@ -612,8 +616,11 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         case deadlinePassed
     }
 
-    /// Reads the viewport of the reflowable main frame registered under the
-    /// current capability, in that frame and the locator command world.
+    /// Reads the viewport of the frame the registry selects under the current
+    /// capability, in that frame and the locator command world. Only a
+    /// reflowable spread reads its location this way, and there that frame is
+    /// the main frame; nothing here checks the layout, and a fixed layout
+    /// would select its resource's child frame.
     ///
     /// The capability alone does not identify the resource frame (a direct
     /// same-origin child holds it too), so the read runs in the frame the
