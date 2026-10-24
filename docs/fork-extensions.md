@@ -126,6 +126,108 @@ A click on a link in a reflowable EPUB started a main-frame navigation, and WebK
 | `Tests/NavigatorTests/EPUB/EPUBPageWorldLogTests.swift` | The new reason joins the level table and the warning-floor count. The log-interpolation scan covers every `*SpreadView*.swift` source, listed from the directory, so both `EPUBSpreadView+*.swift` extensions are in it. |
 | `Tests/NavigatorTests/EPUB/EPUBSpreadViewCommandOutcomeTests.swift` | Calls the shared helpers instead of its private copies. |
 
+## Locator command bridge and render readiness (ADR-0168, ADR-0152)
+
+The host app lands citations, search results and stored locators precisely, and indexes EPUB text against the rendered DOM. Both need two things upstream does not have: one readiness authority per spread, whose per-document frame capability (not a render generation) says whether a step still acts on the same document, and a locator command surface that runs in an isolated content world, so a publication script can neither call it nor forge its answers. Upstream lands a locator by page-world `evaluateJavaScript` and reports no outcome. Here a navigation spends one absolute deadline across every rung, answers a typed outcome (`.landed` only when visibly landed, `.cancelled` when superseded), and binds a receipt to the world it landed in. Design records: [ADR-0168](../../docs/ADR/0168-render-faithful-epub-index-locator.md) and [ADR-0152](../../docs/ADR/0152-typed-citation-location.md) in the host repository; the operational laws are its [`docs/architecture/epub-render-readiness.md`](../../docs/architecture/epub-render-readiness.md) §§ 1–7.
+
+This is the part of the fork that cannot become additive: readiness is stored state on upstream's spread views and `PaginationView`. Treat it as permanently divergent.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBSpreadReadiness.swift` | `EPUBSpreadReadiness`, the one readiness authority per spread (initializing, ready, failed; position and decoration writers; command readiness), and `EPUBSpreadFrameCapability`, the opaque per-document token. | No — it is the readiness model. |
+| `Sources/Navigator/EPUB/EPUBInitializationStabilityBudget.swift`, `EPUBInitializationStabilityInheritance.swift` | One stabilization budget per spread, and the active locator operation a cross-resource hop publishes so the target spread spends what is left of it instead of a fresh allowance. | No. |
+| `Sources/Navigator/EPUB/EPUBLocatorCommandBridge.swift` | The isolated-world bridge: the content world, the capability hand-off, the frame registry that selects which frame a command or read runs in, and the commands themselves (locator navigation, progression jump, text uniqueness, decoration items). | No. |
+| `Sources/Navigator/EPUB/EPUBLocatorCommandDecoder.swift` | Typed, fail-closed decoding of every command answer. | No. |
+| `Sources/Navigator/EPUB/EPUBLocatorCommandReceipt.swift` | `EPUBLocatorCommandReceipt` (public) and `EPUBLocatorNavigationResult`: the world a landing bound, which later steps revalidate. | No. |
+| `Sources/Navigator/EPUB/EPUBLocatorCommandWatchdog.swift`, `EPUBLocatorOperationDeadline.swift`, `EPUBMonotonicClock.swift` | The single absolute deadline per navigation, the monotonic clock it is read on, and the watchdog that bounds a `callAsyncJavaScript` WebKit may never resume. | No. |
+| `Sources/Navigator/EPUB/EPUBLocatorNavigationTaskQueue.swift` | Latest-request-wins locator navigation without overlapping the navigator's state machine. | No. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController+LocatorCommands.swift` | The navigator's additive command surface: bridge navigation, receipts, readiness waits, and the visible-text reads (`extractVisibleText(maximumLength:)`, `extractVisibleExcerpt(maximumLength:)`). Its `EPUBLocatorCommandState.afterHopForTesting` and the await on it are compiled only under `RENDER_FAITHFUL_NAV_TESTING`. | No. |
+| `Sources/Navigator/EPUB/EPUBDecorationWriteGate.swift`, `DiffableDecoration+CommandItems.swift`, `Sources/Navigator/Decorator/DecorationApplyTaskQueue.swift` | Decorations go to the isolated world as typed command items, keyed on the frame capability, one apply at a time. | No — the host app bans the page-world path upstream uses. |
+| `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | Built into `readium-reader-locator-commands.js`. The frozen `readerLocatorCommands` object: capability acceptance (`acceptFrameCapability`, called natively) and a `pagehide` revocation that counts only a browser-dispatched event, locator and progression navigation, the progression read, frame waits that answer `cancelled` when superseded. Native registration, which accepts only the current capability, is what keeps a page script's forged capability out. | No. |
+| `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reader-locator-commands.js`, `readium-reader-locator-commands.js.map` | The committed command bundle and its source map, re-emitted by `pnpm run bundle`; the parent's bridge gate reads the map to prove the bundle carries no `utils.js`. | No (build artifacts). |
+| `Sources/Navigator/EPUB/Scripts/src/native-log.js` | The native `log` without `utils.js`, so the isolated bundle installs none of `utils.js`'s page-world listeners. | Yes. |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBSpreadView.swift` | Stored readiness, capability and command bridge; installs and enables the bridge with the configuration. | No. |
+| `Sources/Navigator/EPUB/EPUBReflowableSpreadView.swift`, `EPUBFixedSpreadView.swift` | Readiness phases around load, stylesheet and font settle, position commands as writers, and the hand-off to the bridge. The reflowable file also holds `EPUBScrollAnimationCoordinator`. | No. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController.swift` | Stored locator command state and the navigation queue; `go(to:options:)` answers through the typed `goToLocator(_:options:)`. The rest is in `+LocatorCommands.swift`, at the cost of some members widened from `private`. | No. |
+| `Sources/Navigator/Toolkit/PaginationView.swift` | Load generations and page-command continuation registries; `PageCommandOutcome`; `acknowledgeCommandSupersession()`. | No. |
+| `Sources/Navigator/Decorator/DiffableDecoration.swift` | `DecorationApplyTransaction`. `DiffableDecoration+HTML.swift` is deleted. | No. |
+| `Sources/Navigator/EPUB/Scripts/src/rect.js` | Takes `log` from `native-log.js`. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/webpack.config.js` | One entry, `reader-locator-commands`. | No. |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadReadinessTests.swift` | Readiness transitions, writers, generation non-regression, capability identity. |
+| `Tests/NavigatorTests/EPUB/EPUBLocatorFrameRegistryTests.swift` | Registration binds to the capability: an old document, a same-URL reload or a nested frame cannot register. |
+| `Tests/NavigatorTests/EPUB/EPUBLocatorCommandDecoderTests.swift`, `EPUBLocatorCommandReceiptTests.swift`, `EPUBLocatorCommandWatchdogTests.swift`, `EPUBLocatorOperationDeadlineTests.swift`, `EPUBLocatorNavigationTaskQueueTests.swift` | Decoding, receipt currency, the watchdog bound, the one-deadline arithmetic, latest-request-wins. |
+| `Tests/NavigatorTests/EPUB/EPUBInitializationStabilityBudgetTests.swift`, `EPUBInitializationStabilityInheritanceTests.swift` | One budget per spread; a hop's target spends the operation's remainder. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewCommandOutcomeTests.swift`, `EPUBNavigatorPageCommandOutcomeTests.swift`, `EPUBNavigatorLocatorStateOwnershipTests.swift` | Typed outcomes from real spread views and the navigator; who owns the locator state. |
+| `Tests/NavigatorTests/EPUB/EPUBDecorationWriteGateTests.swift`, `Tests/NavigatorTests/Decorator/DecorationApplyTransactionTests.swift` | Decoration writes resolve one document per spread and apply as one transaction. |
+| `Tests/NavigatorTests/EPUB/EPUBLocatorDecorationActivationTests.swift` | A decoration activation message is accepted only with a matching identity, an id in the activated set, the expected keys and finite, in-range geometry. |
+| `Tests/NavigatorTests/Toolkit/PaginationViewCurrentPageTests.swift` | Page-command continuations across load generations. |
+
+## Settled location reporting (#3226)
+
+Upstream's reflowable spread caches the first and last numbers the page world posts in `progressionChanged` and reports them through `navigator(_:locationDidChange:)`. A message dropped while the spread is busy loses the measurement, any publication script can post the same message, and the navigator assigns its location after suspending for table-of-contents metadata without checking what it computed is still showing. The fork reports a progression measured where the spread settled: the page-world message only asks for a read, the read runs in the isolated command world under the frame capability, one physical WebKit call per web view carries it, and the location commits at the spread's accepted observation and again at the navigator's current calculation. Design record: [ADR-0195](../../docs/ADR/0195-settled-epub-location-is-a-capability-bound-measurement-committed-twice.md) in the host repository; the operational laws are its [`docs/architecture/epub-render-readiness.md`](../../docs/architecture/epub-render-readiness.md) § 8.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBLocationObservation.swift` | The spread's observation scheduler: hints that only ask, one read at a time, a retained obligation, one bounded retry, explicit unavailable states and the recovery grants (`EPUBObservationGrant`). | No — it rests on the readiness model. |
+| `Sources/Navigator/EPUB/EPUBLocationTransport.swift` | The single outstanding location call per web view, a read or a capability injection; only WebKit's completion frees it. | No. |
+| `Sources/Navigator/EPUB/EPUBLocationPublication.swift` | The navigator's commit: one calculation at a time, `EPUBPublicationKey` currency, `hold()`/`release()` for a resource hop, and `rebuildLocation()`, where a spread rebuild starts. | No. |
+| `Sources/Navigator/EPUB/EPUBReflowableSpreadView+LocationObservation.swift` | When a read may start (`observationEligibility`) and the scroll and scene signals that ask for one. | No. |
+| `Sources/Navigator/EPUB/EPUBSpreadView+ScrollSettlement.swift` | The scroll view's settlement callbacks a reflowable spread overrides. | No. |
+| `Sources/Navigator/EPUB/EPUBSpreadView+MeasuredPosition.swift` | `measuredPosition()` and `measuredProgression(of:)`, the spread's measurement for a rebuild and a selection. | No. |
+| `Sources/Navigator/EPUB/EPUBUserNavigationInput.swift` | `navigatorWillBeginUserNavigation(_:)` (public delegate, empty default), forwarded from a native drag and a VoiceOver scroll, so a host can tell user input from a report. Holds only the empty defaults; the requirements and forwards are in the upstream files below. | Yes, together with those requirements and forwards. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController+Selection.swift` | `selectionLocation(of:in:)`: a selection's locator for the resource the showing spread reported. | No. |
+| `Sources/Navigator/EPUB/EPUBViewportAndLocationCalculator+Resource.swift` | `locator(ofResourceAt:progression:readingOrder:positionsByReadingOrder:title:)`, a synchronous locator for one resource. | No — only the fork's `selectionLocation(of:in:)` calls it. |
+| `Sources/Navigator/EPUB/EPUBVisibleTextExcerpt.swift` | `EPUBVisibleTextExcerpt` (public): visible text and the resource it was read from. | No — only the fork's `extractVisibleExcerpt(maximumLength:)` produces it. |
+| `Sources/Navigator/EPUB/Scripts/src/progression.js` | Pure `measureProgression()` and `progressionScrollTarget(progression)`, imported by the page-world hint and the isolated read alike. | No — the scripts are permanently divergent (the host's `docs/architecture/swift-toolkit-fork.md`). |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/EPUBReflowableSpreadView.swift` | Stored observation; `progressionDidChange` only hints; the `progression(in:)` override and its cached range are deleted, so a page-world number has nowhere to go; `publicationInput()` answers the accepted observation; the progression jump is the isolated command. | No. |
+| `Sources/Navigator/EPUB/EPUBSpreadView.swift` | The base `progression(in:)` is folded into `publicationInput()`, answered only for a ready fixed spread. `EPUBSpreadViewDelegate.spreadView(_:selectionDidChange:in:frame:domRange:)` carries the selection's reading-order index. `EPUBSpreadViewDelegate` gains the `spreadViewWillBeginUserNavigation(_:)` requirement, called first in `scrollViewWillBeginDragging`. | No. |
+| `Sources/Navigator/EPUB/EPUBFixedSpreadView.swift` | Tells its delegate its pages changed when it becomes ready. | No. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController.swift` | Stored `EPUBLocationPublication`, built with `initialLocation:` and `position:`; `capturePublication` and `commitPublication(_:)` replace `computeCurrentLocationAndViewport` and `notifyCurrentLocation`; `_reloadSpreads()` rebuilds at `locationPublication.rebuildLocation()` where upstream reads `currentLocation`; `positionsByReadingOrder` widened to `private(set)`; stored `loadedTableOfContentsTitleByHref`, written by `tableOfContentsTitleByHrefTask`, whose capture list is `[publication, weak self]`. `EPUBNavigatorDelegate` gains the public `navigatorWillBeginUserNavigation(_:)` requirement, called from the spread's forward and from `accessibilityScroll`. | The capture list is (it fixes a reader kept alive by an unanswered table of contents); the rest is not. |
+| `Sources/Navigator/Toolkit/PaginationView.swift` | `paginationViewWillBeginUserNavigation(_:)` delegate requirement (default in `EPUBUserNavigationInput.swift`). | Yes. |
+| `Sources/Navigator/EPUB/Scripts/src/utils.js` | The hint measures through `progression.js` and posts nothing for unmeasurable geometry. | No — it rests on the fork's `progression.js`. |
+| `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js` | Re-emitted bundles. | No (build artifacts). |
+
+### Modified fork files
+
+| Path | Change |
+| --- | --- |
+| `Sources/Navigator/EPUB/EPUBLocatorCommandBridge.swift` | `readProgression(targetHREF:deadline:completion:)` and `progressionReadOutcome`; `navigate(toProgression:targetHREF:animated:deadline:)`, which runs in the main frame before the document's frame registers; capability injection goes through the transport. |
+| `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | `readProgression(expectedCapability)` and `navigateProgression`; a reflowable hand-off forwards the capability to no child frame. |
+| `Sources/Navigator/EPUB/EPUBSpreadReadiness.swift` | `onStateChange`, called on every state change, which the observation listens to; the stability budget is `nonisolated`. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController+LocatorCommands.swift` | A resource hop holds publication until its landing ends; `extractVisibleExcerpt(maximumLength:)`, which `extractVisibleText(maximumLength:)` wraps. |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSettledLocationReportingTests.swift` | Real navigators and web views against a DOM oracle: page turns (LTR, RTL, animated), native scroll in paged, scroll and vertical-writing layouts, progression and element jumps, a jump into another resource, poisoned hints, reloads before a publication, during a hold and on a fixed layout, and the visible excerpt and selection locator on the showing spread. The animated turn runs in a host that never animates, and no test drives a real touch. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewCommandOutcomeTests.swift` (also listed above) | Spread-level reporting: both registration orders, a command or native scroll revoking the accepted sample, the scroll-end callbacks, `publicationInput()` for reflowable and fixed spreads, a selection before any measurement, native input forwarded before reports, and a page turn settling on the scroll-quiet signal. |
+| `Tests/NavigatorTests/EPUB/EPUBLocatorFrameRegistryTests.swift`, `EPUBSpreadReadinessTests.swift`, `Tests/NavigatorTests/Toolkit/PaginationViewCurrentPageTests.swift` (also listed above) | A reflowable main frame's re-registration replaces its handle; every readiness change is reported in order; a native drag is admitted before the page changes. |
+| `Tests/NavigatorTests/EPUB/EPUBLocationObservationTests.swift` | The scheduler's state contract: one read at a time, retained obligation, the fixed hint window, one bounded retry, unavailable states, grants. |
+| `Tests/NavigatorTests/EPUB/EPUBLocationTransportTests.swift` | One physical call per web view; a deadline that frees no slot; completions that cannot keep their owner alive. |
+| `Tests/NavigatorTests/EPUB/EPUBLocationPublicationTests.swift` | Idle gating, one calculation at a time, key currency, expiry and late exit, holds, the rebuild location. |
+| `Tests/NavigatorTests/EPUB/EPUBScrollAnimationCoordinatorTests.swift` | The animation coordinator resumes only the matching request on cancellation, a stale request or waiter cannot clear a newer one, and a superseded wait's fallback leaves the newer wait to its own timer. |
+| `Tests/NavigatorTests/EPUB/EPUBViewportAndLocationCalculatorTests.swift` (upstream file) | Adds the single-resource locator. |
+
 ## Upstream-rebase guidance
 
 The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
@@ -133,11 +235,14 @@ The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it ta
 1. Conflicts in `EPUBNavigatorViewController.swift` are most likely — the file has multiple modification points. Resolve by preserving the `VisibleAnchorObservingNavigator` conformance and the new orchestrator method.
 2. Conflicts in `EPUBReflowableSpreadView.swift` — preserve the `registerJSMessages` second registration and the `spreadDidLoad` cancellation checkpoints + anchor-tracking init block. Upstream may rework `spreadDidLoad` independently; the cancellation checkpoints are themselves a defensive improvement worth keeping even if the rest of the body changes.
 3. Conflicts in `EPUBSpreadView.swift` — preserve the new protocol method + default-impl extension.
-4. After merge, regenerate the JS bundle (`pnpm run bundle` from `Sources/Navigator/EPUB/Scripts/`) — all four `Assets/Static/scripts/*.js` files will need re-staging due to the chunk-id shift.
+4. After merge, regenerate the JS bundle (`pnpm run bundle` from `Sources/Navigator/EPUB/Scripts/`) — every committed file under `Assets/Static/scripts/`, `.js.map` included, needs re-staging due to the chunk-id shift.
 5. Run the fork-side test suite: `xcodebuild test -scheme Readium-Package -destination 'platform=iOS Simulator,name=iPhone 17' -only-testing:ReadiumNavigatorTests/EPUBReflowableSpreadViewVisibleAnchorTests` should pass 9/9.
 6. In `PDFParser.swift`, preserve the `NormalizingPDFContentIterator.Factory(wrapping:)` wrapper around the content-iterator factory; the two `Sources/Streamer/Parser/PDF/` files (`PDFTextNormalizer.swift`, `NormalizingPDFContentIterator.swift`) are fork-only — keep both. If upstream adopts a normalizing pass on `PDFResourceContentIterator` directly, the decorator + `PDFTextNormalizer` can be deleted and the host app's `DatabaseRebuilder+PDF` reuse re-pointed at upstream's symbol.
 
 7. `EPUBSpreadView.swift` keeps its empty `extension EPUBSpreadView: WKUIDelegate {}` and `webView.uiDelegate = self`; `EPUBSpreadView+LinkContextMenu.swift` relies on both. If upstream implements the context-menu delegate method itself, delete the fork's file rather than merging two implementations.
 8. Keep the bridge wiring in `EPUBSpreadView.swift` (the stored bridge, its install, and its enable and disable beside the locator bridge's) and the `external-link-activation` webpack entry, then rebuild the bundles. If upstream starts cancelling outbound clicks itself, keep one path: two would report the link twice.
+9. Readiness conflicts in the spread views, `PaginationView.swift` and `EPUBNavigatorViewController.swift` are resolved by keeping the fork's stored state and re-applying upstream's change around it, never by taking upstream's body: the readiness model is stored state on those types and has no additive form. Then rebuild the bundles; `reader-locator-commands` is its own entry.
+10. In `EPUBNavigatorViewController._reloadSpreads()`, keep `let locator = locationPublication.rebuildLocation()`. Upstream reads `currentLocation`, which lags the measurement by a calculation; taking upstream's line silently restores a rebuild at the stale location, and only `test_aReloadBeforeAMoveIsPublishedRebuildsAtTheMovedToPage`, `test_aSecondReloadBeforeTheRebuiltSpreadMeasuresRebuildsWhereTheFirstDid` and `test_aFixedLayoutReloadBeforeATurnIsPublishedRebuildsAtTheTurnedToPage` in `EPUBSettledLocationReportingTests` would catch it. They skip when the web content process does not answer, and a run with some skips still reads green, so see all three pass. Likewise keep `progressionDidChange` as a hint that reads no numbers, `utils.js` measuring through `progression.js`, and both `progression(in:)` methods deleted: the reflowable override and the base one folded into `publicationInput()`, whose `0 ... 1` a reflowable caller would read as a position.
+11. Keep the `navigatorWillBeginUserNavigation(_:)` and `spreadViewWillBeginUserNavigation(_:)` requirements on `EPUBNavigatorDelegate` and `EPUBSpreadViewDelegate`, not only their defaults in `EPUBUserNavigationInput.swift`. Without the requirement the build still compiles, the calls dispatch statically to the empty default, and a host stops hearing native and VoiceOver input.
 
 If upstream introduces a `VisibleAnchorObservingNavigator`-equivalent API, this fork's protocol can be deleted and the class conformance can switch to upstream's. The host app's `Coordinator` already speaks via `(@MainActor @Sendable (String, String) -> Void)?` closures so the wire shape is upstream-agnostic.
