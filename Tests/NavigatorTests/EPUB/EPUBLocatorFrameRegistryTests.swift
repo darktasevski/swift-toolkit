@@ -205,6 +205,63 @@ final class EPUBLocatorFrameRegistryTests: XCTestCase {
         )
     }
 
+    /// A main frame holding another capability belongs to another document:
+    /// a new registration replaces nothing of it, and each capability still
+    /// selects its own frame.
+    func test_reflowableMainFrameOfAnotherCapabilityIsNotReplaced() {
+        let previous = EPUBSpreadFrameCapability()
+        let current = EPUBSpreadFrameCapability()
+        var registry = EPUBLocatorFrameRegistry(layout: .reflowable)
+        registry.register(
+            id: "previous",
+            href: "chapter.xhtml",
+            capability: previous,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+
+        let replaced = registry.register(
+            id: "current",
+            href: "chapter.xhtml",
+            capability: current,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+
+        XCTAssertEqual(replaced, [])
+        XCTAssertEqual(
+            registry.select(href: "chapter.xhtml", capability: previous),
+            .selected("previous")
+        )
+        XCTAssertEqual(
+            registry.select(href: "chapter.xhtml", capability: current),
+            .selected("current")
+        )
+    }
+
+    /// Fixed layout never replaces a frame on registration.
+    func test_fixedLayoutReRegistrationReplacesNothing() {
+        let capability = EPUBSpreadFrameCapability()
+        var registry = EPUBLocatorFrameRegistry(layout: .fixed)
+        registry.register(
+            id: "first",
+            href: "chapter.xhtml",
+            capability: capability,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+
+        let replaced = registry.register(
+            id: "retry",
+            href: "chapter.xhtml",
+            capability: capability,
+            isMainFrame: true,
+            isSameOrigin: true
+        )
+
+        XCTAssertEqual(replaced, [])
+    }
+
     func test_repeatedReadyMessageForSameFrameDoesNotCreateDuplicate() {
         let capability = EPUBSpreadFrameCapability()
         var registry = EPUBLocatorFrameRegistry(layout: .reflowable)

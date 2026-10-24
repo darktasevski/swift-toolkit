@@ -15,7 +15,7 @@ enum EPUBSpreadViewHosting {
     struct Timeout: Error {}
 
     /// The resource both factories serve the chapter at.
-    static let chapterHREF = "chapter.html"
+    nonisolated static let chapterHREF = "chapter.html"
 
     /// A reflowable spread over a one-chapter publication whose `chapter.html` is `html`, framed as
     /// the suites that wait for a load off a window frame theirs: a web view with no size may not load.
@@ -234,7 +234,7 @@ final class RecordingSpreadDelegate: @preconcurrency EPUBSpreadViewDelegate {
     func spreadViewDidLoad(_ spreadView: EPUBSpreadView) async {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateDecoration id: Decoration.Id, inGroup group: DecorationGroup, frame: CGRect?, point: CGPoint?) {}
     func spreadView(_ spreadView: EPUBSpreadView, didActivateImageAt url: URL, altText: String?, caption: String?, attribution: String?) {}
-    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, frame: CGRect, domRange: DOMRange?) {}
+    func spreadView(_ spreadView: EPUBSpreadView, selectionDidChange text: Locator.Text?, in resource: ReadingOrder.Index?, frame: CGRect, domRange: DOMRange?) {}
     func spreadViewPagesDidChange(_ spreadView: EPUBSpreadView) {}
     func spreadView(_ spreadView: EPUBSpreadView, present viewController: UIViewController) {}
     func spreadView(_ spreadView: EPUBSpreadView, didReceive event: PointerEvent) {}
