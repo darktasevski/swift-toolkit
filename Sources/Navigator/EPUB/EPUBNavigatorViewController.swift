@@ -416,7 +416,7 @@ open class EPUBNavigatorViewController: InputObservableViewController,
     let readingOrder: [Link]
     public private(set) var currentLocation: Locator?
     private let loadPositionsByReadingOrder: () async -> ReadResult<[[Locator]]>
-    // Not `private`: read from EPUBNavigatorViewController+Selection.swift.
+    /// Not `private`: read from EPUBNavigatorViewController+Selection.swift.
     private(set) var positionsByReadingOrder: [[Locator]] = []
 
     private let viewModel: EPUBNavigatorViewModel
