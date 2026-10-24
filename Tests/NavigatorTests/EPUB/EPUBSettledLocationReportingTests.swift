@@ -51,15 +51,18 @@ private func countedScrollWrites(in webView: WKWebView, world: WKContentWorld) a
 }
 
 /// Regressions for the location a reflowable spread reports once a navigation
-/// settles, and for where a layout reload rebuilds: the position recorded
-/// while the navigator was at rest.
+/// settles, for where a layout reload rebuilds (the position recorded while
+/// the navigator was at rest), and for what the navigator reads of the
+/// showing spread before a move is published.
 /// The navigator tests host the public navigator in a key window and
 /// let it initialize on its own: readiness, frame registration and progression
 /// messages all come from the production lifecycle. The progression-read tests
 /// load documents of known geometry into a bare web view carrying the locator
-/// command script, and issue its frame capability directly; the isolation test
-/// checks that script leaves the page's layout alone. The scroll-hint tests add
-/// the page-world reflowable script to that web view and record what it posts.
+/// command script and issue its frame capability directly; the bridge tests
+/// hand the capability off through the bridge, as a spread does, and register
+/// the frame from the page's own echo. The isolation test checks that script
+/// leaves the page's layout alone. The scroll-hint tests add the page-world
+/// reflowable script to that web view and record what it posts.
 @MainActor
 final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_commandTurnReportsMeasuredProgressionWithinSameResource() async throws {
@@ -712,12 +715,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         let moved = await reader.navigator.goForward(options: NavigatorGoOptions(animated: false))
         XCTAssertTrue(moved)
-        try await reader.waitFor("the turned-to page, ready") {
-            guard let spread = reader.currentSpread else {
-                return false
-            }
-            return spread.spread.first.link.url().isEquivalentTo(Self.nextChapterHREF.anyURL) && spread.publicationInput() != nil
-        }
+        _ = try await measuredSpread(showing: Self.nextChapterHREF, in: reader)
         XCTAssertTrue(
             reader.navigator.currentLocation?.href.isEquivalentTo(Self.longChapterHREF.anyURL) == true,
             "Setup: the turn was published before the reload"
@@ -755,6 +753,178 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             (spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound ?? 0) > 0
         }
         return try XCTUnwrap(spread.builtLocationObservation?.currentObservation?.sample.range.lowerBound)
+    }
+
+    // MARK: - Reads before a move is published
+
+    /// The visible text reads the spread the reader moved into, though the
+    /// move is unpublished and the committed location still names the
+    /// resource the reader left (#3775).
+    func test_visibleTextBeforeACrossResourceMoveIsPublishedReadsTheShowingResource() async throws {
+        let (reader, _) = try await openReaderTurnedBackIntoTheLongChapterUnpublished()
+
+        let text = await reader.navigator.extractVisibleText(maximumLength: 4096)
+
+        XCTAssertTrue(
+            text?.contains("Synthetic paragraph") == true,
+            "The visible text is \(text.map { "\"\($0)\"" } ?? "nil"), not the long chapter showing"
+        )
+    }
+
+    /// A selection made before a move is published locates the resource it
+    /// was made in, at the progression the showing spread measured (#3775).
+    func test_aSelectionBeforeACrossResourceMoveIsPublishedLocatesTheShowingResource() async throws {
+        let (reader, spread) = try await openReaderTurnedBackIntoTheLongChapterUnpublished()
+        let measured = try XCTUnwrap(spread.publicationInput()?.progressions[spread.spread.first.index]?.lowerBound)
+        XCTAssertGreaterThan(measured, 0, "Setup: the turn measured the chapter start, where both chapters' progressions are 0")
+
+        let locator = try await selectLastParagraph(in: spread, of: reader)
+
+        XCTAssertTrue(locator.href.isEquivalentTo(Self.longChapterHREF.anyURL), "The selection locates \(locator.href)")
+        XCTAssertEqual(locator.locations.progression ?? -1, measured, accuracy: 0.000_001)
+        XCTAssertEqual(locator.text.highlight?.hasPrefix("Synthetic paragraph 160."), true)
+    }
+
+    /// A selection at the start of a resource the reader jumped to locates
+    /// that resource, though the unpublished location left behind sits at the
+    /// same progression in another one.
+    func test_aSelectionAtTheProgressionLeftBehindInAnotherResourceLocatesTheShowingResource() async throws {
+        let contents = heldTableOfContents()
+        let reader = try await openReader(minimumScreens: 1, tableOfContents: contents)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let target = Locator(href: Self.nextChapterHREF.anyURL, mediaType: .html, locations: Locator.Locations(progression: 0))
+        let jumped = await reader.navigator.go(to: target, options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(jumped)
+        let spread = try await measuredSpread(showing: Self.nextChapterHREF, in: reader)
+        let published = try XCTUnwrap(reader.navigator.currentLocation)
+        XCTAssertTrue(published.href.isEquivalentTo(Self.longChapterHREF.anyURL), "Setup: the jump was published")
+        XCTAssertEqual(published.locations.progression, spread.measuredPosition()?.locations.progression, "Setup: the progressions differ")
+
+        let locator = try await selectLastParagraph(in: spread, of: reader)
+
+        XCTAssertTrue(locator.href.isEquivalentTo(Self.nextChapterHREF.anyURL), "The selection locates \(locator.href)")
+        XCTAssertEqual(locator.text.highlight, "Next chapter.")
+    }
+
+    /// A selection made after a page turn within a chapter, before the turn is
+    /// published, locates the turned-to page with the position and total
+    /// progression a publication would give it.
+    func test_aSelectionBeforeATurnWithinAChapterIsPublishedLocatesTheTurnedToPage() async throws {
+        let contents = heldTableOfContents()
+        let reader = try await openReader(minimumScreens: 4, tableOfContents: contents, positioned: true)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+        let moved = try await measuredProgressionAfterSwipingToTheMiddlePage(spread, in: reader)
+        XCTAssertEqual(reader.navigator.currentLocation?.locations.progression ?? -1, 0, "Setup: the turn was published")
+
+        let locator = try await selectLastParagraph(in: spread, of: reader)
+
+        XCTAssertTrue(locator.href.isEquivalentTo(Self.longChapterHREF.anyURL), "The selection locates \(locator.href)")
+        XCTAssertEqual(locator.locations.progression ?? -1, moved, accuracy: 0.000_001)
+        XCTAssertEqual(locator.locations.position, 1)
+        XCTAssertNotNil(locator.locations.totalProgression, "The selection lacks the derived total progression")
+    }
+
+    /// A selection on the second page of a fixed-layout spread locates that
+    /// page with its own position, though the spread publishes its first page.
+    func test_aSelectionOnTheSecondPageOfAFixedLayoutSpreadLocatesThatPage() async throws {
+        let reader = try await openReader(
+            layout: .fixed,
+            minimumScreens: 0,
+            positioned: true,
+            preferences: EPUBPreferences(offsetFirstPage: false, spread: .always)
+        )
+        try await reader.waitFor("a ready two-page spread") {
+            guard let spread = reader.currentSpread else {
+                return false
+            }
+            return spread.spread.readingOrderIndices.count == 2 && spread.publicationInput() != nil
+        }
+        let spread = try XCTUnwrap(reader.currentSpread)
+        let second = spread.spread.readingOrderIndices.upperBound
+
+        reader.navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "Next chapter."), in: second, frame: .zero, domRange: nil)
+
+        let locator = try XCTUnwrap(reader.navigator.currentSelection?.locator, "The selection was dropped")
+        XCTAssertTrue(locator.href.isEquivalentTo(Self.nextChapterHREF.anyURL), "The selection locates \(locator.href)")
+        XCTAssertEqual(locator.locations.position, 2)
+        XCTAssertEqual(locator.locations.totalProgression, 0.5)
+    }
+
+    /// A selection report naming a resource the spread does not show, as a
+    /// page script can post one, is dropped rather than located there.
+    func test_aSelectionNamingAResourceTheSpreadDoesNotShowIsDropped() async throws {
+        let (reader, spread) = try await openReaderTurnedBackIntoTheLongChapterUnpublished()
+        let left = try XCTUnwrap(reader.navigator.readingOrder.firstIndexWithHREF(Self.nextChapterHREF.anyURL))
+
+        reader.navigator.spreadView(spread, selectionDidChange: Locator.Text(highlight: "Next chapter."), in: left, frame: .zero, domRange: nil)
+
+        XCTAssertNil(reader.navigator.currentSelection, "A selection was located in a resource the spread does not show")
+    }
+
+    /// A selection on the published page carries what the publication derived
+    /// for it: its title, total progression and position.
+    func test_aSelectionOnThePublishedPageCarriesThePublishedLocation() async throws {
+        let contents = HeldTableOfContents(entries: [Link(href: Self.longChapterHREF.string, title: "Long")])
+        contents.release()
+        let reader = try await openReader(minimumScreens: 1, tableOfContents: contents, positioned: true)
+        let spread = try XCTUnwrap(reader.currentSpread)
+        try await reader.waitFor("the published title") { reader.navigator.currentLocation?.title != nil }
+        let published = try XCTUnwrap(reader.navigator.currentLocation)
+        XCTAssertNotNil(published.locations.totalProgression, "Setup: nothing beyond the measurement was published")
+
+        let locator = try await selectLastParagraph(in: spread, of: reader)
+
+        XCTAssertTrue(locator.href.isEquivalentTo(published.href), "The selection locates \(locator.href)")
+        XCTAssertEqual(locator.title, published.title)
+        XCTAssertEqual(locator.locations.progression, published.locations.progression)
+        XCTAssertEqual(locator.locations.totalProgression, published.locations.totalProgression)
+        XCTAssertEqual(locator.locations.position, published.locations.position)
+    }
+
+    /// Opens on the next chapter with a held table of contents, then turns
+    /// back into the long chapter: its last page shows and is measured, while
+    /// the committed location still names the next chapter.
+    private func openReaderTurnedBackIntoTheLongChapterUnpublished() async throws -> (Reader, EPUBSpreadView) {
+        let contents = heldTableOfContents()
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1, tableOfContents: contents)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+
+        let moved = await reader.navigator.goBackward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        let spread = try await measuredSpread(showing: Self.longChapterHREF, in: reader)
+        XCTAssertTrue(
+            reader.navigator.currentLocation?.href.isEquivalentTo(Self.nextChapterHREF.anyURL) == true,
+            "Setup: the turn was published"
+        )
+        return (reader, spread)
+    }
+
+    /// Waits until the current spread shows `href`, ready and measured.
+    private func measuredSpread(showing href: RelativeURL, in reader: Reader) async throws -> EPUBSpreadView {
+        try await reader.waitFor("\(href), measured and ready") {
+            guard let spread = reader.currentSpread else {
+                return false
+            }
+            return spread.spread.first.link.url().isEquivalentTo(href.anyURL)
+                && spread.isCommandReady
+                && spread.publicationInput() != nil
+        }
+        return try XCTUnwrap(reader.currentSpread)
+    }
+
+    /// Selects the chapter's last paragraph in the page, which reports the
+    /// selection as a reader's would, and returns the locator the navigator
+    /// gives it.
+    private func selectLastParagraph(in spread: EPUBSpreadView, of reader: Reader) async throws -> Locator {
+        _ = try await spread.webView.callAsyncJavaScript(
+            "window.getSelection().selectAllChildren(document.body.lastElementChild);",
+            arguments: [:],
+            in: nil,
+            contentWorld: .defaultClient
+        )
+        try await reader.waitFor("the selection") { reader.navigator.currentSelection != nil }
+        return try XCTUnwrap(reader.navigator.currentSelection?.locator)
     }
 
     // MARK: - Locator navigation into another resource
@@ -1647,6 +1817,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     func test_progressionReadClampsFiniteOverscroll() async throws {
         let cases: [(document: ProgressionDocument, offset: String, first: Double, last: Double)] = [
             (.leftToRightPages, "1500", 5.0 / 6, 1),
+            // Past the end by more than a page: both ends clamp to 1, a
+            // zero-width range the decoder still accepts.
+            (.leftToRightPages, "2100", 1, 1),
             (.leftToRightPages, "-300", 0, 1.0 / 6),
             (.rightToLeftPages, "-1500", 5.0 / 6, 1),
             // A right-to-left start overscroll is a positive offset, before
@@ -1763,6 +1936,18 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let outcome = try await page.readThroughBridge()
 
         XCTAssertEqual(outcome, .sample(EPUBProgressionSample(capability: capability, range: (1.0 / 3) ... (2.0 / 3))))
+    }
+
+    /// The hand-off injects into whichever document holds the main frame, so
+    /// it names no frame; a read runs in the main frame that registered.
+    func test_aHandOffNamesNoFrameAndAReadRunsInTheRegisteredMainFrame() async throws {
+        let held = try await openHeldRegisteredPage()
+
+        XCTAssertEqual(try held.startRead(reportingTo: BridgeReadOutcomes()), .started)
+
+        XCTAssertNil(held.scripts.frame(0), "The hand-off named a frame")
+        let read = try XCTUnwrap(held.scripts.frame(1), "The read named no frame")
+        XCTAssertTrue(read.isMainFrame, "The read runs in a child frame")
     }
 
     /// A direct same-origin child frame that holds the capability answers a
@@ -2318,8 +2503,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// quiet signal before it gives up.
     private static let scrollAnimationFallback: Duration = .milliseconds(800)
 
-    private static let longChapterHREF = RelativeURL(path: "long.html")!
-    private static let nextChapterHREF = RelativeURL(path: "next.html")!
+    // Nonisolated: a default argument reads them outside the main actor.
+    private nonisolated static let longChapterHREF = RelativeURL(path: "long.html")!
+    private nonisolated static let nextChapterHREF = RelativeURL(path: "next.html")!
 
     private func openReader(
         at href: RelativeURL = longChapterHREF,
@@ -2327,6 +2513,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         layout: ReadiumShared.Layout = .reflowable,
         minimumScreens: Int = 3,
         tableOfContents: HeldTableOfContents? = nil,
+        positioned: Bool = false,
         preferences: EPUBPreferences = EPUBPreferences()
     ) async throws -> Reader {
         let initialLocation = Locator(
@@ -2335,7 +2522,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             locations: Locator.Locations(progression: progression)
         )
         let navigator = try EPUBNavigatorViewController(
-            publication: makePublication(layout: layout, tableOfContents: tableOfContents),
+            publication: makePublication(layout: layout, tableOfContents: tableOfContents, positioned: positioned),
             initialLocation: initialLocation,
             config: EPUBNavigatorViewController.Configuration(preferences: preferences)
         )
@@ -2474,7 +2661,13 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return held
     }
 
-    private func makePublication(layout: ReadiumShared.Layout = .reflowable, tableOfContents: HeldTableOfContents? = nil) -> Publication {
+    /// - Parameter positioned: gives every resource one position, so a
+    ///   published location carries a position and a total progression.
+    private func makePublication(
+        layout: ReadiumShared.Layout = .reflowable,
+        tableOfContents: HeldTableOfContents? = nil,
+        positioned: Bool = false
+    ) -> Publication {
         let paragraphs = (1 ... 160)
             .map { "<p>Synthetic paragraph \($0). The quick brown fox jumps over the lazy dog, again and again, to fill the page.</p>" }
             .joined()
@@ -2499,11 +2692,14 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
                     at: Self.nextChapterHREF.anyURL
                 )
             ),
-            servicesBuilder: PublicationServicesBuilder { builder in
-                if let tableOfContents {
-                    builder.setTableOfContentsServiceFactory { _ in tableOfContents }
+            servicesBuilder: PublicationServicesBuilder(
+                positions: positioned ? PerResourcePositionsService.makeFactory(fallbackMediaType: .html) : nil,
+                setup: { builder in
+                    if let tableOfContents {
+                        builder.setTableOfContentsServiceFactory { _ in tableOfContents }
+                    }
                 }
-            }
+            )
         )
     }
 }
@@ -2773,15 +2969,22 @@ private struct SetupTimeout: Error {}
 @MainActor
 private func contentProcessAnswers(_ webView: WKWebView, within timeout: Duration = .seconds(5)) async throws -> Bool {
     let answer = ScriptAnswer()
-    webView.evaluateJavaScript("1") { _, _ in
-        answer.isReceived = true
-    }
+    probe(webView, answeringTo: answer)
     let clock = ContinuousClock()
     let deadline = clock.now.advanced(by: timeout)
     while !answer.isReceived, clock.now < deadline {
         try await clock.sleep(for: .milliseconds(20))
     }
     return answer.isReceived
+}
+
+/// Not awaited: a process that stopped answering never completes an awaited
+/// call, so the caller polls `answer` against its own deadline instead.
+@MainActor
+private func probe(_ webView: WKWebView, answeringTo answer: ScriptAnswer) {
+    webView.evaluateJavaScript("1") { _, _ in
+        answer.isReceived = true
+    }
 }
 
 @MainActor
@@ -2900,14 +3103,15 @@ private enum GeometryStub: CustomStringConvertible {
 }
 
 /// A bare web view carrying the locator command script, hosted at the
-/// navigator tests' 600×800 size. Nothing here mints readiness or registers a
-/// frame: the capability is issued straight to the document under test. On
-/// request it also carries the page-world reflowable script, injected as a
-/// spread injects it, with every message that script posts recorded and none
-/// acted on.
+/// navigator tests' 600×800 size. Nothing here mints readiness. A test either
+/// issues a capability straight to the document (`acceptCapability(_:)`) or
+/// hands one off through `bridge`, which registers the frame from the page's
+/// real echo (`register(_:)`). On request it also carries the page-world
+/// reflowable script, injected as a spread injects it, with every message
+/// that script posts recorded and none acted on.
 @MainActor
 private final class ProgressionPage {
-    static let capability = "settled-location-test-capability"
+    nonisolated static let capability = "settled-location-test-capability"
     private static let frameHoldingScript = """
     globalThis.__deliverFrame = globalThis.requestAnimationFrame.bind(globalThis);
     globalThis.__heldFrames = null;
@@ -4092,6 +4296,7 @@ private final class HopGate {
 /// A table of contents that answers only once the test releases it.
 @MainActor
 private final class HeldTableOfContents: TableOfContentsService {
+    private nonisolated let entries: [Link]
     private(set) var wasAsked = false
     private var isReleased = false
     private var waiters: [CheckedContinuation<Void, Never>] = []
@@ -4104,9 +4309,14 @@ private final class HeldTableOfContents: TableOfContentsService {
         waiters = []
     }
 
+    /// - Parameter entries: what the table of contents answers once released.
+    init(entries: [Link] = []) {
+        self.entries = entries
+    }
+
     nonisolated func tableOfContents() async -> ReadResult<[Link]> {
         await waitForRelease()
-        return .success([])
+        return .success(entries)
     }
 
     private func waitForRelease() async {

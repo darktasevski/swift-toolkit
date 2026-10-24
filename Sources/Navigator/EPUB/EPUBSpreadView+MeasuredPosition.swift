@@ -12,16 +12,24 @@ extension EPUBSpreadView {
     /// measured there, or at the start of a fixed-layout resource. `nil` while
     /// the spread has nothing it could publish.
     func measuredPosition() -> Locator? {
-        guard let input = publicationInput() else {
+        let resource = spread.first
+        guard let progression = measuredProgression(of: resource.index) else {
             return nil
         }
-        let resource = spread.first
-        let progression = input.progressions[resource.index]?.lowerBound ?? 0
         return Locator(
             href: resource.link.url(),
             // A rebuild never reads the media type; a manifest item may omit it.
             mediaType: resource.link.mediaType ?? .xhtml,
-            locations: Locator.Locations(progression: min(max(progression, 0), 1))
+            locations: Locator.Locations(progression: progression)
         )
+    }
+
+    /// The progression, clamped to 0...1, at the start of what this spread
+    /// measured it shows of the resource at `index`: a reflowable spread's
+    /// measured range, or the start of a fixed-layout resource. `nil` while
+    /// the spread has nothing it could publish, or does not show that
+    /// resource.
+    func measuredProgression(of index: ReadingOrder.Index) -> Double? {
+        publicationInput()?.progressions[index].map { min(max($0.lowerBound, 0), 1) }
     }
 }

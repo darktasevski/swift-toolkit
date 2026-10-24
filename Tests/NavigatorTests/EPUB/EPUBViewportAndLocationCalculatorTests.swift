@@ -430,6 +430,52 @@ enum EPUBViewportAndLocationCalculatorTests {
             #expect(viewport.resources.first(where: { $0.href.string == ro[1].href })?.progression == 0.2 ... 0.8)
         }
     }
+
+    /// The per-resource locator a selection reads is the one a publication of
+    /// a spread starting at that resource would carry.
+    @Suite("Locator - one resource") struct ResourceLocator {
+        @Test(
+            "matches the spread calculation's locator",
+            arguments: [(0, 0.0), (0, 0.3), (0, 2.0 / 3), (1, 0.5), (1, 1.0)]
+        )
+        func matchesTheSpreadCalculation(index: Int, progression: Double) async {
+            let readingOrder = makeReadingOrder(count: 2)
+            let positions = makePositions(resourceCount: 2, positionsPerResource: 4)
+            let title = "Chapter \(index + 1)"
+            let (spreadLocator, _) = await EPUBViewportAndLocationCalculator.compute(
+                readingOrderIndices: index ... index,
+                progression: { _ in progression ... min(progression + 0.2, 1) },
+                readingOrder: readingOrder,
+                positionsByReadingOrder: positions,
+                tableOfContentsTitleByHref: [readingOrder[index].url(): title],
+                fallbackLocator: noFallback
+            )
+
+            let locator = EPUBViewportAndLocationCalculator.locator(
+                ofResourceAt: index,
+                progression: progression,
+                readingOrder: readingOrder,
+                positionsByReadingOrder: positions,
+                title: title
+            )
+
+            #expect(spreadLocator != nil)
+            #expect(locator == spreadLocator)
+        }
+
+        @Test("is absent for a resource without positions")
+        func absentWithoutPositions() {
+            let locator = EPUBViewportAndLocationCalculator.locator(
+                ofResourceAt: 0,
+                progression: 0.5,
+                readingOrder: makeReadingOrder(count: 1),
+                positionsByReadingOrder: [[]],
+                title: nil
+            )
+
+            #expect(locator == nil)
+        }
+    }
 }
 
 // MARK: - Helpers
