@@ -2548,6 +2548,31 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertFalse(commit.deadlinePassed, "The wait did not read the current spread")
     }
 
+    /// A spread whose hand-off goes missing mid-wait tells the wait through
+    /// the callback the wait installed: nothing else reaches the navigator.
+    func test_aPendingCommitWaitEndsWhenTheCurrentSpreadBlocksMidWait() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = spread.locationObservation
+        let capability = try XCTUnwrap(spread.readiness.currentFrameCapability)
+        reader.navigator.locationPublication.hold()
+        defer { reader.navigator.locationPublication.release() }
+        let result = PendingCommitResult()
+        let wait = Task { @MainActor in
+            result.commit = await reader.navigator.awaitPendingLocationCommit()
+        }
+        try await ContinuousClock().sleep(for: .milliseconds(50))
+        XCTAssertNil(result.commit, "premise: the hold keeps the wait")
+
+        observation.handshakeDidFail(for: capability)
+        observation.handshakeDidFail(for: capability)
+        XCTAssertEqual(observation.pendingWork, .blocked, "premise: the hand-off is missing")
+        await wait.value
+
+        let commit = try XCTUnwrap(result.commit)
+        XCTAssertFalse(commit.deadlinePassed, "The wait did not hear its spread block")
+    }
+
     func test_aPendingCommitWaitHearsTheCurrentSpread() async throws {
         let reader = try await openReader()
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)

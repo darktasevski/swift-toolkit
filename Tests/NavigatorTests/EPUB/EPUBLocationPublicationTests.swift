@@ -677,12 +677,12 @@ final class EPUBLocationPublicationTests: XCTestCase {
         )
         publication?.setIdle(true)
         publication?.spreadWork = { .working }
-        let wait = try PendingWait(XCTUnwrap(publication))
+        let wait = try PendingWait(weakly: XCTUnwrap(publication))
         weak let weakPublication = publication
+        try await pollUntil { deadlines.armedCount == 1 }
 
         publication = nil
-        try await pollUntil { deadlines.armedCount == 1 }
-        XCTAssertNotNil(weakPublication, "premise: the suspended wait keeps its publication")
+        XCTAssertNotNil(weakPublication, "The suspended wait does not keep its publication")
         deadlines.advance(by: EPUBLocationPublication.calculationBudget)
         try await pollUntil { wait.isFinished }
 
@@ -835,6 +835,15 @@ private final class PendingWait {
     init(_ publication: EPUBLocationPublication) {
         task = Task { @MainActor [weak self] in
             let passed = await publication.awaitPendingCommit()
+            self?.deadlinePassed = passed
+        }
+    }
+
+    /// Holds the publication only through the suspended call, as a host that
+    /// captures its navigator weakly does.
+    init(weakly publication: EPUBLocationPublication) {
+        task = Task { @MainActor [weak self, weak publication] in
+            let passed = await publication?.awaitPendingCommit()
             self?.deadlinePassed = passed
         }
     }
