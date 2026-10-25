@@ -182,9 +182,10 @@ Upstream's reflowable spread caches the first and last numbers the page world po
 
 | Path | Purpose | Upstream-PR-ready? |
 | --- | --- | --- |
-| `Sources/Navigator/EPUB/EPUBLocationObservation.swift` | The spread's observation scheduler: hints that only ask, one read at a time, a retained obligation, one bounded retry, explicit unavailable states and the recovery grants (`EPUBObservationGrant`). | No — it rests on the readiness model. |
+| `Sources/Navigator/EPUB/EPUBLocationObservation.swift` | The spread's observation scheduler: hints that only ask, one read at a time, a retained obligation, one bounded retry, explicit unavailable states and the recovery grants (`EPUBObservationGrant`). `pendingWork` and `onPendingWorkChange` tell the navigator's commit wait what the spread still owes. | No — it rests on the readiness model. |
 | `Sources/Navigator/EPUB/EPUBLocationTransport.swift` | The single outstanding location call per web view, a read or a capability injection; only WebKit's completion frees it. | No. |
-| `Sources/Navigator/EPUB/EPUBLocationPublication.swift` | The navigator's commit: one calculation at a time, `EPUBPublicationKey` currency, `hold()`/`release()` for a resource hop, and `rebuildLocation()`, where a spread rebuild starts. | No. |
+| `Sources/Navigator/EPUB/EPUBLocationPublication.swift` | The navigator's commit: one calculation at a time, `EPUBPublicationKey` currency, `hold()`/`release()` for a resource hop, and `rebuildLocation()`, where a spread rebuild starts. `awaitPendingCommit()` waits, within `calculationBudget`, until no commit is still to come. | No. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController+PendingLocationCommit.swift` | `awaitPendingLocationCommit()` (public) and `EPUBPendingLocationCommit`: a host saving the position on dismiss waits for a location still being calculated, so it saves the place on screen (#3080). `EPUBSpreadLocationWork`, what the current spread still owes. | No — it rests on the publication and the observation. |
 | `Sources/Navigator/EPUB/EPUBReflowableSpreadView+LocationObservation.swift` | When a read may start (`observationEligibility`) and the scroll and scene signals that ask for one. | No. |
 | `Sources/Navigator/EPUB/EPUBSpreadView+ScrollSettlement.swift` | The scroll view's settlement callbacks a reflowable spread overrides. | No. |
 | `Sources/Navigator/EPUB/EPUBSpreadView+MeasuredPosition.swift` | `measuredPosition()` and `measuredProgression(of:)`, the spread's measurement for a rebuild and a selection. | No. |

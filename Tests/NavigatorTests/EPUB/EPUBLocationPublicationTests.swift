@@ -400,6 +400,295 @@ final class EPUBLocationPublicationTests: XCTestCase {
         XCTAssertEqual(fixture.deadlines.armedCount, 0)
         XCTAssertFalse(fixture.publication.isCalculating)
     }
+
+    // MARK: - Pending commit wait
+
+    func test_aWaitWithNothingOutstandingReturnsAtOnce() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+
+        let wait = fixture.startWait()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.deadlines.armedCount, 0, "A wait with nothing outstanding armed a deadline")
+    }
+
+    func test_aWaitResumesOnceTheRunningCalculationCommits() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+        a.release()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.committed, ["a"])
+    }
+
+    func test_aWaitEndsAtItsDeadlineWhileWorkIsStillOutstanding() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+
+        let wait = try await fixture.startArmedWait()
+        fixture.deadlines.advance(by: EPUBLocationPublication.calculationBudget - .milliseconds(1))
+        try await fixture.assertStillWaiting(wait)
+        fixture.deadlines.advance(by: .milliseconds(1))
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, true)
+    }
+
+    func test_aCalculationBegunMidWaitDoesNotExtendItsDeadline() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let wait = try await fixture.startArmedWait()
+        fixture.deadlines.advance(by: .seconds(3))
+
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+        fixture.deadlines.advance(by: EPUBLocationPublication.calculationBudget - .seconds(3))
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, true)
+        XCTAssertTrue(fixture.publication.isCalculating, "premise: the later calculation is still running")
+        a.release()
+    }
+
+    /// An obligation with nothing publishable to capture still holds the wait:
+    /// the inputs it waits for are on their way.
+    func test_anObligationWaitingForPublishableInputsHoldsTheWait() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.current = nil
+        fixture.publication.request()
+        XCTAssertTrue(fixture.publication.hasObligation, "premise: the obligation was retained")
+        XCTAssertFalse(fixture.publication.isCalculating, "premise: nothing could be captured")
+
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+        fixture.offer("a").release()
+        fixture.publication.request()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.committed, ["a"])
+    }
+
+    /// A navigation under way when the wait starts will settle and ask for a
+    /// publication: a dismiss early in a page turn waits for the turn.
+    func test_aNavigationInFlightHoldsTheWaitUntilWhatItSettlesOnCommits() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.publication.setIdle(false)
+        XCTAssertFalse(fixture.publication.hasObligation, "premise: the move has not asked yet")
+
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        fixture.publication.setIdle(true)
+        try await fixture.waitUntil { a.started }
+        try await fixture.assertStillWaiting(wait)
+        a.release()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.committed, ["a"])
+    }
+
+    /// Before its first settle the navigator is still opening at its initial
+    /// location, which has nothing newer to publish.
+    func test_aNavigatorThatNeverSettledHasNothingToWaitFor() async throws {
+        let fixture = try PublicationFixture()
+
+        let wait = fixture.startWait()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+    }
+
+    func test_aHoldHoldsTheWaitUntilItsRelease() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.publication.hold()
+
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+        fixture.publication.release()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+    }
+
+    /// A calculation outlived by a navigation exits without committing and
+    /// keeps the obligation, so the wait runs on to the next commit.
+    func test_aStaleExitKeepsTheWaitUntilTheNextCalculationCommits() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+        let wait = try await fixture.startArmedWait()
+        fixture.publication.setIdle(false)
+        fixture.publication.setIdle(true)
+        let b = fixture.offer("b")
+
+        a.release()
+        try await fixture.waitUntil { b.started }
+        try await fixture.assertStillWaiting(wait)
+        b.release()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.committed, ["b"])
+    }
+
+    func test_spreadWorkHoldsTheWaitUntilTheSpreadReportsItDone() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+        fixture.spreadWork = .idle
+        fixture.publication.spreadWorkDidChange()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+    }
+
+    /// The observation reports each of its changes as it makes it, so within
+    /// one turn it can pass through a state that is not where it ends.
+    func test_aSpreadThatIsIdleOnlyMidTurnDoesNotEndTheWait() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let wait = try await fixture.startArmedWait()
+
+        fixture.spreadWork = .idle
+        fixture.publication.spreadWorkDidChange()
+        fixture.spreadWork = .working
+        fixture.publication.spreadWorkDidChange()
+
+        try await fixture.assertStillWaiting(wait)
+        fixture.spreadWork = .idle
+        fixture.publication.spreadWorkDidChange()
+        try await fixture.waitUntil { wait.isFinished }
+    }
+
+    func test_aBlockedSpreadEndsTheWaitAtOnce() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+
+        fixture.spreadWork = .blocked
+        fixture.publication.spreadWorkDidChange()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+    }
+
+    /// An expired calculation may never exit, and until it does nothing else
+    /// can publish (ADR-0195, the navigator slot).
+    func test_anExpiredCalculationHoldingTheSlotEndsTheWaitAtOnce() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+        fixture.deadlines.advance(by: EPUBLocationPublication.calculationBudget)
+        XCTAssertTrue(fixture.publication.isOperationPending, "premise: the calculation expired")
+
+        let wait = fixture.startWait()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        a.release()
+    }
+
+    /// A deadline and a change that ends the wait arriving together resume it
+    /// once: a second resume would trap.
+    func test_theDeadlineAndAnEndingChangeTogetherResumeTheWaitOnce() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+
+        fixture.spreadWork = .idle
+        fixture.publication.spreadWorkDidChange()
+        fixture.deadlines.advance(by: EPUBLocationPublication.calculationBudget)
+        try await fixture.waitUntil { wait.isFinished }
+        try await fixture.settle()
+
+        XCTAssertEqual(wait.deadlinePassed, true)
+    }
+
+    func test_everyOutstandingWaitResumes() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let first = fixture.startWait()
+        let second = fixture.startWait()
+        try await fixture.assertStillWaiting(first)
+
+        fixture.spreadWork = .idle
+        fixture.publication.spreadWorkDidChange()
+        try await fixture.waitUntil { first.isFinished && second.isFinished }
+
+        XCTAssertEqual(first.deadlinePassed, false)
+        XCTAssertEqual(second.deadlinePassed, false)
+    }
+
+    func test_aCancelledWaitReturnsAtOnce() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .working
+        let wait = fixture.startWait()
+        try await fixture.assertStillWaiting(wait)
+
+        wait.cancel()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, false)
+        XCTAssertEqual(fixture.deadlines.armedCount, 0, "The cancelled wait left its deadline armed")
+    }
+
+    /// The suspended call keeps the publication alive, and the deadline still
+    /// ends the wait when nothing else owns it.
+    func test_aWaitWhosePublicationHasNoOtherOwnerResumesAtItsDeadline() async throws {
+        let deadlines = ManualDeadlines()
+        var publication: EPUBLocationPublication? = EPUBLocationPublication(
+            scheduler: deadlines.scheduler,
+            initialLocation: nil,
+            position: { nil },
+            capture: { nil },
+            commit: { _ in }
+        )
+        publication?.setIdle(true)
+        publication?.spreadWork = { .working }
+        let wait = try PendingWait(XCTUnwrap(publication))
+        weak let weakPublication = publication
+
+        publication = nil
+        try await pollUntil { deadlines.armedCount == 1 }
+        XCTAssertNotNil(weakPublication, "premise: the suspended wait keeps its publication")
+        deadlines.advance(by: EPUBLocationPublication.calculationBudget)
+        try await pollUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, true)
+        try await pollUntil { weakPublication == nil }
+    }
 }
 
 // MARK: - Fixtures
@@ -453,22 +742,29 @@ private final class PublicationFixture {
     private(set) var dispatched: [String] = []
     private(set) var committed: [String] = []
 
-    lazy var publication = EPUBLocationPublication(
-        scheduler: deadlines.scheduler,
-        initialLocation: Locator(href: href, mediaType: .html, title: Self.initialTitle),
-        position: { [unowned self] in position },
-        capture: { [unowned self] in
-            guard let calculation = current else {
-                return nil
-            }
-            dispatched.append(calculation.name)
-            return EPUBPublicationCapture(
-                isCurrent: { calculation.isCurrent },
-                calculate: { await calculation.run() }
-            )
-        },
-        commit: { [unowned self] in committed.append($0.locator?.title ?? "nil") }
-    )
+    /// What the current spread still owes the publication.
+    var spreadWork: EPUBSpreadLocationWork = .idle
+
+    lazy var publication: EPUBLocationPublication = {
+        let publication = EPUBLocationPublication(
+            scheduler: deadlines.scheduler,
+            initialLocation: Locator(href: href, mediaType: .html, title: Self.initialTitle),
+            position: { [unowned self] in position },
+            capture: { [unowned self] in
+                guard let calculation = current else {
+                    return nil
+                }
+                dispatched.append(calculation.name)
+                return EPUBPublicationCapture(
+                    isCurrent: { calculation.isCurrent },
+                    calculate: { await calculation.run() }
+                )
+            },
+            commit: { [unowned self] in committed.append($0.locator?.title ?? "nil") }
+        )
+        publication.spreadWork = { [unowned self] in spreadWork }
+        return publication
+    }()
 
     init() throws {
         href = try XCTUnwrap(RelativeURL(path: "chapter.html")).anyURL
@@ -498,6 +794,57 @@ private final class PublicationFixture {
         line: UInt = #line
     ) async throws {
         try await pollUntil(condition, file: file, line: line)
+    }
+
+    /// Starts a wait for the pending commit.
+    func startWait() -> PendingWait {
+        PendingWait(publication)
+    }
+
+    /// Starts a wait and returns once its deadline is armed, so advancing the
+    /// deadlines measures from the wait's start.
+    func startArmedWait() async throws -> PendingWait {
+        let armedBefore = deadlines.armedCount
+        let wait = startWait()
+        try await waitUntil { deadlines.armedCount == armedBefore + 1 }
+        return wait
+    }
+
+    /// Lets queued main-actor work run.
+    func settle() async throws {
+        try await ContinuousClock().sleep(for: .milliseconds(50))
+    }
+
+    /// Fails when `wait` has ended, after letting queued main-actor work run.
+    func assertStillWaiting(
+        _ wait: PendingWait,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        try await settle()
+        XCTAssertNil(wait.deadlinePassed, "The wait ended with work outstanding", file: file, line: line)
+    }
+}
+
+/// One wait for a publication's pending commit, run in its own task.
+@MainActor
+private final class PendingWait {
+    private(set) var deadlinePassed: Bool?
+    private var task: Task<Void, Never>?
+
+    init(_ publication: EPUBLocationPublication) {
+        task = Task { @MainActor [weak self] in
+            let passed = await publication.awaitPendingCommit()
+            self?.deadlinePassed = passed
+        }
+    }
+
+    var isFinished: Bool {
+        deadlinePassed != nil
+    }
+
+    func cancel() {
+        task?.cancel()
     }
 }
 

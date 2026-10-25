@@ -871,6 +871,101 @@ final class EPUBLocationObservationTests: XCTestCase {
 
         reads.first?.completion(.failed)
     }
+
+    // MARK: - Pending work
+
+    func test_anObservationWithNothingToReadHasNoPendingWork() {
+        let fixture = ObservationFixture()
+
+        XCTAssertEqual(fixture.observation.pendingWork, .idle)
+    }
+
+    /// The navigator's commit wait learns of each change: an answer that only
+    /// ends the read still tells it.
+    func test_aReadIsPendingWorkUntilItsAnswerAndItsEndIsReported() {
+        let fixture = ObservationFixture()
+        var changes = 0
+        fixture.observation.onPendingWorkChange = { changes += 1 }
+
+        fixture.observation.request()
+        XCTAssertEqual(fixture.observation.pendingWork, .working)
+        XCTAssertFalse(fixture.observation.hasObligation, "premise: the read carries the obligation")
+        let beforeAnswer = changes
+
+        fixture.answer(0, fixture.sample(0 ... 0.5))
+
+        XCTAssertEqual(fixture.observation.pendingWork, .idle)
+        XCTAssertGreaterThan(changes, beforeAnswer, "The read's end was not reported")
+    }
+
+    func test_aHintWindowIsPendingWorkBeforeItsReadStarts() {
+        let fixture = ObservationFixture()
+
+        fixture.observation.hint()
+        XCTAssertEqual(fixture.reads.count, 0, "premise: the window has not closed")
+        XCTAssertFalse(fixture.observation.hasObligation, "premise: only the window is pending")
+
+        XCTAssertEqual(fixture.observation.pendingWork, .working)
+    }
+
+    func test_anObligationWaitingForEligibilityIsPendingWork() {
+        let fixture = ObservationFixture()
+        fixture.eligibility = .unsettled
+
+        fixture.observation.request()
+        XCTAssertEqual(fixture.reads.count, 0, "premise: nothing was read")
+
+        XCTAssertEqual(fixture.observation.pendingWork, .working)
+    }
+
+    /// A failed read's retry is still to come, and the obligation it carries
+    /// is what keeps it pending.
+    func test_aRetryAfterAFailedReadIsPendingWork() {
+        let fixture = ObservationFixture()
+        fixture.observation.request()
+
+        fixture.answer(0, .failed)
+        XCTAssertEqual(fixture.startedReads, 1, "premise: the retry has not started")
+
+        XCTAssertEqual(fixture.observation.pendingWork, .working)
+    }
+
+    /// A read that fails into unavailability reaches the navigator by no other
+    /// route, so the observation reports it.
+    func test_aReadFailingIntoUnavailabilityBlocksAndIsReported() {
+        let fixture = ObservationFixture()
+        var changes = 0
+        fixture.observation.onPendingWorkChange = { changes += 1 }
+        fixture.observation.request()
+        fixture.answer(0, .failed)
+        fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
+        let beforeFailure = changes
+
+        fixture.answer(1, .failed)
+
+        XCTAssertEqual(fixture.observation.unavailability, .readFailed, "premise: the retry was spent")
+        XCTAssertEqual(fixture.observation.pendingWork, .blocked)
+        XCTAssertGreaterThan(changes, beforeFailure, "The failure into unavailability was not reported")
+    }
+
+    /// A missing hand-off blocks even an obligation retained beside it.
+    func test_aMissingHandOffBlocksAndIsReported() {
+        let fixture = ObservationFixture()
+        var changes = 0
+        fixture.observation.onPendingWorkChange = { changes += 1 }
+        fixture.observation.handshakeDidFail(for: fixture.capability)
+        fixture.deadlines.advance(by: EPUBLocationObservation.retryGap)
+        let beforeFailure = changes
+
+        fixture.observation.handshakeDidFail(for: fixture.capability)
+
+        XCTAssertTrue(fixture.observation.isRegistrationMissing, "premise: the re-issue was spent")
+        XCTAssertEqual(fixture.observation.pendingWork, .blocked)
+        XCTAssertGreaterThan(changes, beforeFailure, "The missing hand-off was not reported")
+        fixture.observation.request()
+        XCTAssertTrue(fixture.observation.hasObligation, "premise: the request was retained")
+        XCTAssertEqual(fixture.observation.pendingWork, .blocked, "A retained obligation hid the missing hand-off")
+    }
 }
 
 // MARK: - Fixtures

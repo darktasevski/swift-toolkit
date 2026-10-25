@@ -62,6 +62,9 @@ struct EPUBPublicationCapture {
 /// it records the current spread's measured position, so a rebuild lands where
 /// the reader moved even while the calculation that will publish it is still
 /// running, and never behind what was published.
+///
+/// A caller about to save the position can wait for a commit still to come
+/// (`awaitPendingCommit()`), bounded by `calculationBudget`.
 @MainActor
 final class EPUBLocationPublication {
     /// How long one calculation may take before its result can no longer commit.
@@ -84,11 +87,32 @@ final class EPUBLocationPublication {
 
     /// Advanced by every `setIdle(false)` and `hold()`.
     private var revision: UInt64 = 0
-    private var isIdle = false
-    private var holds = 0
-    private var active: Active?
+    private var isIdle = false {
+        didSet { commitWorkDidChange() }
+    }
+
+    /// Before its first settle the navigator is still opening at its initial
+    /// location, so no navigation is in flight that a commit wait should cover.
+    private var hasSettled = false
+    private var holds = 0 {
+        didSet { commitWorkDidChange() }
+    }
+
+    private var active: Active? {
+        didSet { commitWorkDidChange() }
+    }
+
     private var lastID = 0
-    private(set) var hasObligation = false
+    private(set) var hasObligation = false {
+        didSet { commitWorkDidChange() }
+    }
+
+    /// What the current spread still owes, read by a commit wait. The
+    /// navigator sets it when a wait starts.
+    var spreadWork: @MainActor () -> EPUBSpreadLocationWork = { .idle }
+    private var commitWaiters: [Int: CommitWaiter] = [:]
+    private var lastWaiterID = 0
+    private var isCommitWaitEvaluationScheduled = false
 
     /// Whether a calculation this publication started has not exited yet.
     var isCalculating: Bool {
@@ -148,6 +172,7 @@ final class EPUBLocationPublication {
     func setIdle(_ idle: Bool) {
         isIdle = idle
         if idle {
+            hasSettled = true
             attemptDispatch()
         } else {
             revision &+= 1
@@ -212,6 +237,83 @@ final class EPUBLocationPublication {
         hasObligation = true
     }
 
+    // MARK: - Pending commit wait
+
+    /// Waits until no commit is still to come, and answers whether
+    /// `calculationBudget` passed first. Returns at once when nothing would
+    /// publish before a named event. A state change, the deadline or the
+    /// caller's cancellation resumes it, never WebKit, so a call stuck there
+    /// cannot hold it past the deadline.
+    func awaitPendingCommit() async -> Bool {
+        guard isCommitPending else {
+            return false
+        }
+        lastWaiterID += 1
+        let id = lastWaiterID
+        return await withTaskCancellationHandler {
+            await withCheckedContinuation { continuation in
+                let waiter = CommitWaiter(continuation)
+                commitWaiters[id] = waiter
+                // The suspended call keeps the publication alive, so this fires.
+                waiter.deadline = scheduler.schedule(scheduler.now() + Self.calculationBudget) { [weak self] in
+                    self?.commitWaiters.removeValue(forKey: id)?.resume(deadlinePassed: true)
+                }
+            }
+        } onCancel: {
+            Task { @MainActor [weak self] in
+                self?.commitWaiters.removeValue(forKey: id)?.resume(deadlinePassed: false)
+            }
+        }
+    }
+
+    /// The current spread's work changed.
+    func spreadWorkDidChange() {
+        commitWorkDidChange()
+    }
+
+    /// A commit is still to come: an obligation, a calculation, a hold, a
+    /// navigation since the first settle, or the spread's own work.
+    private var isCommitPending: Bool {
+        // An expired calculation may never exit, and nothing publishes until
+        // it does (ADR-0195, the navigator slot).
+        guard !isOperationPending else {
+            return false
+        }
+        switch spreadWork() {
+        case .blocked:
+            return false
+        case .working:
+            return true
+        case .idle:
+            return hasObligation || active != nil || holds > 0 || (hasSettled && !isIdle)
+        }
+    }
+
+    /// Evaluates the waits once the current main-actor work ends: a method
+    /// passes through intermediate states between its assignments, such as
+    /// `calculationDidExit` freeing the slot before it commits.
+    private func commitWorkDidChange() {
+        guard !commitWaiters.isEmpty, !isCommitWaitEvaluationScheduled else {
+            return
+        }
+        isCommitWaitEvaluationScheduled = true
+        Task { @MainActor [weak self] in
+            self?.evaluateCommitWaits()
+        }
+    }
+
+    private func evaluateCommitWaits() {
+        isCommitWaitEvaluationScheduled = false
+        guard !isCommitPending else {
+            return
+        }
+        let waiters = commitWaiters.values
+        commitWaiters.removeAll()
+        for waiter in waiters {
+            waiter.resume(deadlinePassed: false)
+        }
+    }
+
     private func calculationDidExit(_ id: Int, with output: EPUBPublicationOutput) {
         guard let finished = active, finished.id == id else {
             return
@@ -224,5 +326,22 @@ final class EPUBLocationPublication {
             hasObligation = true
         }
         attemptDispatch()
+    }
+}
+
+/// One caller waiting for a pending commit. Only the call that removes it
+/// from the publication's waiters resumes it, so it resumes once.
+@MainActor
+private final class CommitWaiter {
+    var deadline: EPUBScheduledDeadline?
+    private let continuation: CheckedContinuation<Bool, Never>
+
+    init(_ continuation: CheckedContinuation<Bool, Never>) {
+        self.continuation = continuation
+    }
+
+    func resume(deadlinePassed: Bool) {
+        deadline?.cancel()
+        continuation.resume(returning: deadlinePassed)
     }
 }

@@ -2485,6 +2485,80 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertEqual((sample["last"] as? NSNumber)?.doubleValue ?? -1, last, accuracy: 0.000_001, "last", file: file, line: line)
     }
 
+    // MARK: - Pending commit wait
+
+    func test_aPendingCommitWaitWithNothingOutstandingReturnsTheCurrentLocation() async throws {
+        let reader = try await openReader()
+        let current = try XCTUnwrap(reader.navigator.currentLocation)
+
+        let commit = await reader.navigator.awaitPendingLocationCommit()
+
+        XCTAssertFalse(commit.deadlinePassed, "A settled reader still had work outstanding")
+        XCTAssertEqual(commit.location, current)
+    }
+
+    /// A dismiss right after a turn into another resource: the wait returns
+    /// the place the turn commits, not the one before it.
+    func test_aPendingCommitWaitReturnsWhereATurnIntoAnotherResourceCommits() async throws {
+        let contents = HeldTableOfContents()
+        let reader = try await openReader(at: Self.nextChapterHREF, minimumScreens: 1, tableOfContents: contents)
+        let opening = try XCTUnwrap(reader.currentSpread)
+        try await reader.waitFor("a calculation of the opening page") { contents.wasAsked }
+
+        let moved = await reader.navigator.goBackward(options: NavigatorGoOptions(animated: false))
+        XCTAssertTrue(moved)
+        try await reader.waitFor("the previous resource's spread") {
+            reader.currentSpread.map { $0 !== opening } == true
+        }
+        let result = PendingCommitResult()
+        let wait = Task { @MainActor in
+            result.commit = await reader.navigator.awaitPendingLocationCommit()
+        }
+        try await ContinuousClock().sleep(for: .milliseconds(300))
+        XCTAssertNil(result.commit, "The wait ended while the turn's calculation was held")
+
+        contents.release()
+        await wait.value
+
+        let commit = try XCTUnwrap(result.commit)
+        let location = try XCTUnwrap(commit.location)
+        XCTAssertFalse(commit.deadlinePassed)
+        XCTAssertTrue(
+            location.href.isEquivalentTo(Self.longChapterHREF.anyURL),
+            "The wait returned the place before the turn: \(location.href)"
+        )
+        XCTAssertEqual(location, reader.navigator.currentLocation)
+    }
+
+    /// The wait reads the current spread: one that is blocked ends it at once,
+    /// even while the publication holds.
+    func test_aPendingCommitWaitReturnsAtOnceForABlockedCurrentSpread() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        let observation = spread.locationObservation
+        let capability = try XCTUnwrap(spread.readiness.currentFrameCapability)
+        reader.navigator.locationPublication.hold()
+        defer { reader.navigator.locationPublication.release() }
+        observation.handshakeDidFail(for: capability)
+        observation.handshakeDidFail(for: capability)
+        XCTAssertEqual(observation.pendingWork, .blocked, "premise: the hand-off is missing")
+
+        let commit = await reader.navigator.awaitPendingLocationCommit()
+
+        XCTAssertFalse(commit.deadlinePassed, "The wait did not read the current spread")
+    }
+
+    func test_aPendingCommitWaitHearsTheCurrentSpread() async throws {
+        let reader = try await openReader()
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+
+        _ = await reader.navigator.awaitPendingLocationCommit()
+
+        let observation = try XCTUnwrap(spread.builtLocationObservation)
+        XCTAssertNotNil(observation.onPendingWorkChange, "The wait does not hear the current spread's work")
+        XCTAssertEqual(reader.navigator.locationPublication.spreadWork(), observation.pendingWork)
+    }
+
     // MARK: - Fixture
 
     /// The production debounce is 300 ms; a report that has not arrived well
@@ -4291,6 +4365,12 @@ private final class HopGate {
         continuation?.resume()
         continuation = nil
     }
+}
+
+/// Where a test's pending commit wait leaves its result.
+@MainActor
+private final class PendingCommitResult {
+    var commit: EPUBPendingLocationCommit?
 }
 
 /// A table of contents that answers only once the test releases it.
