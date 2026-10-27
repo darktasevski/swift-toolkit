@@ -178,6 +178,8 @@ For completely custom tokenizing or to improve the existing tokenizers, you can 
 
 `PublicationSpeechSynthesizer` can be used with any TTS engine, provided they implement the `TTSEngine` interface. Take a look at `AVTTSEngine` for an example implementation.
 
+`PublicationSpeechSynthesizer` and `TTSEngine` are main-actor isolated: create and drive the synthesizer from the main actor, call `onSpeakRange` there, and return from `speak` once its task is cancelled. The delegate hears each state synchronously, as it is set.
+
 ```swift
 let synthesizer = PublicationSpeechSynthesizer(
     publication: publication,
