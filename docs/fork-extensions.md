@@ -228,6 +228,38 @@ Upstream's reflowable spread caches the first and last numbers the page world po
 | `Tests/NavigatorTests/EPUB/EPUBScrollAnimationCoordinatorTests.swift` | The animation coordinator resumes only the matching request on cancellation, a stale request or waiter cannot clear a newer one, and a superseded wait's fallback leaves the newer wait to its own timer. |
 | `Tests/NavigatorTests/EPUB/EPUBViewportAndLocationCalculatorTests.swift` (upstream file) | Adds the single-resource locator. |
 
+## Speech synthesizer isolation (backport of upstream #808 and #832)
+
+`PublicationSpeechSynthesizer` wrote `state` from the host's thread (`pause()`, `stop()`, called on
+the main actor) and from the cooperative pool (`play()`, inside `currentTask`), and its `didSet`
+notified the delegate from a new task that read `state` again when it ran. A read racing a write
+could tear the enum's `Locator` payload; the host app's read-aloud view model crashed with
+`SIGSEGV` in `URL.absoluteString`, reached from `Locator.jsonString()`, during a full Catalyst test
+run. Upstream gave the type one owner, the main actor, in two steps: #808 (`250cbadbb`) isolated the
+synthesizer, and #832 (`566f3a617`, "Migrate `ReadiumNavigator` to Swift 6") isolated `TTSEngine`
+and `AVTTSEngine`. Both are in 4.0.0-alpha.1. This branch carries the TTS slice of both, plus four
+fixes upstream does not have.
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/TTS/PublicationSpeechSynthesizer.swift` | From #808: `@MainActor` on the class, the delegate called synchronously from `state`'s `didSet` and the engine-failure path, `defaultTokenizerFactory` `nonisolated` (#808's own state; #832 later drops it under Swift 6). Fork adaptation: `EngineFactory` is `@MainActor () -> TTSEngine`, because a Swift 5.10 default argument cannot call the main-actor `AVTTSEngine()` initializer; upstream keeps `() -> TTSEngine` and relies on Swift 6's isolated default arguments. Fork fixes: a playback task that a later command superseded never writes `state` or `utterances` and never reaches the engine; each new task waits for the one it replaces before it touches the content iterator, so one task at a time uses it; `next()`/`previous()` move the cursor at once when the utterance is loaded, so each skip still moves one utterance; a word-range report refines only the utterance being played, so one reported after a pause cannot bring `.playing` back. | Isolation: upstream already. Fixes: yes. |
+| `Sources/Navigator/TTS/TTSEngine.swift` | From #832: `@MainActor` on the protocol. | Upstream already (#832). |
+| `Sources/Navigator/TTS/AVTTSEngine.swift` | From #832: `@MainActor` on the class, the cancellation handler hops to the main actor before it touches the state machine, and the `AVSpeechSynthesizerDelegate` conformance is `@preconcurrency`, in an extension. The nested `Task` class (#832's `@MainActor SpeechTask`) is not renamed or isolated, so the hop is spelled `_Concurrency.Task`. Fork fixes: `speak` called from an already-cancelled task returns without reaching AVFoundation, and every task the state machine drops is finished, so no `speak` call is left waiting forever. | Isolation: upstream already. Fixes: yes. |
+| `TestApp/Sources/Reader/Common/TTS/TTSViewModel.swift` | From #808: `@MainActor` on the class and on `Settings`' initializer, which reads the synthesizer, so the TestApp CI build still compiles. | Upstream already (#808). |
+
+Not carried: #808's audio-session half. It makes `AudioSessionManaging` `@MainActor` with a
+token-returning `start` and `end(with:)`, and gives `AudioSessionUser` an `isolated deinit`; both
+change the public protocol. Until it lands, `AudioSession`'s nonisolated `start(with:isPlaying:)`,
+`user(_:didChangePlaying:)` and `end(for:)` each post an unordered task.
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerStateTests.swift` | The delegate has heard `.playing` then `.paused` when `pause()` returns; a word range reported after a pause leaves it paused; two skips in a row move two utterances on and the superseded one never reaches the engine; a new utterance starts only once the engine has returned the one it interrupts. `AVTTSEngine` has no test: its task and utterance types are private and it drives the real `AVSpeechSynthesizer`. |
+
 ## Upstream-rebase guidance
 
 The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
@@ -244,5 +276,7 @@ The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it ta
 9. Readiness conflicts in the spread views, `PaginationView.swift` and `EPUBNavigatorViewController.swift` are resolved by keeping the fork's stored state and re-applying upstream's change around it, never by taking upstream's body: the readiness model is stored state on those types and has no additive form. Then rebuild the bundles; `reader-locator-commands` is its own entry.
 10. In `EPUBNavigatorViewController._reloadSpreads()`, keep `let locator = locationPublication.rebuildLocation()`. Upstream reads `currentLocation`, which lags the measurement by a calculation; taking upstream's line silently restores a rebuild at the stale location, and only `test_aReloadBeforeAMoveIsPublishedRebuildsAtTheMovedToPage`, `test_aSecondReloadBeforeTheRebuiltSpreadMeasuresRebuildsWhereTheFirstDid` and `test_aFixedLayoutReloadBeforeATurnIsPublishedRebuildsAtTheTurnedToPage` in `EPUBSettledLocationReportingTests` would catch it. They skip when the web content process does not answer, and a run with some skips still reads green, so see all three pass. Likewise keep `progressionDidChange` as a hint that reads no numbers, `utils.js` measuring through `progression.js`, and both `progression(in:)` methods deleted: the reflowable override and the base one folded into `publicationInput()`, whose `0 ... 1` a reflowable caller would read as a position.
 11. Keep the `navigatorWillBeginUserNavigation(_:)` and `spreadViewWillBeginUserNavigation(_:)` requirements on `EPUBNavigatorDelegate` and `EPUBSpreadViewDelegate`, not only their defaults in `EPUBUserNavigationInput.swift`. Without the requirement the build still compiles, the calls dispatch statically to the empty default, and a host stops hearing native and VoiceOver input.
+
+12. A 4.0 merge takes upstream's isolation in `PublicationSpeechSynthesizer.swift`, `TTSEngine.swift` and `AVTTSEngine.swift`, and keeps the four fork fixes on top: the superseded-task guards and `replaceTask(_:)`, the synchronous cursor move in `skip(_:)`, the word-range guard in `play(_:)`, and `AVTTSEngine`'s early return and `finish()` calls. `PublicationSpeechSynthesizerStateTests` fails when one of the synthesizer's fixes is lost; nothing tests the engine's. The main-actor synthesizer also relies on the content iterators' `next()` running off the main actor, which Swift 5 rules give the fork's class iterators and upstream's `actor` iterators give 4.0; adopting `NonisolatedNonsendingByDefault` with class iterators would move PDF text extraction onto the main actor.
 
 If upstream introduces a `VisibleAnchorObservingNavigator`-equivalent API, this fork's protocol can be deleted and the class conformance can switch to upstream's. The host app's `Coordinator` already speaks via `(@MainActor @Sendable (String, String) -> Void)?` closures so the wire shape is upstream-agnostic.
