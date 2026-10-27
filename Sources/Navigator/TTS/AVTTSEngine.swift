@@ -15,6 +15,7 @@ public protocol AVTTSEngineDelegate: AnyObject {
 }
 
 /// Implementation of a `TTSEngine` using Apple AVFoundation's `AVSpeechSynthesizer`.
+@MainActor
 public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Loggable {
     /// Range of valid values for an AVUtterance rate.
     ///
@@ -86,8 +87,11 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
                 on(.play(task))
             }
         } onCancel: {
-            task.cancel()
-            on(.stop(task))
+            // The nested `Task` class shadows the concurrency type.
+            _Concurrency.Task { @MainActor in
+                task.cancel()
+                on(.stop(task))
+            }
         }
     }
 

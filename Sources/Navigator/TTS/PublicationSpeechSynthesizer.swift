@@ -20,8 +20,9 @@ public protocol PublicationSpeechSynthesizerDelegate: AnyObject {
 
 /// `PublicationSpeechSynthesizer` orchestrates the rendition of a `Publication` by iterating through its content,
 /// splitting it into individual utterances using a `ContentTokenizer`, then using a `TTSEngine` to read them aloud.
+@MainActor
 public class PublicationSpeechSynthesizer: Loggable {
-    public typealias EngineFactory = () -> TTSEngine
+    public typealias EngineFactory = @MainActor () -> TTSEngine
     public typealias TokenizerFactory = (_ defaultLanguage: Language?) -> ContentTokenizer
 
     /// Returns whether the `publication` can be played with a `PublicationSpeechSynthesizer`.
@@ -91,9 +92,7 @@ public class PublicationSpeechSynthesizer: Loggable {
                 audioSession.user(audioSessionUser, didChangePlaying: state.isPlaying)
             }
 
-            Task {
-                await delegate?.publicationSpeechSynthesizer(self, stateDidChange: state)
-            }
+            delegate?.publicationSpeechSynthesizer(self, stateDidChange: state)
         }
     }
 
@@ -154,7 +153,7 @@ public class PublicationSpeechSynthesizer: Loggable {
     }
 
     /// The default content tokenizer will split the `Content.Element` items into individual sentences.
-    public static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
+    public nonisolated static let defaultTokenizerFactory: TokenizerFactory = { defaultLanguage in
         makeTextContentTokenizer(
             defaultLanguage: defaultLanguage,
             contextSnippetLength: 50,
@@ -312,7 +311,7 @@ public class PublicationSpeechSynthesizer: Loggable {
             await playNextUtterance(.forward)
         case let .failure(error):
             state = .paused(utterance)
-            await delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
+            delegate?.publicationSpeechSynthesizer(self, utterance: utterance, didFailWithError: .engine(error))
         }
     }
 
