@@ -243,8 +243,9 @@ and a host serializing the locator crashed on a null `URL`. Upstream's #808 (`25
 | `Sources/Navigator/TTS/PublicationSpeechSynthesizer.swift` | `@MainActor` on the class; `state`'s `didSet` and the engine-failure path call the delegate synchronously; `defaultTokenizerFactory` is `nonisolated`; `EngineFactory` is `@MainActor () -> TTSEngine`, which upstream's Swift 6 language mode infers and this Swift 5.10 package must state. | Upstream already (#808). |
 | `Sources/Navigator/TTS/TTSEngine.swift` | `@MainActor` on the protocol, so `speak` and `onSpeakRange` run on the synthesizer's actor. | Upstream already (#808). |
 | `Sources/Navigator/TTS/AVTTSEngine.swift` | `@MainActor` on the class; the cancellation handler hops to the main actor before it touches the state machine, as upstream's does. The nested `Task` class (upstream's `SpeechTask`) shadows the concurrency type, so the hop is spelled `_Concurrency.Task`. | Upstream already (#808), minus the rename. |
+| `TestApp/Sources/Reader/Common/TTS/TTSViewModel.swift` | `@MainActor` on the class and on `Settings`' initializer, which reads the synthesizer, so the TestApp CI build still compiles. | Upstream already (#808). |
 
-Not carried: #808's `AudioSessionUser` token rework, which needs `AudioSessionToken` from #856 and #905; this branch's `AudioSessionManaging` has no token. `TestApp` is not built by any gate and keeps its pre-#808 view model.
+Not carried: #808's `AudioSessionUser` token rework, which needs `AudioSessionToken` from #856 and #905; this branch's `AudioSessionManaging` has no token.
 
 ### Tests
 
