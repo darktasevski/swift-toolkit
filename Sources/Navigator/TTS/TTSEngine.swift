@@ -11,6 +11,7 @@ import ReadiumShared
 ///
 /// Implement this interface to support third-party engines with
 /// ``PublicationSpeechSynthesizer``.
+@MainActor
 public protocol TTSEngine: AnyObject {
     /// List of available synthesizer voices.
     var availableVoices: [TTSVoice] { get }
@@ -20,7 +21,9 @@ public protocol TTSEngine: AnyObject {
 
     /// Synthesizes the given `utterance` and returns its status.
     ///
-    /// `onSpeakRange` is called repeatedly while the engine plays portions (e.g. words) of the utterance.
+    /// `onSpeakRange` is called repeatedly, on the main actor, while the engine plays portions
+    /// (e.g. words) of the utterance. When the calling task is cancelled the engine stops and
+    /// returns; the synthesizer starts its next utterance only once it has.
     func speak(
         _ utterance: TTSUtterance,
         onSpeakRange: @escaping (Range<String.Index>) -> Void

@@ -15,7 +15,8 @@ public protocol AVTTSEngineDelegate: AnyObject {
 }
 
 /// Implementation of a `TTSEngine` using Apple AVFoundation's `AVSpeechSynthesizer`.
-public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Loggable {
+@MainActor
+public class AVTTSEngine: NSObject, TTSEngine, Loggable {
     /// Range of valid values for an AVUtterance rate.
     ///
     /// > The speech rate is a decimal representation within the range of `AVSpeechUtteranceMinimumSpeechRate` and
@@ -75,6 +76,10 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
         _ utterance: TTSUtterance,
         onSpeakRange: @escaping (Range<String.Index>) -> Void
     ) async -> Result<Void, TTSError> {
+        // A task cancelled before it got here was superseded: it must not reach the synthesizer.
+        guard !_Concurrency.Task.isCancelled else {
+            return .success(())
+        }
         let task = Task(
             utterance: utterance,
             onSpeakRange: onSpeakRange
@@ -86,8 +91,11 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
                 on(.play(task))
             }
         } onCancel: {
-            task.cancel()
-            on(.stop(task))
+            // The nested `Task` class shadows the concurrency type.
+            _Concurrency.Task { @MainActor in
+                task.cancel()
+                on(.stop(task))
+            }
         }
     }
 
@@ -300,21 +308,25 @@ public class AVTTSEngine: NSObject, TTSEngine, AVSpeechSynthesizerDelegate, Logg
             state = .stopping(current, queued: next)
             stopEngine()
 
+        // Every task leaves the state machine through `finish()`, so its `speak` returns.
         case let (.stopping(current, queued: next), .didFinish(finished)) where current == finished:
             if let next = next, !next.isCancelled {
                 state = .starting(next)
                 startEngine(with: next)
             } else {
                 state = .stopped
+                next?.finish()
             }
 
             current.finish()
 
-        case let (.stopping(current, queued: _), .play(next)):
+        case let (.stopping(current, queued: replaced), .play(next)):
             state = .stopping(current, queued: next)
+            replaced?.finish()
 
-        case let (.stopping(current, queued: _), .stop(toStop)) where current == toStop:
+        case let (.stopping(current, queued: queued?), .stop(toStop)) where queued == toStop:
             state = .stopping(current, queued: nil)
+            queued.finish()
 
         default:
             break
@@ -398,3 +410,7 @@ private extension AVSpeechSynthesisVoice {
         self.init(language: language.code.bcp47)
     }
 }
+
+/// AVFoundation declares no isolation for its delegate; the engine's state machine runs on the
+/// main actor and asserts it in `on(_:)`.
+extension AVTTSEngine: @preconcurrency AVSpeechSynthesizerDelegate {}
