@@ -10,8 +10,9 @@ import ReadiumShared
 public struct EPUBPendingLocationCommit: Equatable, Sendable {
     /// The navigator's `currentLocation` when the wait ended.
     public let location: Locator?
-    /// Work was still outstanding at the deadline, so `location` is the last
-    /// one committed before it.
+    /// A deadline passed with work still outstanding, the wait's own or that
+    /// of the calculation it waited on, so `location` is the last one
+    /// committed before the move.
     public let deadlinePassed: Bool
 }
 
@@ -32,7 +33,8 @@ public extension EPUBNavigatorViewController {
     /// the one before a move. Returns at once when nothing is outstanding or
     /// nothing would publish before a named event, and at
     /// `EPUBLocationPublication.calculationBudget` otherwise, with the last
-    /// committed location.
+    /// committed location. A calculation that outlives its own budget ends
+    /// the wait too, as a deadline passed.
     func awaitPendingLocationCommit() async -> EPUBPendingLocationCommit {
         locationPublication.spreadWork = { [weak self] in
             self?.currentSpreadLocationWork() ?? .idle

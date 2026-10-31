@@ -112,7 +112,13 @@ final class EPUBLocationPublication {
     var spreadWork: @MainActor () -> EPUBSpreadLocationWork = { .idle }
     private var commitWaiters: [Int: CommitWaiter] = [:]
     private var lastWaiterID = 0
-    private var isCommitWaitEvaluationScheduled = false
+    /// An evaluation of the commit waits is queued and has not run.
+    private(set) var isCommitWaitEvaluationScheduled = false
+
+    /// How many callers are suspended in `awaitPendingCommit()`.
+    var commitWaiterCount: Int {
+        commitWaiters.count
+    }
 
     /// Whether a calculation this publication started has not exited yet.
     var isCalculating: Bool {
@@ -239,14 +245,15 @@ final class EPUBLocationPublication {
 
     // MARK: - Pending commit wait
 
-    /// Waits until no commit is still to come, and answers whether
-    /// `calculationBudget` passed first. Returns at once when nothing would
-    /// publish before a named event. A state change, the deadline or the
-    /// caller's cancellation resumes it, never WebKit, so a call stuck there
-    /// cannot hold it past the deadline.
+    /// Waits until no commit is still to come, and answers whether a deadline
+    /// passed with work outstanding: the wait's own `calculationBudget`, or
+    /// the running calculation's, whose expiry leaves its move uncommitted.
+    /// Returns at once when nothing would publish before a named event. A
+    /// state change, the deadline or the caller's cancellation resumes it,
+    /// never WebKit, so a call stuck there cannot hold it past the deadline.
     func awaitPendingCommit() async -> Bool {
         guard isCommitPending else {
-            return false
+            return isOperationPending
         }
         lastWaiterID += 1
         let id = lastWaiterID
@@ -260,6 +267,8 @@ final class EPUBLocationPublication {
                 }
             }
         } onCancel: {
+            // While the waiter is registered its suspended call retains the
+            // publication, so `self` is there to remove and resume it.
             Task { @MainActor [weak self] in
                 self?.commitWaiters.removeValue(forKey: id)?.resume(deadlinePassed: false)
             }
@@ -297,6 +306,8 @@ final class EPUBLocationPublication {
             return
         }
         isCommitWaitEvaluationScheduled = true
+        // A registered waiter's suspended call retains the publication, so
+        // `self` outlives every waiter this evaluation could resume.
         Task { @MainActor [weak self] in
             self?.evaluateCommitWaits()
         }
@@ -307,10 +318,11 @@ final class EPUBLocationPublication {
         guard !isCommitPending else {
             return
         }
+        let deadlinePassed = isOperationPending
         let waiters = commitWaiters.values
         commitWaiters.removeAll()
         for waiter in waiters {
-            waiter.resume(deadlinePassed: false)
+            waiter.resume(deadlinePassed: deadlinePassed)
         }
     }
 
