@@ -368,13 +368,25 @@ final class EPUBLocationPublicationTests: XCTestCase {
         let deadlines = ManualDeadlines()
         let calculation = try Calculation(name: "a", href: XCTUnwrap(RelativeURL(path: "chapter.html")).anyURL)
         let commits = CommitRecorder()
-        var publication: EPUBLocationPublication? = EPUBLocationPublication(
-            scheduler: deadlines.scheduler,
-            initialLocation: nil,
-            position: { nil },
-            capture: { EPUBPublicationCapture(isCurrent: { true }, calculate: { await calculation.run() }) },
-            commit: { commits.titles.append($0.locator?.title ?? "nil") }
-        )
+        // Captured only by the calculation, so it goes when the publication's calculation task
+        // ends: once the publication is released, that task holds the last reference.
+        weak var calculationTaskToken: CalculationTaskToken?
+        var publication: EPUBLocationPublication? = {
+            let token = CalculationTaskToken()
+            calculationTaskToken = token
+            return EPUBLocationPublication(
+                scheduler: deadlines.scheduler,
+                initialLocation: nil,
+                position: { nil },
+                capture: {
+                    EPUBPublicationCapture(isCurrent: { true }, calculate: { [token] in
+                        withExtendedLifetime(token) {}
+                        return await calculation.run()
+                    })
+                },
+                commit: { commits.titles.append($0.locator?.title ?? "nil") }
+            )
+        }()
         publication?.setIdle(true)
         publication?.request()
         try await pollUntil { calculation.started }
@@ -384,8 +396,7 @@ final class EPUBLocationPublicationTests: XCTestCase {
         XCTAssertNil(weakPublication, "The running calculation kept the publication alive")
 
         calculation.release()
-        try await pollUntil { calculation.exited }
-        try await ContinuousClock().sleep(for: .milliseconds(50))
+        try await pollUntil { calculationTaskToken == nil }
         XCTAssertEqual(commits.titles, [], "The released publication's calculation committed")
     }
 
@@ -596,6 +607,26 @@ final class EPUBLocationPublicationTests: XCTestCase {
         try await fixture.waitUntil { wait.isFinished }
 
         XCTAssertEqual(wait.deadlinePassed, false)
+    }
+
+    /// A blocked spread ends the wait at once, but an expired calculation
+    /// still holding the slot left its move uncommitted: the calculation's
+    /// budget decides the outcome, so the wait reports a deadline passed.
+    func test_aBlockedSpreadBesideAnExpiredCalculationReportsTheDeadlinePassed() async throws {
+        let fixture = try PublicationFixture()
+        fixture.publication.setIdle(true)
+        fixture.spreadWork = .blocked
+        let a = fixture.offer("a")
+        fixture.publication.request()
+        try await fixture.waitUntil { a.started }
+        fixture.deadlines.advance(by: EPUBLocationPublication.calculationBudget)
+        XCTAssertTrue(fixture.publication.isOperationPending, "premise: the calculation expired")
+
+        let wait = fixture.startWait()
+        try await fixture.waitUntil { wait.isFinished }
+
+        XCTAssertEqual(wait.deadlinePassed, true)
+        a.release()
     }
 
     /// An expired calculation may never exit, and until it does nothing else
@@ -891,6 +922,8 @@ private final class PendingWait {
 /// Commits recorded apart from any fixture, so a test can release everything
 /// else.
 @MainActor
+private final class CalculationTaskToken: Sendable {}
+
 private final class CommitRecorder {
     var titles: [String] = []
 }
