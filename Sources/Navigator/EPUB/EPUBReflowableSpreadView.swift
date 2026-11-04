@@ -1032,13 +1032,12 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
         // a script can call `webkit.messageHandlers.visibleAnchorChanged.postMessage(...)`
         // directly with a forged payload — `WKUserContentController` registers
         // handlers on the page world, not an isolated world. Blast radius is
-        // bounded: the receiving reducer's lookup-miss arm in `.visibleAnchorChanged`
-        // (see `ReaderFeature+Persistence.swift`) treats the fragmentId as
-        // untrusted and only writes `currentChapterId` if the (href, fragmentId)
-        // pair is present in `visibleAnchorLookup` — which is sourced from the
-        // NCX, not the script. At worst, an attacker with a `<script>` block
-        // can lie about which sub-chapter the user is reading WITHIN the same
-        // spread.
+        // bounded: the host reader's lookup-miss arm for `.visibleAnchorChanged`
+        // treats the fragmentId as untrusted and only writes `currentChapterId`
+        // if the (href, fragmentId) pair is present in `visibleAnchorLookup` —
+        // which is sourced from the NCX, not the script. At worst, an attacker
+        // with a `<script>` block can lie about which sub-chapter the user is
+        // reading WITHIN the same spread.
         guard let anchorId = Self.decodeVisibleAnchorBody(body) else { return }
         delegate?.spreadView(self, visibleAnchorDidChange: anchorId)
     }

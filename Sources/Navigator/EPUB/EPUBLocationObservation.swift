@@ -216,10 +216,19 @@ final class EPUBLocationObservation {
     private let onAccepted: @MainActor (EPUBAcceptedObservation) -> Void
 
     private var authorityRevision: UInt64 = 0
-    private(set) var hasObligation = false
-    private var active: ActiveRead?
+    private(set) var hasObligation = false {
+        didSet { onPendingWorkChange?() }
+    }
+
+    private var active: ActiveRead? {
+        didSet { onPendingWorkChange?() }
+    }
+
     private var lastReadID = 0
-    private var hintWindowDeadline: EPUBScheduledDeadline?
+    private var hintWindowDeadline: EPUBScheduledDeadline? {
+        didSet { onPendingWorkChange?() }
+    }
+
     private var retryDeadline: EPUBScheduledDeadline?
     private var cycle = RecoveryCycle()
     private var handshakeRetryUsed = false
@@ -243,10 +252,32 @@ final class EPUBLocationObservation {
         active != nil
     }
 
-    private(set) var unavailability: EPUBObservationUnavailability?
+    private(set) var unavailability: EPUBObservationUnavailability? {
+        didSet { onPendingWorkChange?() }
+    }
+
     /// The capability hand-off failed, and so did its one re-issue. Reads wait
     /// until a grant re-issues it or a frame registers.
-    private(set) var isRegistrationMissing = false
+    private(set) var isRegistrationMissing = false {
+        didSet { onPendingWorkChange?() }
+    }
+
+    /// Told of every change that can move `pendingWork`, including those
+    /// that reach the navigator by no other route, such as a read failing
+    /// into unavailability. The navigator's commit wait sets it.
+    var onPendingWorkChange: (@MainActor () -> Void)?
+
+    /// What this spread still owes the navigator's publication.
+    var pendingWork: EPUBSpreadLocationWork {
+        if unavailability != nil || isRegistrationMissing {
+            return .blocked
+        }
+        if hasObligation || active != nil || hintWindowDeadline != nil {
+            return .working
+        }
+        return .idle
+    }
+
     /// The accepted sample, until an authoritative invalidation revokes it.
     private(set) var currentObservation: EPUBAcceptedObservation?
 
