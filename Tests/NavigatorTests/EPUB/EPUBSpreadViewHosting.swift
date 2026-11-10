@@ -160,8 +160,8 @@ enum EPUBSpreadViewHosting {
         """
 
         // Same earned-skip rule as `waitForDocumentLoad`, and deliberately the
-        // same shape: these two are the only skip sites, so they must not drift
-        // into disagreeing about what counts as the host's fault. Here the
+        // same shape: these and `waitForReady` are the only skip sites, so they must
+        // not drift into disagreeing about what counts as the host's fault. Here the
         // wrapper document is already loaded and it is the iframe that has not
         // arrived, so the signature is a readiness that has not failed —
         // a `.failed` or `.unavailable` spread is a navigator defect.
@@ -174,6 +174,39 @@ enum EPUBSpreadViewHosting {
                 """
                 Environment did not deliver the fixed-layout iframe resource — \
                 WebContent process is not making progress (see #1693). \(diagnosis)
+                """
+            )
+        }
+    }
+
+    /// Waits for a hosted spread to turn ready. Setup, like `waitForDocumentLoad`, and
+    /// skipping on the same signature: still `.loading` while WebKit reports a load in
+    /// progress (#1693). Host the spread first: one hosted after its load does not turn ready.
+    static func waitForReady(in spreadView: EPUBSpreadView) async throws {
+        do {
+            try await waitUntil(reportingFailure: false) {
+                if case .ready = spreadView.readiness.state {
+                    return true
+                }
+                return false
+            }
+        } catch {
+            let diagnosis = """
+            state=\(spreadView.readiness.state), \
+            isLoading=\(spreadView.webView.isLoading), \
+            progress=\(spreadView.webView.estimatedProgress)
+            """
+            guard
+                case .loading = spreadView.readiness.state,
+                spreadView.webView.isLoading
+            else {
+                XCTFail("Spread did not turn ready, and not for a reason the host explains: \(diagnosis)")
+                throw error
+            }
+            throw XCTSkip(
+                """
+                Environment did not deliver a ready spread — WebContent process is \
+                not making progress (see #1693). \(diagnosis)
                 """
             )
         }

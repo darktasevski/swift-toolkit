@@ -58,9 +58,12 @@ function appendVirtualColumnIfNeeded() {
   if (isScrollModeEnabled() || getColumnCountPerScreen() != 2) {
     virtualCol?.remove();
   } else {
+    var width = pageWidth();
+    if (width === null) {
+      return;
+    }
     var documentWidth = document.scrollingElement.scrollWidth;
-    var pageWidth = window.innerWidth;
-    var colCount = documentWidth / pageWidth;
+    var colCount = documentWidth / width;
     var hasOddColCount = (Math.round(colCount * 2) / 2) % 1 > 0.1;
     if (hasOddColCount) {
       if (virtualCol) {
@@ -154,8 +157,7 @@ export function scrollToId(id, animated) {
     return false;
   }
 
-  scrollToRect(element.getBoundingClientRect(), animated);
-  return true;
+  return scrollToRect(element.getBoundingClientRect(), animated);
 }
 
 // Position must be in the range [0 - 1], 0-100%.
@@ -262,17 +264,22 @@ function scrollTo({ left, top, animated } = {}) {
   });
 }
 
+// The scrollport's width, or null when it has none. Measured, never cached:
+// `innerWidth` reads 0 for a moment after a resource transition.
+function pageWidth() {
+  const width = document.scrollingElement.clientWidth;
+  return width > 0 ? width : null;
+}
+
 // Snap the offset to the start of its page, or null when the page has no width.
-// Measured, never cached: `innerWidth` reads 0 for a moment after a resource
-// transition, and a snap to a 0 width is `NaN`, which WebKit scrolls to 0.
 function snapOffset(offset) {
-  const pageWidth = document.scrollingElement.clientWidth;
-  if (!(Number.isFinite(pageWidth) && pageWidth > 0)) {
+  const width = pageWidth();
+  if (width === null) {
     return null;
   }
   const delta = isRTL() ? -1 : 1;
   const value = offset + delta;
-  return value - (value % pageWidth);
+  return value - (value % width);
 }
 
 function snapCurrentPosition() {

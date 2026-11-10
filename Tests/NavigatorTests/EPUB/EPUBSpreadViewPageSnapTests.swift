@@ -9,15 +9,18 @@ import ReadiumShared
 import WebKit
 import XCTest
 
-/// A body resize in a paginated resource re-snaps the scroll offset to the start of its page. The
-/// page is the scrollport's width, measured when the snap runs: `window.innerWidth`, the visual
-/// viewport, reads 0 for a moment after a resource transition while the layout is already sized, and
-/// a width of 0 snapped every offset to `NaN`, which WebKit writes to `scrollLeft` as 0 (#1677).
+/// A paginated resource measures its page as the scrollport's width when it uses it. The visual
+/// viewport (`window.innerWidth`, `visualViewport.width`) reads 0 for a moment after a resource
+/// transition while the layout is already sized, and a page width of 0 snapped every offset to
+/// `NaN`, which WebKit writes to `scrollLeft` as 0 (#1677).
 @MainActor
 final class EPUBSpreadViewPageSnapTests: XCTestCase {
     /// Paginated by its own columns, so the test does not depend on how ReadiumCSS lays out a page.
     private static let chapter: String = {
-        let paragraph = "<p>" + String(repeating: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", count: 40) + "</p>"
+        let text = String(repeating: "Lorem ipsum dolor sit amet, consectetur adipiscing elit. ", count: 40)
+        let paragraphs = (0 ..< 30).map { index in
+            index == 20 ? "<p id=\"later\">\(text)</p>" : "<p>\(text)</p>"
+        }
         return """
         <!doctype html>
         <html><head><style>
@@ -27,7 +30,7 @@ final class EPUBSpreadViewPageSnapTests: XCTestCase {
         }
         body { margin: 0 !important; padding: 0 !important; }
         </style></head><body>
-        \(String(repeating: paragraph, count: 30))
+        \(paragraphs.joined())
         </body></html>
         """
     }()
@@ -35,84 +38,145 @@ final class EPUBSpreadViewPageSnapTests: XCTestCase {
     /// Off a page boundary, so a snap that ran is visible as a move to the page start.
     private static let offPage = 37.0
 
-    /// What the page's own snap left behind once a body resize has run it.
-    private struct Snap {
-        let page: Double
-        let before: Double
-        let after: Double
+    private static let zeroVisualViewport = """
+    Object.defineProperty(window, "innerWidth", { configurable: true, get: () => 0 });
+    Object.defineProperty(window.visualViewport, "width", { configurable: true, get: () => 0 });
+    """
+
+    /// Also zeroes the scrollport, counting the reads that see it in `window.__widthReads`.
+    private static let zeroEveryWidth = zeroVisualViewport + """
+    window.__widthReads = 0;
+    Object.defineProperty(document.scrollingElement, "clientWidth", {
+      configurable: true,
+      get: () => { window.__widthReads += 1; return 0; },
+    });
+    """
+
+    /// Shared by every script: `frames(n)` waits n frames, and `afterResize(record)` stores what
+    /// `record` returns as the probe, in a frame after the page's own handling of the next body
+    /// resize. The page registered its observer at `load`, before this one, and its frame
+    /// callback was requested first, so it has run by then.
+    private static let prelude = """
+    const root = document.scrollingElement;
+    const page = root.clientWidth;
+    if (!(page > 0 && root.scrollWidth >= 4 * page)) {
+      return { error: `not paginated: page ${page}, scrollWidth ${root.scrollWidth}` };
     }
+    const frames = (count) => new Promise((resolve) => {
+      const step = (left) => (left === 0 ? resolve() : requestAnimationFrame(() => step(left - 1)));
+      step(count);
+    });
+    const afterResize = (record) => {
+      const observer = new ResizeObserver(() => {
+        observer.disconnect();
+        requestAnimationFrame(() => { window.__snapProbe = record(); });
+      });
+      observer.observe(document.body);
+    };
+    window.__snapProbe = null;
+    root.scrollLeft = 2 * page + offPage;
+    await frames(2);
+    const before = window.scrollX;
+
+    """
+
+    private static let growBody = #"document.body.append(document.createElement("p"), "A paragraph that grows the body.");"#
 
     func testAResizeWhileTheVisualViewportReadsZeroSnapsToThePageStart() async throws {
-        let snap = try await snapAfterResize(zeroing: #"Object.defineProperty(window, "innerWidth", { configurable: true, get: () => 0 });"#)
+        let probe = try await runInHostedSpread("""
+        \(Self.zeroVisualViewport)
+        afterResize(() => ({ page, before, after: window.scrollX }));
+        \(Self.growBody)
+        """)
 
-        XCTAssertEqual(snap.before, 2 * snap.page + Self.offPage, "The setup scroll did not hold")
-        XCTAssertEqual(snap.after, 2 * snap.page, "The snap measured the visual viewport instead of the scrollport")
+        let page = try number(probe, "page")
+        XCTAssertEqual(try number(probe, "before"), 2 * page + Self.offPage, "The setup scroll did not hold")
+        XCTAssertEqual(try number(probe, "after"), 2 * page, "The snap measured the visual viewport instead of the scrollport")
     }
 
     func testAResizeWithNoMeasurablePageLeavesTheOffsetAlone() async throws {
-        let snap = try await snapAfterResize(zeroing: """
-        Object.defineProperty(window, "innerWidth", { configurable: true, get: () => 0 });
-        Object.defineProperty(document.scrollingElement, "clientWidth", { configurable: true, get: () => 0 });
+        let probe = try await runInHostedSpread("""
+        \(Self.zeroEveryWidth)
+        afterResize(() => ({ page, before, after: window.scrollX, reads: window.__widthReads }));
+        \(Self.growBody)
         """)
 
-        XCTAssertEqual(snap.before, 2 * snap.page + Self.offPage, "The setup scroll did not hold")
-        XCTAssertEqual(snap.after, snap.before, "A snap with no page width moved the offset")
+        let before = try number(probe, "before")
+        XCTAssertEqual(before, try 2 * number(probe, "page") + Self.offPage, "The setup scroll did not hold")
+        XCTAssertGreaterThan(try number(probe, "reads"), 0, "The page's resize handling never measured the page")
+        XCTAssertEqual(try number(probe, "after"), before, "A snap with no page width moved the offset")
     }
 
-    /// Scrolls the third page off its boundary, runs `zeroing`, resizes the body, and reads the offset
-    /// in a frame after the page's own resize handling. Its observer was registered at `load`, before
-    /// this one, so its frame callback has already run.
-    private func snapAfterResize(zeroing: String) async throws -> Snap {
+    func testAJumpWithNoMeasurablePageLeavesTheOffsetAlone() async throws {
+        let probe = try await runInHostedSpread("""
+        \(Self.zeroEveryWidth)
+        readium.scrollToPosition(0.5, "ltr", false);
+        const positionReads = window.__widthReads;
+        const scrolledToId = readium.scrollToId("later", false);
+        await frames(2);
+        window.__snapProbe = { page, before, after: window.scrollX, positionReads, scrolledToId };
+        """)
+
+        XCTAssertEqual(try number(probe, "before"), try 2 * number(probe, "page") + Self.offPage, "The setup scroll did not hold")
+        XCTAssertGreaterThan(try number(probe, "positionReads"), 0, "The progression jump never measured the page")
+        XCTAssertEqual(probe["scrolledToId"] as? Bool, false, "A jump to an element with no page width reported success")
+        XCTAssertEqual(try number(probe, "after"), try number(probe, "before"), "A jump with no page width moved the offset")
+    }
+
+    /// Two columns per screen with an odd column count is what the page's virtual column exists
+    /// to even out; a resize while the visual viewport reads 0 must still do it.
+    func testAResizeWhileTheVisualViewportReadsZeroEvensOutTwoColumns() async throws {
+        let probe = try await runInHostedSpread("""
+        const isOdd = () => (Math.round((root.scrollWidth / root.clientWidth) * 2) / 2) % 1 > 0.1;
+        document.documentElement.style.setProperty("column-width", "auto", "important");
+        document.documentElement.style.setProperty("column-count", "2", "important");
+        await frames(4);
+        const columns = getComputedStyle(document.documentElement).columnCount;
+        if (columns !== "2" || isOdd()) {
+          return { error: `two columns did not settle even: column-count ${columns}, odd ${isOdd()}` };
+        }
+        \(Self.zeroVisualViewport)
+        let oddBefore;
+        afterResize(() => ({ oddBefore, oddAfter: isOdd() }));
+        const column = document.createElement("div");
+        column.style.breakBefore = "column";
+        column.textContent = "A column.";
+        document.body.append(column);
+        oddBefore = isOdd();
+        """)
+
+        XCTAssertEqual(probe["oddBefore"] as? Bool, true, "Setup: the added column did not make the count odd")
+        XCTAssertEqual(probe["oddAfter"] as? Bool, false, "The resize left two columns per screen with an odd column count")
+    }
+
+    /// Hosts the chapter, waits for it to turn ready, and runs `script` after `prelude` in the
+    /// page; the script's probe is `window.__snapProbe`, which this polls for.
+    private func runInHostedSpread(_ script: String) async throws -> [String: Any] {
         let spreadView = EPUBSpreadViewHosting.makeReflowableSpreadView(chapter: Self.chapter)
-        // Hosted before it loads: a spread hosted after its load does not turn ready, and one that
-        // turns ready goes to its opening location, which would move the offset under the test.
+        // Hosted before it loads: a spread that turns ready goes to its opening location, which
+        // would move the offset under the script.
         let window = EPUBSpreadViewHosting.host(spreadView)
         defer {
             spreadView.removeFromSuperview()
             window.isHidden = true
         }
-        try await waitForReady(spreadView)
+        try await EPUBSpreadViewHosting.waitForReady(in: spreadView)
 
-        let setup = """
-        const root = document.scrollingElement;
-        const page = root.clientWidth;
-        if (!(page > 0 && root.scrollWidth >= 4 * page)) {
-          return { error: `not paginated: page ${page}, scrollWidth ${root.scrollWidth}` };
-        }
-        root.scrollLeft = 2 * page + offPage;
-        await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(resolve)));
-        const before = window.scrollX;
-        \(zeroing)
-        window.__snapProbe = null;
-        let resized = false;
-        const observer = new ResizeObserver(() => {
-          // The observation's first callback reports the size the body already has.
-          if (!resized) {
-            return;
-          }
-          observer.disconnect();
-          requestAnimationFrame(() => {
-            window.__snapProbe = { page, before, after: window.scrollX };
-          });
-        });
-        observer.observe(document.body);
-        resized = true;
-        document.body.append(document.createElement("p"), "A paragraph that grows the body.");
-        return { ok: true };
-        """
         let started = try await spreadView.webView.callAsyncJavaScript(
-            setup,
+            Self.prelude + script + "\nreturn { ok: true };",
             arguments: ["offPage": Self.offPage],
             in: nil,
             contentWorld: .page
-        ) as? [String: Any]
-        if let error = started?["error"] as? String {
-            XCTFail("Fixture: \(error)")
+        )
+        let start = started as? [String: Any]
+        guard start?["ok"] as? Bool == true else {
+            XCTFail("Fixture: \(start?["error"] as? String ?? String(describing: started))")
             throw EPUBSpreadViewHosting.Timeout()
         }
 
+        // A liveness backstop like `EPUBSpreadViewHosting.waitUntil`'s, not a performance bound.
         let clock = ContinuousClock()
-        let deadline = clock.now.advanced(by: .seconds(10))
+        let deadline = clock.now.advanced(by: .seconds(30))
         while clock.now < deadline {
             let probe = try await spreadView.webView.callAsyncJavaScript(
                 "return window.__snapProbe;",
@@ -121,34 +185,15 @@ final class EPUBSpreadViewPageSnapTests: XCTestCase {
                 contentWorld: .page
             ) as? [String: Any]
             if let probe {
-                return try Snap(
-                    page: XCTUnwrap(probe["page"] as? Double),
-                    before: XCTUnwrap(probe["before"] as? Double),
-                    after: XCTUnwrap(probe["after"] as? Double)
-                )
+                return probe
             }
             try await clock.sleep(for: .milliseconds(20))
         }
-        XCTFail("The body resize never reached a frame")
+        XCTFail("The script's probe never arrived")
         throw EPUBSpreadViewHosting.Timeout()
     }
 
-    /// Setup, so only the #1693 signature skips: a load WebKit still reports in progress.
-    private func waitForReady(_ spreadView: EPUBSpreadView) async throws {
-        do {
-            try await EPUBSpreadViewHosting.waitUntil(reportingFailure: false) {
-                if case .ready = spreadView.readiness.state {
-                    return true
-                }
-                return false
-            }
-        } catch {
-            let diagnosis = "state=\(spreadView.readiness.state), isLoading=\(spreadView.webView.isLoading)"
-            guard case .loading = spreadView.readiness.state, spreadView.webView.isLoading else {
-                XCTFail("The spread did not turn ready: \(diagnosis)")
-                throw error
-            }
-            throw XCTSkip("WebContent process is not making progress (see #1693). \(diagnosis)")
-        }
+    private func number(_ probe: [String: Any], _ key: String) throws -> Double {
+        try XCTUnwrap(probe[key] as? Double, "Probe has no number \(key): \(probe)")
     }
 }
