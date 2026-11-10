@@ -261,6 +261,26 @@ change the public protocol. Until it lands, `AudioSession`'s nonisolated `start(
 | --- | --- |
 | `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerStateTests.swift` | The delegate has heard `.playing` then `.paused` when `pause()` returns; a word range reported after a pause leaves it paused; two skips in a row move two utterances on and the superseded one never reaches the engine; a new utterance starts only once the engine has returned the one it interrupts. `AVTTSEngine` has no test: its task and utterance types are private and it drives the real `AVSpeechSynthesizer`. |
 
+## Page snapping measures the scrollport (Reader app #1677)
+
+`utils.js` cached the page width from `window.innerWidth` on each body resize, starting at `0`. The visual viewport reads `0` for a moment after a resource transition while the layout is already sized (measured with live instrumentation, Reader app plan `2026-07-20-render-faithful-epub-index-locator-v7-refactor.md`, checkpoint 2026-07-24 09:01), and a snap to a width of `0` is `NaN`, which WebKit writes to `scrollLeft` as `0`: a resize in that window, or a snap before the first one, sent a paginated resource back to its first page. `pageWidth()` now measures `document.scrollingElement.clientWidth` when it is called, as `progressionScrollTarget` does, and answers `null` when the scrollport has no width. The snap and the two-column virtual-column check, the two width reads of the resize handler, both use it and leave the page alone on `null`.
+
+The hunk stands alone: it touches neither the fork's `progression.js` import nor its hint, so it can be offered upstream although the file as a whole stays divergent (see *Settled location reporting*). It deliberately does not share `progressionScrollTarget`'s snap or the isolated `reader-locator-commands.js` `snapOffset`, which would tie it to fork-only files. `scrollLeft`, `scrollRight` and `scrollToOffset` still take `window.innerWidth` as the page: no Swift code calls them, so they are left as upstream wrote them.
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/utils.js` | The `viewportWidth` cache is gone. `pageWidth()` reads the scrollport's width, `null` for none. On `null`, `snapCurrentPosition`, `scrollToPosition` and `appendVirtualColumnIfNeeded` change nothing, and `scrollToRect`, with `scrollToId` and `scrollToLocator` through it, returns `false`. | Yes, this hunk on its own — the bug is upstream's (2021 and 2025-05-15 lines). |
+| `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js` | Re-emitted by `pnpm run bundle`. | No (build artifacts). |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewPageSnapTests.swift` | 4 tests on a hosted, paginated spread. While the visual viewport reads `0`, a body resize snaps an off-boundary offset to its page start, and in two columns per screen evens out an odd column count. With no measurable scrollport, a resize and a jump (`scrollToPosition`, `scrollToId`) leave the offset alone, each shown to have measured the page in the same run, and `scrollToId` returns `false`. Each checks first that its setup held, since a spread that turns ready goes to its opening location. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewHosting.swift` | `waitForReady(in:)`, the third earned-skip site beside `waitForDocumentLoad` and `waitForFixedResourceLoad`. |
+
 ## Upstream-rebase guidance
 
 The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
