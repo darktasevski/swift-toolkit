@@ -44,7 +44,6 @@ window.addEventListener(
 );
 
 function onViewportWidthChanged() {
-  viewportWidth = window.innerWidth;
   appendVirtualColumnIfNeeded();
   snapCurrentPosition();
 }
@@ -79,7 +78,6 @@ function appendVirtualColumnIfNeeded() {
 
 var lastKnownProgressions;
 var ticking = false;
-var viewportWidth = 0;
 
 /**
  * First and last progressions in range [0 - 1].
@@ -180,8 +178,10 @@ export function scrollToPosition(position, dir, animated) {
   } else {
     var documentWidth = document.scrollingElement.scrollWidth;
     var factor = dir == "rtl" ? -1 : 1;
-    let offset = documentWidth * position * factor;
-    scrollTo({ left: snapOffset(offset), animated });
+    let offset = snapOffset(documentWidth * position * factor);
+    if (offset !== null) {
+      scrollTo({ left: offset, animated });
+    }
   }
 }
 
@@ -205,7 +205,11 @@ function scrollToRect(rect, animated) {
   if (isScrollModeEnabled()) {
     scrollTo({ top: rect.top + window.scrollY, animated });
   } else {
-    scrollTo({ left: snapOffset(rect.left + window.scrollX), animated });
+    let offset = snapOffset(rect.left + window.scrollX);
+    if (offset === null) {
+      return false;
+    }
+    scrollTo({ left: offset, animated });
   }
 
   return true;
@@ -258,11 +262,17 @@ function scrollTo({ left, top, animated } = {}) {
   });
 }
 
-// Snap the offset to the screen width (page width).
+// Snap the offset to the start of its page, or null when the page has no width.
+// Measured, never cached: `innerWidth` reads 0 for a moment after a resource
+// transition, and a snap to a 0 width is `NaN`, which WebKit scrolls to 0.
 function snapOffset(offset) {
+  const pageWidth = document.scrollingElement.clientWidth;
+  if (!(Number.isFinite(pageWidth) && pageWidth > 0)) {
+    return null;
+  }
   const delta = isRTL() ? -1 : 1;
   const value = offset + delta;
-  return value - (value % viewportWidth);
+  return value - (value % pageWidth);
 }
 
 function snapCurrentPosition() {
@@ -271,6 +281,9 @@ function snapCurrentPosition() {
   }
   var currentOffset = window.scrollX;
   var currentOffsetSnapped = snapOffset(currentOffset + 1);
+  if (currentOffsetSnapped === null) {
+    return;
+  }
 
   document.scrollingElement.scrollLeft = currentOffsetSnapped;
 }
