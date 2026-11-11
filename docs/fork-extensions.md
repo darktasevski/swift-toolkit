@@ -267,6 +267,7 @@ come from the navigator itself and pass through no host control: the restart aft
 jump made while playing, and the advance to the next resource. A host that silenced the engine
 (the Reader app's App Lock playback hold) was undone by a start already issued, which ran on the
 next main-actor turn. A pause tapped while a first play was still loading was lost the same way.
+Design record: [§ D6 of the App Lock design in the host repository](../../docs/superpowers/specs/2026-10-27-catalyst-app-lock-design.md#d6-audio-while-locked-root-r5).
 
 ### Modified upstream files
 
@@ -278,7 +279,7 @@ next main-actor turn. A pause tapped while a first play was still loading was lo
 
 | Path | Coverage |
 | --- | --- |
-| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; a toggle pauses a pending start and starts again after one ran to its end; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. |
+| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; the gate refuses an advance; a toggle pauses a pending start, leaving the audio session unstarted, and starts again after a start ran to its end, after the last resource ends, and after the next resource fails to load; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. |
 
 ## Upstream-rebase guidance
 

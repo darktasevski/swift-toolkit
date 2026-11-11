@@ -326,7 +326,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 
     /// Pauses the playback, and cancels a start still pending: a play whose first resource is
-    /// loading, the restart after a seek or a jump, or an advance to the next resource.
+    /// loading, the restart a seek or a jump made while playing issues once it lands, or an advance
+    /// to the next resource. A seek or a jump still in flight restarts when it lands, even after a
+    /// pause: each reads whether it was playing when it began.
     public func pause() {
         playTask = nil
         engine.pause()
