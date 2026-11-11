@@ -260,6 +260,26 @@ change the public protocol. Until it lands, `AudioSession`'s nonisolated `start(
 | --- | --- |
 | `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerStateTests.swift` | The delegate has heard `.playing` then `.paused` when `pause()` returns; a word range reported after a pause leaves it paused; two skips in a row move two utterances on and the superseded one never reaches the engine; a new utterance starts only once the engine has returned the one it interrupts. `AVTTSEngine` has no test: its task and utterance types are private and it drives the real `AVSpeechSynthesizer`. |
 
+## Audio playback starts meet a gate, and a pause wins over a pending start
+
+`AudioNavigator.play()` starts the engine in a task, and `pause()` did not cancel it. Three starts
+come from the navigator itself and pass through no host control: the restart after a seek or a
+jump made while playing, and the advance to the next resource. A host that silenced the engine
+(the Reader app's App Lock playback hold) was undone by a start already issued, which ran on the
+next main-actor turn. A pause tapped while a first play was still loading was lost the same way.
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/Audiobook/AudioNavigator.swift` | `AudioNavigatorDelegate.navigatorShouldStartPlayback(_:)` (default `true`), asked when the start task begins and again once the first resource has loaded. `pause()` cancels the pending start task; `playPause()` counts a pending start as playing. The advance to the next resource is kept as that task. `seek(to:)` and `go(to:)` pause the engine directly, so a seek keeps a pending play and `play()`'s own opening jump does not cancel it. A start task clears itself once it ends uncancelled. | Yes |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; a toggle pauses a pending start and starts again after one ran to its end; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. |
+
 ## Upstream-rebase guidance
 
 The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
