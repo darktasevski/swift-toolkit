@@ -251,8 +251,9 @@ fixes upstream does not have.
 
 Not carried: #808's audio-session half. It makes `AudioSessionManaging` `@MainActor` with a
 token-returning `start` and `end(with:)`, and gives `AudioSessionUser` an `isolated deinit`; both
-change the public protocol. Until it lands, `AudioSession`'s nonisolated `start(with:isPlaying:)`,
-`user(_:didChangePlaying:)` and `end(for:)` each post an unordered task.
+change the public protocol. Until it lands, `AudioSession`'s nonisolated `user(_:didChangePlaying:)` and
+`end(for:)` each post an unordered task. `start(with:isPlaying:)` is main-actor and synchronous,
+for the start gate (§ Audio playback starts meet a gate).
 
 ### Tests
 
@@ -273,13 +274,15 @@ Design record: [§ D6 of the App Lock design in the host repository](../../docs/
 
 | Path | Change | Upstream-PR-ready? |
 | --- | --- | --- |
-| `Sources/Navigator/Audiobook/AudioNavigator.swift` | `AudioNavigatorDelegate.navigatorShouldStartPlayback(_:)` (default `true`), asked when the start task begins and again once the first resource has loaded. `pause()` cancels the pending start task; `playPause()` counts a pending start as playing. The advance to the next resource is kept as that task. `seek(to:)` and `go(to:)` pause the engine directly, so a seek keeps a pending play and `play()`'s own opening jump does not cancel it. A start task clears itself once it ends uncancelled. | Yes |
+| `Sources/Navigator/Audiobook/AudioNavigator.swift` | `AudioNavigatorDelegate.navigatorShouldStartPlayback(_:)` (default `true`), asked when the start task begins and again once the first resource has loaded. `pause()` cancels the pending start task; `playPause()` counts a pending start as playing. The advance to the next resource is kept as that task. `seek(to:)` and `go(to:)` pause the engine directly, so a seek keeps a pending play and `play()`'s own opening jump does not cancel it. A start task clears itself once it ends uncancelled. The audio session starts only after the last gate check admits the start, and before the engine plays, so a refused start interrupts no other app's audio. | Yes |
+| `Sources/Shared/Toolkit/Media/AudioSession.swift` | `AudioSessionManaging.start(with:isPlaying:)` is `@MainActor`, and `AudioSession` activates the session before it returns instead of posting a task, so an engine started next plays in an active session. A start for the current user activates a session that ended under it, as on going to the background while paused. `init()`, `appDidEnterBackground()` and the `isSessionStarted` getter are internal, for tests. This is a narrower step than #808's audio-session half (below). `end(for:)` stays nonisolated, because `AudioNavigator`'s `deinit` calls it. | No: #808 replaces the protocol |
 
 ### Tests
 
 | Path | Coverage |
 | --- | --- |
-| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; the gate refuses an advance; a toggle pauses a pending start, leaving the audio session unstarted, and starts again after a start ran to its end, after the last resource ends, and after the next resource fails to load; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. |
+| `Tests/SharedTests/Toolkit/Media/AudioSessionTests.swift` | `start(with:isPlaying:)` has activated the session when it returns, and activates it again for a user whose session ended on going to the background. |
+| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | A start refused after the first load leaves the audio session off; the session starts after the load and before the engine plays. A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; the gate refuses an advance; a toggle pauses a pending start, leaving the audio session unstarted, and starts again after a start ran to its end, after the last resource ends, and after the next resource fails to load; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. |
 
 ## Upstream-rebase guidance
 

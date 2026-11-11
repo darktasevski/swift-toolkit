@@ -106,6 +106,19 @@ struct AudioNavigatorStartTests {
             #expect(fixture.engine.playCount == 0)
         }
 
+        /// A start refused once the first resource has loaded leaves the audio session off, so other
+        /// apps' audio is never interrupted for a start that does not play.
+        @Test func refusalAfterTheFirstLoadStartsNoAudioSession() async throws {
+            let fixture = StartFixture()
+            fixture.delegate.answers = [true, false]
+
+            fixture.navigator.play()
+            try await waitUntil { fixture.delegate.askCount == 2 }
+            await settle()
+
+            #expect(fixture.audioSession.startCount == 0)
+        }
+
         @Test func refusesASeekRestart() async throws {
             let fixture = try await StartFixture.playing()
             fixture.delegate.answers = [false]
@@ -194,6 +207,17 @@ struct AudioNavigatorStartTests {
             #expect(fixture.engine.playCount == 1)
         }
 
+        /// The session comes on only once the last gate check admits the start, and before the engine
+        /// plays.
+        @Test func startsTheSessionAfterTheLoadAndBeforeTheEngine() async throws {
+            let fixture = StartFixture()
+
+            fixture.navigator.play()
+            try await waitUntil { fixture.engine.playCount == 1 }
+
+            #expect(fixture.events.all == ["load", "session", "play"])
+        }
+
         @Test func survivesASeek() async throws {
             let fixture = StartFixture()
 
@@ -230,12 +254,15 @@ private func waitUntil(_ condition: () -> Bool) async throws {
 
 @MainActor
 private final class StartFixture {
-    let engine = StartRecordingEngine()
-    let audioSession = StartRecordingAudioSession()
+    let events = StartEvents()
+    let engine: StartRecordingEngine
+    let audioSession: StartRecordingAudioSession
     let delegate = StartDelegate()
     let navigator: AudioNavigator
 
     init(resources: Int = 1) {
+        engine = StartRecordingEngine(events: events)
+        audioSession = StartRecordingAudioSession(events: events)
         let readingOrder = (0 ..< resources).map {
             Link(href: "track\($0).mp3", mediaType: .mp3, duration: 60)
         }
@@ -291,11 +318,26 @@ private final class StartDelegate: AudioNavigatorDelegate {
     func navigator(_: any Navigator, presentError _: NavigatorError) {}
 }
 
+/// The order in which the session and the engine are reached.
+private final class StartEvents {
+    private(set) var all: [String] = []
+
+    func record(_ event: String) {
+        all.append(event)
+    }
+}
+
 private final class StartRecordingAudioSession: AudioSessionManaging {
+    private let events: StartEvents
     private(set) var startCount = 0
+
+    init(events: StartEvents) {
+        self.events = events
+    }
 
     func start(with _: AudioSessionUser, isPlaying _: Bool) {
         startCount += 1
+        events.record("session")
     }
 
     func end(for _: AudioSessionUser) {}
@@ -310,6 +352,11 @@ private enum StartRecordingEngineError: Error {
 @MainActor
 private final class StartRecordingEngine: AudioPlaybackEngine {
     weak var delegate: AudioPlaybackEngineDelegate?
+    private let events: StartEvents
+
+    init(events: StartEvents) {
+        self.events = events
+    }
 
     private(set) var state: AudioEnginePlaybackState = .stopped
     private(set) var currentTime: Double = 0
@@ -326,6 +373,7 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
 
     func load(_: AVURLAsset, originalFileURL _: URL?) async throws {
         loadCount += 1
+        events.record("load")
         if failsLoads {
             throw StartRecordingEngineError.loadFailed
         }
@@ -342,6 +390,7 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
 
     func play() {
         playCount += 1
+        events.record("play")
         send(.playing)
     }
 

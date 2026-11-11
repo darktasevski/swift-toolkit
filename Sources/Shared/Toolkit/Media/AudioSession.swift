@@ -26,8 +26,8 @@ public extension AudioSessionUser {
 
 /// Manages the app's audio session for Readium audio consumers.
 public protocol AudioSessionManaging {
-    /// Starts a new audio session with the given `user`.
-    func start(with user: AudioSessionUser, isPlaying: Bool)
+    /// Starts an audio session with the given `user`, active by the time it returns.
+    @MainActor func start(with user: AudioSessionUser, isPlaying: Bool)
 
     /// Ends the current audio session.
     func end(for user: AudioSessionUser)
@@ -61,7 +61,8 @@ public final class AudioSession: AudioSessionManaging, Loggable {
     /// Shared `AudioSession` for this app.
     public nonisolated static let shared = AudioSession()
 
-    private nonisolated init() {
+    /// Internal so a test can own an instance; the app uses `shared`.
+    nonisolated init() {
         Task {
             await observeAppStateChanges()
         }
@@ -84,24 +85,18 @@ public final class AudioSession: AudioSessionManaging, Loggable {
     /// Current user of the `AudioSession`.
     private var user: User?
 
-    /// Starts a new audio session with the given `user`.
-    public nonisolated func start(with user: AudioSessionUser, isPlaying: Bool) {
-        Task {
-            await start(with: user, isPlaying: isPlaying)
-        }
-    }
-
-    private func start(with user: AudioSessionUser, isPlaying: Bool) async {
+    /// Starts an audio session with the given `user`, active by the time it returns, so an engine the
+    /// caller starts next plays in it. The current user gets its session back if it ended while the
+    /// user stayed, as on going to the background while paused.
+    public func start(with user: AudioSessionUser, isPlaying: Bool) {
         let id = ObjectIdentifier(user)
-        guard self.user?.id != id else {
-            return
+        if self.user?.id != id {
+            if let oldUser = self.user {
+                end(forUserID: oldUser.id)
+            }
+            self.user = User(user)
+            self.isPlaying = false
         }
-
-        if let oldUser = self.user {
-            end(forUserID: oldUser.id)
-        }
-        self.user = User(user)
-        self.isPlaying = false
 
         startSession(with: user.audioConfiguration)
     }
@@ -155,7 +150,7 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         NotificationCenter.default.addObserver(self, selector: #selector(appDidEnterBackground), name: UIApplication.didEnterBackgroundNotification, object: nil)
     }
 
-    @objc private func appDidEnterBackground() {
+    @objc func appDidEnterBackground() {
         if !isPlaying {
             endSession()
         }
@@ -163,7 +158,7 @@ public final class AudioSession: AudioSessionManaging, Loggable {
 
     // MARK: Session management
 
-    private var isSessionStarted = false
+    private(set) var isSessionStarted = false
 
     private func startSession(with config: Configuration) {
         guard !isSessionStarted else {

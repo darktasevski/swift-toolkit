@@ -11,13 +11,14 @@ import XCTest
 
 @MainActor
 final class AudioNavigatorAudioSessionTests: XCTestCase {
-    func testPlayStartsInjectedAudioSession() async {
+    /// The session starts once the first resource has loaded, so the wait polls rather than yields.
+    func testPlayStartsInjectedAudioSession() async throws {
         let audioSession = RecordingAudioSessionManager()
         let (navigator, _) = makeNavigator(audioSession: audioSession)
 
         navigator.play()
-        for _ in 0 ..< 10 where audioSession.startCount == 0 {
-            await Task.yield()
+        for _ in 0 ..< 200 where audioSession.startCount == 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
         }
 
         XCTAssertEqual(audioSession.startCount, 1)

@@ -304,12 +304,13 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     ///
     /// The engine starts in a task, which a later `pause()` cancels. The delegate's
     /// `navigatorShouldStartPlayback(_:)` is asked when the task starts and again once the first
-    /// resource has loaded, so a start meets the answer of the moment it would play.
+    /// resource has loaded, so a start meets the answer of the moment it would play. The audio
+    /// session comes on only once that last answer admits the start, and before the engine plays:
+    /// a refused start interrupts no other app's audio.
     public func play() {
         playTask = Task { @MainActor in
             defer { clearPlayTaskIfCurrent() }
             guard !Task.isCancelled, shouldStartPlayback() else { return }
-            audioSession.start(with: self, isPlaying: false)
 
             if !hasLoadedAsset {
                 if let location = initialLocation {
@@ -319,6 +320,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                 }
             }
             guard !Task.isCancelled, shouldStartPlayback() else { return }
+            audioSession.start(with: self, isPlaying: false)
             // Apply speed before starting playback (not applied when paused)
             engine.rate = Float(settings.speed)
             engine.play()
