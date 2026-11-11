@@ -66,6 +66,14 @@ class ZIPFoundationContainerTests: XCTestCase {
         try await AssertEntry(path: "A folder/Sub.folder%/file-compressed.txt", in: container, isCompressed: true, length: 8659, originalLength: 29609)
     }
 
+    func testBoundedReadClampsToEndOfEntry() async throws {
+        let archive = try await container(for: "test.zip")
+        let entry = try XCTUnwrap(archive[AnyURL(path: "uncompressed.txt")!])
+        let expected = try await entry.read().get()
+        let bounded = try await entry.read(range: 0 ..< 16 * 1024 * 1024 + 1).get()
+        XCTAssertEqual(bounded, expected)
+    }
+
     func testReadCompressedEntry() async throws {
         let container = try await container(for: "test.zip")
         let entry = try XCTUnwrap(try container[XCTUnwrap(AnyURL(path: "A folder/Sub.folder%/file-compressed.txt"))])
