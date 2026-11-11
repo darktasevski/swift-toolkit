@@ -59,11 +59,12 @@ extension EPUBSpreadView {
         delegate?.spreadView(self, didTapOnExternalURL: url)
     }
 
-    /// Replaces WebKit's link context menu. Returning `nil` would not suppress it for an `http(s)`
-    /// link: WebKit's source falls back to DataDetectors' URL menu, whose preview loads the
-    /// destination and whose "Open Link" hands it to Safari without consulting the navigation
-    /// policy. A non-`nil` configuration with no `previewProvider` skips that fallback and loads
-    /// nothing.
+    /// The fallback for a link menu WebKit still requests through the UI delegate. The gesture
+    /// bridge presents the usual one (`configurePublicationMenu`) and `WebView` disables link
+    /// previews. Returning `nil` would not suppress WebKit's menu for an `http(s)` link: WebKit's
+    /// source falls back to DataDetectors' URL menu, whose preview loads the destination and whose
+    /// "Open Link" hands it to Safari without consulting the navigation policy. A non-`nil`
+    /// configuration with no `previewProvider` skips that fallback and loads nothing.
     func webView(
         _: WKWebView,
         contextMenuConfigurationForElement elementInfo: WKContextMenuElementInfo,

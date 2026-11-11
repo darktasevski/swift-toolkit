@@ -74,9 +74,12 @@ an image inside it. Internal links have no long-press action.
 
 For a packaged bitmap, `EPUBPublicationMenu` offers Save Image and Share.
 Long-press the image on iOS or right-click it on Catalyst. Both reflowable and fixed-layout spreads use the same menu (#3660).
-Copy is available when the host supplies `Configuration.copyImage` and the publication
-has no content-protection service. The host receives PNG data only after the user
-selects Copy. `EPUBMenuImage` limits input bytes and pixel dimensions before decoding.
+Copy is available when the host supplies `Configuration.copyImage`. The host receives PNG
+data only after the user selects Copy. A publication with a content-protection service gets
+no image menu: Readium defines rights for text only, and the selection menu already drops
+Share for such a publication. `EPUBMenuImage` limits input bytes and pixel dimensions before
+decoding, and admits only the EPUB core raster types (JPEG, PNG, GIF, WebP) judged by the
+bytes, since manifests often mislabel images.
 The bridge accepts resource addresses for menu presentation and has no operation that writes a clipboard.
 
 The host chooses how to present the destination after Open Link. The action sheet omits
