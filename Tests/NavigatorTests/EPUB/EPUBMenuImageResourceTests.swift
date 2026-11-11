@@ -34,9 +34,16 @@ final class EPUBMenuImageResourceTests: XCTestCase {
         XCTAssertNil(resolve(sourceURL: AnyURL(string: "https://example.org/image.png")?.absoluteURL))
     }
 
-    func testWrongEncodedTypeIsRejected() async throws {
+    func testMislabeledImageTakesItsEncodedType() async throws {
         let png = try imageData(type: .png, width: 2, height: 3)
         let image = try XCTUnwrap(resolve(data: png, mediaType: .jpeg))
+        let content = await image.read()
+        XCTAssertEqual(content?.type, .png)
+    }
+
+    func testEncodingOutsideTheEPUBCoreRasterTypesIsRejected() async throws {
+        let tiff = try imageData(type: .tiff, width: 2, height: 3)
+        let image = try XCTUnwrap(resolve(data: tiff))
         let content = await image.read()
         XCTAssertNil(content)
     }

@@ -15,10 +15,11 @@ struct EPUBMenuImage {
     private static let byteLimit = 16 * 1024 * 1024
     private static let pixelLimit = 8 * 1024 * 1024
     private static let dimensionLimit = 8192
-    private static let decodableTypes = Set(CGImageSourceCopyTypeIdentifiers() as? [String] ?? [])
+    /// The EPUB core raster media types. Photos accepts each of them, and ImageIO never
+    /// parses a rarer format on a book's behalf.
+    private static let admittedTypes: Set<UTType> = [.jpeg, .png, .gif, .webP]
 
     private let resource: Resource
-    private let type: UTType
 
     static func resolve(_ url: URL, publication: Publication, baseURL: AbsoluteURL) -> Self? {
         guard
@@ -26,12 +27,11 @@ struct EPUBMenuImage {
             url.host == baseURL.host, let href = baseURL.relativize(url),
             let link = publication.linkWithHREF(href), !link.templated, link.url().relativeURL != nil,
             let mediaType = link.mediaType, mediaType.isBitmap,
-            let type = UTType(mimeType: mediaType.string), decodableTypes.contains(type.identifier),
             let resource = publication.get(link),
             resource.sourceURL == nil || resource.sourceURL?.scheme == .file
         else { return nil }
 
-        return Self(resource: resource, type: type)
+        return Self(resource: resource)
     }
 
     func read() async -> Contents? {
@@ -52,18 +52,21 @@ struct EPUBMenuImage {
             bytes.append(chunk)
         }
         guard case .success = result, !oversized, !Task.isCancelled else { return nil }
-        return Contents(bytes: bytes, type: type)
+        return Contents(bytes: bytes)
     }
 
     struct Contents: Sendable {
         fileprivate let bytes: Data
-        fileprivate let type: UTType
+        /// The encoded type, which Save and Share declare. Manifests often mislabel
+        /// images, so the bytes decide it rather than the declared media type.
+        let type: UTType
         private let longestSide: Int
 
-        fileprivate init?(bytes: Data, type: UTType) {
+        fileprivate init?(bytes: Data) {
             guard
                 let source = Self.imageSource(bytes),
-                CGImageSourceGetType(source) as String? == type.identifier,
+                let identifier = CGImageSourceGetType(source) as String?,
+                let type = UTType(identifier), EPUBMenuImage.admittedTypes.contains(type),
                 CGImageSourceGetStatus(source) == .statusComplete,
                 let properties = CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any],
                 let width = properties[kCGImagePropertyPixelWidth] as? Int,
