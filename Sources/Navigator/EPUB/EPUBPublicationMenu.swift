@@ -61,16 +61,21 @@ extension EPUBSpreadView {
         CGRect(x: bounds.width * normalized.x, y: bounds.height * normalized.y, width: 1, height: 1)
     }
 
-    private var imageCopySink: (@MainActor @Sendable (Data) -> Void)? {
-        viewModel.publication.isProtected ? nil : viewModel.config.copyImage
+    /// Readium defines rights for text only. A protected publication therefore exports no
+    /// image, as its selection menu offers no Share (`EditingActionsController.canShare`).
+    private var canExportImages: Bool {
+        !viewModel.publication.isProtected
     }
 
     func imageMenu(for url: URL, at point: CGPoint) -> UIAlertController? {
-        guard let image = EPUBMenuImage.resolve(url, publication: viewModel.publication, baseURL: viewModel.publicationBaseURL) else { return nil }
+        guard
+            canExportImages,
+            let image = EPUBMenuImage.resolve(url, publication: viewModel.publication, baseURL: viewModel.publicationBaseURL)
+        else { return nil }
         let sheet = UIAlertController(title: nil, message: nil, preferredStyle: .actionSheet)
         let rect = menuAnchor(point)
         let generation = readiness.generation
-        let actions: [EPUBPublicationMenu.ImageAction] = imageCopySink == nil ? [.save, .share] : [.copy, .save, .share]
+        let actions: [EPUBPublicationMenu.ImageAction] = viewModel.config.copyImage == nil ? [.save, .share] : [.copy, .save, .share]
         for action in actions {
             let item = UIAlertAction(title: action.title, style: .default) { [weak self] _ in
                 Task { @MainActor [weak self] in
@@ -94,7 +99,7 @@ extension EPUBSpreadView {
         @MainActor func isCurrent() -> Bool {
             window != nil && readiness.generation == generation
         }
-        guard isCurrent(), action != .copy || imageCopySink != nil else { return }
+        guard isCurrent(), canExportImages, action != .copy || viewModel.config.copyImage != nil else { return }
         guard let contents = await image.read() else {
             if isCurrent() {
                 presentImageActionError()
@@ -104,14 +109,13 @@ extension EPUBSpreadView {
         guard isCurrent() else { return }
         switch action {
         case .copy:
-            guard imageCopySink != nil else { return }
             guard let png = await contents.pngData() else {
                 if isCurrent() {
                     presentImageActionError()
                 }
                 return
             }
-            guard isCurrent(), let sink = imageCopySink else { return }
+            guard isCurrent(), let sink = viewModel.config.copyImage else { return }
             sink(png)
         case .save:
             do {

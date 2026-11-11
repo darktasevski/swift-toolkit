@@ -11,18 +11,17 @@ import XCTest
 
 @MainActor
 final class EPUBPublicationMenuTests: XCTestCase {
-    func testUnlockedProtectedPublicationOffersSaveAndShare() throws {
-        let menu = try imageMenu(protected: true, hasCopySink: true)
-        XCTAssertEqual(menu.actions.map(\.title), titles([.save, .share]))
+    func testUnlockedProtectedPublicationOffersNoImageMenu() {
+        XCTAssertNil(imageMenu(protected: true, hasCopySink: true))
     }
 
     func testUnprotectedPublicationWithCopySinkOffersCopySaveAndShare() throws {
-        let menu = try imageMenu(protected: false, hasCopySink: true)
+        let menu = try XCTUnwrap(imageMenu(protected: false, hasCopySink: true))
         XCTAssertEqual(menu.actions.map(\.title), titles([.copy, .save, .share]))
     }
 
     func testUnprotectedPublicationWithoutCopySinkOffersSaveAndShare() throws {
-        let menu = try imageMenu(protected: false, hasCopySink: false)
+        let menu = try XCTUnwrap(imageMenu(protected: false, hasCopySink: false))
         XCTAssertEqual(menu.actions.map(\.title), titles([.save, .share]))
     }
 
@@ -66,7 +65,7 @@ final class EPUBPublicationMenuTests: XCTestCase {
         actions.map(\.title)
     }
 
-    private func imageMenu(protected: Bool, hasCopySink: Bool) throws -> UIAlertController {
+    private func imageMenu(protected: Bool, hasCopySink: Bool) -> UIAlertController? {
         let sink: (@MainActor @Sendable (Data) -> Void)?
         if hasCopySink {
             sink = { _ in XCTFail("Opening the menu performed Copy") }
@@ -74,7 +73,7 @@ final class EPUBPublicationMenuTests: XCTestCase {
             sink = nil
         }
         let (spread, url) = makeFixture(protected: protected, copySink: sink)
-        return try XCTUnwrap(spread.imageMenu(for: url, at: .zero))
+        return spread.imageMenu(for: url, at: .zero)
     }
 
     private func makeFixture(protected: Bool, copySink: (@MainActor @Sendable (Data) -> Void)?) -> (EPUBReflowableSpreadView, URL) {
