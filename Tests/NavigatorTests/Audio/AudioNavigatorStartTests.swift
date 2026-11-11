@@ -115,6 +115,19 @@ struct AudioNavigatorStartTests {
 
             #expect(fixture.engine.playCount == 1)
         }
+
+        /// `Restart.advancePlaysTheNextResource` is the positive control: the same release, admitted,
+        /// plays within the bound.
+        @Test func refusesAnAdvance() async throws {
+            let fixture = try await StartFixture.advancing()
+            fixture.delegate.answers = [false]
+
+            fixture.engine.releaseLoad()
+            try await Task.sleep(nanoseconds: boundedWait)
+
+            #expect(fixture.engine.loadCount == 2)
+            #expect(fixture.engine.playCount == 1)
+        }
     }
 
     @MainActor
@@ -127,12 +140,38 @@ struct AudioNavigatorStartTests {
             await settle()
 
             #expect(fixture.engine.playCount == 0)
+            #expect(fixture.audioSession.startCount == 0)
         }
 
         @Test func startsAgainAfterAStartRanToItsEnd() async throws {
             let fixture = try await StartFixture.playing()
             fixture.engine.stopOnItsOwn()
 
+            fixture.navigator.playPause()
+
+            try await waitUntil { fixture.engine.playCount == 2 }
+        }
+
+        /// The advance off the last resource ends without a play, so it must not stay the pending
+        /// start the toggle would cancel.
+        @Test func startsAgainAfterTheLastResourceEnds() async throws {
+            let fixture = try await StartFixture.playing()
+
+            fixture.engine.finish()
+            try await waitUntil { fixture.delegate.nextResourceAskCount == 1 }
+            await settle()
+            fixture.navigator.playPause()
+
+            try await waitUntil { fixture.engine.playCount == 2 }
+        }
+
+        @Test func startsAgainAfterTheNextResourceFailsToLoad() async throws {
+            let fixture = try await StartFixture.playing(resources: 2)
+            fixture.engine.failsLoads = true
+
+            fixture.engine.finish()
+            try await waitUntil { fixture.engine.loadCount == 2 }
+            await settle()
             fixture.navigator.playPause()
 
             try await waitUntil { fixture.engine.playCount == 2 }
@@ -236,11 +275,17 @@ private final class StartDelegate: AudioNavigatorDelegate {
     /// Answers in order; the last one repeats. Admits when empty.
     var answers: [Bool] = []
     private(set) var askCount = 0
+    private(set) var nextResourceAskCount = 0
 
     func navigatorShouldStartPlayback(_: AudioNavigator) -> Bool {
         defer { askCount += 1 }
         guard !answers.isEmpty else { return true }
         return answers[min(askCount, answers.count - 1)]
+    }
+
+    func navigator(_: AudioNavigator, shouldPlayNextResource _: MediaPlaybackInfo) -> Bool {
+        nextResourceAskCount += 1
+        return true
     }
 
     func navigator(_: any Navigator, presentError _: NavigatorError) {}
@@ -258,6 +303,10 @@ private final class StartRecordingAudioSession: AudioSessionManaging {
     func user(_: AudioSessionUser, didChangePlaying _: Bool) {}
 }
 
+private enum StartRecordingEngineError: Error {
+    case loadFailed
+}
+
 @MainActor
 private final class StartRecordingEngine: AudioPlaybackEngine {
     weak var delegate: AudioPlaybackEngineDelegate?
@@ -271,10 +320,15 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     private(set) var loadCount = 0
     /// When set, each load waits for `releaseLoad()`.
     var holdsLoads = false
+    /// When set, each load throws.
+    var failsLoads = false
     private var heldLoad: CheckedContinuation<Void, Never>?
 
     func load(_: AVURLAsset, originalFileURL _: URL?) async throws {
         loadCount += 1
+        if failsLoads {
+            throw StartRecordingEngineError.loadFailed
+        }
         if holdsLoads {
             await withCheckedContinuation { heldLoad = $0 }
         }
@@ -311,7 +365,7 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
         delegate?.engineDidFinishPlaying(self)
     }
 
-    /// Stops without the navigator asking, as at the end of the last resource.
+    /// Pauses without the navigator asking, short of the resource's end.
     func stopOnItsOwn() {
         send(.paused)
     }
