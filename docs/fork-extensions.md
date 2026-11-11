@@ -64,9 +64,20 @@ Carried since the v3.9.0 sync. Upstream #792 added the official `PDFResourceCont
 | `Tests/StreamerTests/Parser/PDF/PDFTextNormalizerTests.swift` | 6 tests: within-paragraph join, paragraph-break preservation, hyphenation, multiple blank lines, empty, single-line. |
 | `Tests/StreamerTests/Parser/PDF/NormalizingPDFContentIteratorTests.swift` | 6 tests: segment+highlight rejoin, hyphenation, locator preservation, end-of-iteration nil, non-text pass-through, `previous()` normalization. |
 
-## Owned link context menu
+## EPUB image and link menus
 
-A long-press on a link that leaves the publication showed WebKit's link menu, whose preview fetched the destination and whose "Open Link" went to Safari without consulting the navigation policy, so a host app that confirms outbound links (Reader app #3016) was bypassed. Returning `nil` from the UI delegate does not suppress it for an `http(s)` link: WebKit falls back to DataDetectors' URL menu. The spread view returns its own configuration instead: no preview, and one item that takes the tap path (`spreadView(_:didTapOnExternalURL:)`). Links inside the publication and `javascript:` links get `nil`. An image keeps WebKit's menu unless it is inside an outbound link, where it gets this one, without Save, Copy or Share. Design record: [ADR-0186 in the host repository](../../docs/ADR/0186-converted-container-link-disposition.md).
+EPUB spreads disable WebKit previews at web-view construction. The gesture bridge
+requests a native menu for an external link. Its Open Link action
+takes the tap path (`spreadView(_:didTapOnExternalURL:)`). A link takes precedence over
+an image inside it. Internal links have no long-press action.
+[Outbound-link design](../../docs/ADR/0186-converted-container-link-disposition.md)
+
+For a packaged bitmap, `EPUBPublicationMenu` offers Save Image and Share.
+Long-press the image on iOS or right-click it on Catalyst. Both reflowable and fixed-layout spreads use the same menu (#3660).
+Copy is available when the host supplies `Configuration.copyImage` and the publication
+has no content-protection service. The host receives PNG data only after the user
+selects Copy. `EPUBMenuImage` limits input bytes and pixel dimensions before decoding.
+The bridge accepts resource addresses for menu presentation and has no operation that writes a clipboard.
 
 For an upstream PR, three things would surprise: the item reads "Open Link…" with a `safari` image although upstream's default hand-off opens at once (and `mailto:` opens Mail); WebKit's Copy Link and Share are gone; and for a publication served over `http(s)` every internal link is `http(s)`, so returning `nil` for it still gets DataDetectors' menu — unreachable for a publication served from the custom scheme, as the host app's are.
 

@@ -6,6 +6,7 @@
   "license": "BSD-3-Clause",
   "private": true,
   "scripts": {
+    "test": "node --test test/*.test.cjs",
     "bundle": "webpack",
     "lint": "eslint src",
     "checkformat": "prettier --check '**/*.js'",
