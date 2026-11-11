@@ -68,6 +68,7 @@ for (const nested of [false, true]) {
       const release = nested ? frame(requests, press.window) : press;
       press.fire("pointerdown", "html", { clientX: -1, clientY: -1 });
       press.fire("contextmenu", "html", { clientX: -1, clientY: -1 });
+      release.fire("pointermove", "img", { button: -1, buttons: 2 });
       release.fire("pointerup", "img");
       assert.equal(
         requests.length,
@@ -96,5 +97,14 @@ test("a right drag from the background does not open an image menu", () => {
   fire("pointerdown", "html");
   fire("pointermove", "img", { screenX: 220, buttons: 2 });
   fire("pointerup", "img");
+  assert.deepEqual(requests, []);
+});
+
+test("a drag after an unlocated press does not open the release target", () => {
+  const requests = [];
+  const { fire } = frame(requests);
+  fire("pointerdown", "html", { clientX: -1, clientY: -1 });
+  fire("pointermove", "img", { button: -1, buttons: 2 });
+  fire("pointerup", "img", { screenX: 220 });
   assert.deepEqual(requests, []);
 });

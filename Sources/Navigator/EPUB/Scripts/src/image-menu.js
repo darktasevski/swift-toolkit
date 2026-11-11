@@ -163,11 +163,13 @@
     (event) => {
       if (!event.isTrusted) return;
       const press = sequence.secondary;
-      if (
-        press?.id === event.pointerId &&
-        (moved(event, press) || (!press.start && event.buttons & 2))
-      ) {
-        delete sequence.secondary;
+      if (press?.id === event.pointerId && event.buttons & 2) {
+        if (!press.start && event.clientX >= 0 && event.clientY >= 0) {
+          // The first located sample resolves a stationary Catalyst press.
+          press.start = { x: event.screenX, y: event.screenY };
+        } else if (moved(event, press)) {
+          delete sequence.secondary;
+        }
       }
       if (
         pending?.id === event.pointerId &&

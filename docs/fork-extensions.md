@@ -79,7 +79,9 @@ has no content-protection service. The host receives PNG data only after the use
 selects Copy. `EPUBMenuImage` limits input bytes and pixel dimensions before decoding.
 The bridge accepts resource addresses for menu presentation and has no operation that writes a clipboard.
 
-For an upstream PR, three things would surprise: the item reads "Open Link…" with a `safari` image although upstream's default hand-off opens at once (and `mailto:` opens Mail); WebKit's Copy Link and Share are gone; and for a publication served over `http(s)` every internal link is `http(s)`, so returning `nil` for it still gets DataDetectors' menu — unreachable for a publication served from the custom scheme, as the host app's are.
+The host chooses how to present the destination after Open Link. The action sheet omits
+WebKit's Copy Link and Share actions. The navigator's WKUIDelegate configuration remains
+available to WebKit for link requests it delivers through that delegate.
 
 ### New files
 
