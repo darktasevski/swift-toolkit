@@ -328,6 +328,99 @@ struct AudioNavigatorStartTests {
 
             #expect(fixture.engine.playCount == 1)
         }
+
+        /// A closed navigator never plays, nor turns the session on, once its opening jump lands.
+        @Test func cancelsAPlayWhoseFirstResourceIsLoading() async throws {
+            let fixture = StartFixture()
+            fixture.engine.holdsLoads = true
+
+            fixture.navigator.play()
+            try await waitUntil { fixture.engine.loadCount == 1 }
+            fixture.navigator.close()
+            fixture.engine.releaseLoad()
+            try await Task.sleep(nanoseconds: boundedWait)
+
+            #expect(fixture.engine.playCount == 0)
+            #expect(fixture.audioSession.startCount == 0)
+        }
+    }
+
+    /// Seeks and jumps in flight together, as in scrubbing or repeated skips, owe one restart.
+    @MainActor
+    struct Burst {
+        @Test func restartsOnceTheLastSeekLands() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.holdsSeeks = true
+            let seeks = fixture.engine.seekCount
+
+            async let first: Void = fixture.navigator.seek(to: 10)
+            try await waitUntil { fixture.engine.seekCount == seeks + 1 }
+            async let second: Void = fixture.navigator.seek(to: 20)
+            try await waitUntil { fixture.engine.seekCount == seeks + 2 }
+            fixture.engine.releaseSeek()
+            await first
+            try await Task.sleep(nanoseconds: boundedWait)
+            #expect(fixture.engine.playCount == 1, "no restart while a seek is in flight")
+
+            fixture.engine.releaseSeek()
+            await second
+            try await waitUntil { fixture.engine.playCount == 2 }
+            try await Task.sleep(nanoseconds: boundedWait)
+            #expect(fixture.engine.playCount == 2)
+        }
+
+        @Test func aPlayMadeDuringItJoinsIt() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.holdsSeeks = true
+            let seeks = fixture.engine.seekCount
+
+            async let seek: Void = fixture.navigator.seek(to: 10)
+            try await waitUntil { fixture.engine.seekCount == seeks + 1 }
+            fixture.navigator.play()
+            try await Task.sleep(nanoseconds: boundedWait)
+            #expect(fixture.engine.playCount == 1, "no start while the seek is in flight")
+
+            fixture.engine.releaseSeek()
+            await seek
+            try await waitUntil { fixture.engine.playCount == 2 }
+            try await Task.sleep(nanoseconds: boundedWait)
+            #expect(fixture.engine.playCount == 2)
+        }
+
+        /// A joined `play()` is the user's own start, so it plays even when the jump fails to load.
+        @Test func aJoinedPlayPlaysEvenIfTheJumpFails() async throws {
+            let fixture = try await StartFixture.playing(resources: 2)
+            fixture.engine.holdsLoads = true
+
+            async let jump = fixture.navigator.go(to: fixture.link(1))
+            try await waitUntil { fixture.engine.loadCount == 2 }
+            fixture.engine.failsLoads = true
+            fixture.navigator.play()
+            fixture.engine.releaseLoad()
+            let landed = await jump
+            try #require(!landed)
+
+            try await waitUntil { fixture.engine.playCount == 2 }
+        }
+
+        /// `restartsOnceTheLastSeekLands` is the positive control: its seeks, all landed, restart
+        /// within the bound.
+        @Test func aJumpThatFailsLeavesItPaused() async throws {
+            let fixture = try await StartFixture.playing(resources: 2)
+            fixture.engine.holdsSeeks = true
+            let seeks = fixture.engine.seekCount
+
+            async let seek: Void = fixture.navigator.seek(to: 10)
+            try await waitUntil { fixture.engine.seekCount == seeks + 1 }
+            fixture.engine.failsLoads = true
+            let landed = await fixture.navigator.go(to: fixture.link(1))
+            try #require(!landed)
+            fixture.engine.releaseSeek()
+            await seek
+            try await Task.sleep(nanoseconds: boundedWait)
+
+            #expect(fixture.engine.playCount == 1)
+        }
     }
 
     @MainActor
@@ -561,7 +654,7 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     private(set) var loadCount = 0
     /// When set, each load waits for `releaseLoad()`.
     var holdsLoads = false
-    /// When set, each load throws.
+    /// When set, each load throws, once released if it is held.
     var failsLoads = false
     private(set) var seekCount = 0
     /// When set, each seek waits for `releaseSeek()`.
@@ -572,11 +665,11 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     func load(_: AVURLAsset, originalFileURL _: URL?) async throws {
         loadCount += 1
         events.record("load")
-        if failsLoads {
-            throw StartRecordingEngineError.loadFailed
-        }
         if holdsLoads {
             await loadHold.wait()
+        }
+        if failsLoads {
+            throw StartRecordingEngineError.loadFailed
         }
         state = .paused
     }
