@@ -209,19 +209,12 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         engine.delegate = self
     }
 
-    deinit {
+    /// Isolated, so the session ends before the navigator is freed: an end posted from here could
+    /// reach a later user allocated at the same address.
+    isolated deinit {
         playTask?.cancel()
-
         audioSession.end(for: self)
-
-        // Engine cleanup must run on main thread. We capture the engine reference
-        // and dispatch async. The engine will clean up its observers.
-        // Note: Prefer calling close() explicitly before releasing the navigator
-        // to ensure cleanup completes synchronously.
-        let engine = self.engine
-        DispatchQueue.main.async {
-            engine.stop()
-        }
+        engine.stop()
     }
 
     /// Explicitly closes the navigator and releases all resources.

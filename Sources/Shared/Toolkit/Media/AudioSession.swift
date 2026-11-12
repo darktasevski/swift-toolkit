@@ -29,8 +29,9 @@ public protocol AudioSessionManaging {
     /// Starts an audio session with the given `user`, active by the time it returns.
     @MainActor func start(with user: AudioSessionUser, isPlaying: Bool)
 
-    /// Ends the current audio session.
-    func end(for user: AudioSessionUser)
+    /// Ends the current audio session, by the time it returns, so a start that follows begins a new
+    /// one.
+    @MainActor func end(for user: AudioSessionUser)
 
     /// Indicates whether the `user` is playing.
     func user(_ user: AudioSessionUser, didChangePlaying isPlaying: Bool)
@@ -102,12 +103,10 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         startSession(with: user.audioConfiguration)
     }
 
-    /// Ends the current audio session.
-    public nonisolated func end(for user: AudioSessionUser) {
-        let id = ObjectIdentifier(user)
-        Task {
-            await end(forUserID: id)
-        }
+    /// Ends the current audio session by the time it returns, so a start that follows begins a new
+    /// one.
+    public func end(for user: AudioSessionUser) {
+        end(forUserID: ObjectIdentifier(user))
     }
 
     private func end(forUserID id: ObjectIdentifier) {

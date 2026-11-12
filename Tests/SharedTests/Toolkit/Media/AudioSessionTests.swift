@@ -171,6 +171,21 @@ struct AudioSessionTests {
         #expect(!session.isSessionStarted)
         #expect(session.activations == 1)
     }
+
+    /// The end runs before `end(for:)` returns, so no late end takes back a start that follows it.
+    @Test func aStartRightAfterAnEndKeepsTheSessionStarted() async throws {
+        let session = AudioSession()
+        let user = SessionUser()
+        defer { session.end(for: user) }
+        session.start(with: user, isPlaying: false)
+
+        session.end(for: user)
+        session.start(with: user, isPlaying: false)
+        try await Task.sleep(nanoseconds: 300_000_000)
+
+        #expect(session.isSessionStarted)
+        #expect(session.activations == 2)
+    }
 }
 
 // MARK: - Helpers

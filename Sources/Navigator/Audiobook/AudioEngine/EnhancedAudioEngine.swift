@@ -94,9 +94,7 @@ public final class EnhancedAudioEngine: EnhancedAudioPlaybackEngine, Loggable {
     }
 
     // Note: No deinit - cleanup is handled by stop() which must be called before
-    // the engine is deallocated. AudioNavigator.deinit ensures this by calling
-    // engine.stop() via DispatchQueue.main.async. This pattern is necessary because
-    // deinit runs in a nonisolated context and cannot access @MainActor properties.
+    // the engine is deallocated. AudioNavigator's isolated deinit ensures this.
 
     // MARK: - AudioPlaybackEngine
 
