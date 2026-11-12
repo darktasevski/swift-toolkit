@@ -6,3 +6,8 @@
 
 "ReadiumNavigator.EditingAction.share" = "Share…";
 "ReadiumNavigator.LinkContextMenu.openLink" = "Open Link…";
+"ReadiumNavigator.ImageContextMenu.copy" = "Copy";
+"ReadiumNavigator.ImageContextMenu.save" = "Save Image";
+"ReadiumNavigator.ImageContextMenu.cancel" = "Cancel";
+"ReadiumNavigator.ImageContextMenu.ok" = "OK";
+"ReadiumNavigator.ImageContextMenu.unavailable" = "Couldn’t complete the image action.";
