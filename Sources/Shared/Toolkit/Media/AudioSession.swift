@@ -199,6 +199,10 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         }
 
         isSessionStarted = false
+        // The center holds a block observer until it is removed; dropping the token leaves it live.
+        if let interruptionObserver {
+            NotificationCenter.default.removeObserver(interruptionObserver)
+        }
         interruptionObserver = nil
     }
 
