@@ -96,6 +96,7 @@ public final class AudioSession: AudioSessionManaging, Loggable {
             }
             self.user = User(user)
             self.isPlaying = false
+            observeInterruptions()
         }
 
         startSession(with: user.audioConfiguration)
@@ -158,7 +159,12 @@ public final class AudioSession: AudioSessionManaging, Loggable {
 
     // MARK: Session management
 
+    /// Whether the session is active: set by an activation that succeeded, cleared when the session
+    /// ends or an interruption begins.
     private(set) var isSessionStarted = false
+
+    /// Activations that succeeded; internal, for tests.
+    private(set) var activations = 0
 
     private func startSession(with config: Configuration) {
         guard !isSessionStarted else {
@@ -169,19 +175,12 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         do {
             try audioSession.setCategory(config.category, mode: config.mode, policy: config.routeSharingPolicy, options: config.options)
             try audioSession.setActive(true)
+            isSessionStarted = true
+            activations += 1
             log(.info, "Started audio session with category: \(config.category), mode: \(config.mode), policy: \(config.routeSharingPolicy), options: \(config.options)")
         } catch {
+            // Left inactive, so the next start tries again.
             log(.error, "Failed to start the audio session: \(error)")
-        }
-
-        isSessionStarted = true
-
-        interruptionObserver = NotificationCenter.default.addObserver(
-            forName: AVAudioSession.interruptionNotification,
-            object: audioSession,
-            queue: .main
-        ) { [weak self] notification in
-            self?.handleAudioSessionInterruption(notification: notification)
         }
     }
 
@@ -199,11 +198,6 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         }
 
         isSessionStarted = false
-        // The center holds a block observer until it is removed; dropping the token leaves it live.
-        if let interruptionObserver {
-            NotificationCenter.default.removeObserver(interruptionObserver)
-        }
-        interruptionObserver = nil
     }
 
     /// Whether the audio session is currently interrupted, e.g. by a phone call.
@@ -211,6 +205,23 @@ public final class AudioSession: AudioSessionManaging, Loggable {
 
     /// The observer of audio session interruption notifications.
     private var interruptionObserver: Any?
+
+    /// Watches for interruptions from the first start on, active or not: a session ended in the
+    /// background, after the engine paused for a call, must still hear the call end. The handler acts
+    /// only for a current user, so the observer is never removed.
+    private func observeInterruptions() {
+        guard interruptionObserver == nil else {
+            return
+        }
+
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAudioSessionInterruption(notification: notification)
+        }
+    }
 
     private nonisolated func handleAudioSessionInterruption(notification: Notification) {
         guard let userInfo = notification.userInfo,
@@ -233,22 +244,16 @@ public final class AudioSession: AudioSessionManaging, Loggable {
         switch type {
         case .began:
             isInterrupted = true
+            // The system has deactivated the session, so the next start activates it again.
+            isSessionStarted = false
 
         case .ended:
             isInterrupted = false
 
-            // When an interruption ends, determine whether playback should resume automatically,
-            // and reactivate the audio session if necessary.
-            do {
-                if let user = user?.user {
-                    try AVAudioSession.sharedInstance().setActive(true)
-
-                    if options.contains(.shouldResume) {
-                        user.play()
-                    }
-                }
-            } catch {
-                log(.error, "Cannot resume audio session after interruption: \(error)")
+            // The session turns on again through the user's own start, once it admits the resume,
+            // so a refused resume interrupts no other app's audio.
+            if options.contains(.shouldResume), let user = user?.user {
+                user.play()
             }
 
         @unknown default:

@@ -38,8 +38,8 @@ struct AudioSessionTests {
         #expect(session.isSessionStarted)
     }
 
-    /// A start for a user whose session is active neither activates it again nor watches for
-    /// interruptions a second time, so an interruption ending resumes that user once.
+    /// Repeat starts for the same user watch for interruptions once, so an interruption ending
+    /// resumes that user once.
     @Test func repeatStartsResumeTheUserOnceAfterAnInterruption() async throws {
         let session = AudioSession()
         let user = SessionUser()
@@ -48,14 +48,14 @@ struct AudioSessionTests {
         session.start(with: user, isPlaying: false)
         session.start(with: user, isPlaying: false)
 
-        postInterruptionEndedShouldResume()
+        postInterruption(.ended, options: .shouldResume)
 
         try await waitForTheResumes(of: user)
         #expect(user.plays == 1)
     }
 
-    /// Ending a session stops its watch for interruptions, so a session activated again after going
-    /// to the background resumes its user once.
+    /// A session activated again after going to the background still watches for interruptions
+    /// once, so it resumes its user once.
     @Test func aSessionActivatedAgainResumesTheUserOnceAfterAnInterruption() async throws {
         let session = AudioSession()
         let user = SessionUser()
@@ -65,7 +65,7 @@ struct AudioSessionTests {
         try #require(!session.isSessionStarted)
         session.start(with: user, isPlaying: false)
 
-        postInterruptionEndedShouldResume()
+        postInterruption(.ended, options: .shouldResume)
 
         try await waitForTheResumes(of: user)
         #expect(user.plays == 1)
@@ -83,10 +83,93 @@ struct AudioSessionTests {
         session.start(with: second, isPlaying: false)
 
         #expect(AVAudioSession.sharedInstance().category == .ambient)
-        postInterruptionEndedShouldResume()
+        postInterruption(.ended, options: .shouldResume)
         try await waitForTheResumes(of: second)
         #expect(second.plays == 1)
         #expect(first.plays == 0)
+    }
+
+    /// A start for a user whose session is active does not activate it again.
+    @Test func repeatStartsActivateTheSessionOnce() {
+        let session = AudioSession()
+        let user = SessionUser()
+        defer { session.end(for: user) }
+
+        session.start(with: user, isPlaying: false)
+        session.start(with: user, isPlaying: false)
+        session.start(with: user, isPlaying: false)
+
+        #expect(session.activations == 1)
+    }
+
+    /// A failed activation leaves the session inactive, so the next start tries again.
+    @Test func aFailedActivationIsTriedAgainOnTheNextStart() throws {
+        let session = AudioSession()
+        // Long-form audio cannot mix with others, so `setCategory` throws.
+        let user = SessionUser(audioConfiguration: .init(
+            category: .playback,
+            routeSharingPolicy: .longFormAudio,
+            options: [.mixWithOthers]
+        ))
+        defer { session.end(for: user) }
+        session.start(with: user, isPlaying: false)
+        try #require(!session.isSessionStarted)
+        try #require(session.activations == 0)
+
+        user.audioConfiguration = .init()
+        session.start(with: user, isPlaying: false)
+
+        #expect(session.isSessionStarted)
+        #expect(session.activations == 1)
+    }
+
+    /// The engine pausing for a call ends the session when the app is in the background, but the user
+    /// stays, so the call ending still resumes it.
+    @Test func aUserWhoseSessionEndedInTheBackgroundResumesAfterAnInterruption() async throws {
+        let session = AudioSession()
+        let user = SessionUser()
+        defer { session.end(for: user) }
+        session.start(with: user, isPlaying: false)
+        session.appDidEnterBackground()
+        try #require(!session.isSessionStarted)
+
+        postInterruption(.ended, options: .shouldResume)
+
+        try await waitForTheResumes(of: user)
+        #expect(user.plays == 1)
+    }
+
+    /// The system deactivates the session when an interruption begins, so the next start activates
+    /// it again.
+    @Test func aStartAfterAnInterruptionBeganActivatesTheSessionAgain() async throws {
+        let session = AudioSession()
+        let user = SessionUser()
+        defer { session.end(for: user) }
+        session.start(with: user, isPlaying: false)
+        postInterruption(.began)
+        try await waitUntil { !session.isSessionStarted }
+
+        session.start(with: user, isPlaying: false)
+
+        #expect(session.isSessionStarted)
+        #expect(session.activations == 2)
+    }
+
+    /// An interruption ending only asks the user to resume: the session turns on through the user's
+    /// own start, so a user that refuses the resume, as a held book does, leaves it off.
+    @Test func anInterruptionEndingActivatesNothingByItself() async throws {
+        let session = AudioSession()
+        let user = SessionUser()
+        defer { session.end(for: user) }
+        session.start(with: user, isPlaying: false)
+        postInterruption(.began)
+        try await waitUntil { !session.isSessionStarted }
+
+        postInterruption(.ended, options: .shouldResume)
+
+        try await waitForTheResumes(of: user)
+        #expect(!session.isSessionStarted)
+        #expect(session.activations == 1)
     }
 }
 
@@ -103,19 +186,30 @@ private func waitForTheResumes(of user: SessionUser) async throws {
     try await Task.sleep(nanoseconds: 300_000_000)
 }
 
-private func postInterruptionEndedShouldResume() {
+@MainActor
+private func waitUntil(_ condition: () -> Bool) async throws {
+    for _ in 0 ..< 200 where !condition() {
+        try await Task.sleep(nanoseconds: 10_000_000)
+    }
+    try #require(condition())
+}
+
+private func postInterruption(
+    _ type: AVAudioSession.InterruptionType,
+    options: AVAudioSession.InterruptionOptions = []
+) {
     NotificationCenter.default.post(
         name: AVAudioSession.interruptionNotification,
         object: AVAudioSession.sharedInstance(),
         userInfo: [
-            AVAudioSessionInterruptionTypeKey: AVAudioSession.InterruptionType.ended.rawValue,
-            AVAudioSessionInterruptionOptionKey: AVAudioSession.InterruptionOptions.shouldResume.rawValue,
+            AVAudioSessionInterruptionTypeKey: type.rawValue,
+            AVAudioSessionInterruptionOptionKey: options.rawValue,
         ]
     )
 }
 
 private final class SessionUser: AudioSessionUser {
-    let audioConfiguration: AudioSession.Configuration
+    var audioConfiguration: AudioSession.Configuration
     private(set) var plays = 0
 
     init(audioConfiguration: AudioSession.Configuration = .init()) {
