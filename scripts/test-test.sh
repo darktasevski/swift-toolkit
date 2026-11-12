@@ -20,7 +20,9 @@ SCRATCH="$(cd "$scratch_candidate" && pwd -P)"
 [[ -n "$SCRATCH" && "$SCRATCH" != "/" && -d "$SCRATCH" ]] ||
 	fail "refusing unsafe scratch directory: $SCRATCH"
 
+HELD_HOLDER_PID=""
 cleanup() {
+	[[ -z "$HELD_HOLDER_PID" ]] || kill -KILL "$HELD_HOLDER_PID" 2>/dev/null || true
 	if [[ -n "$SCRATCH" && "$SCRATCH" != "/" && -d "$SCRATCH" ]]; then
 		rm -rf -- "$SCRATCH"
 	fi
@@ -589,5 +591,48 @@ echo "  PASS: TestApp plan includes ReadiumSharedTests"
 grep -Fq 'branches: [ main, develop, fork-extensions ]' "$REPO_ROOT/.github/workflows/checks.yml" ||
 	fail "Checks workflow does not run for fork-extensions pushes"
 echo "  PASS: fork-extensions pushes run Checks"
+
+# Inside the app's checkout, a gate holding the Mac refuses the run before xcodebuild starts.
+app_root="$(git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+if [[ -n "$app_root" && -f "$app_root/scripts/lib/machine-hold.sh" ]]; then
+	fixture_app="$SCRATCH/app"
+	hold_root="$SCRATCH/machine-hold"
+	mkdir -p "$fixture_app/scripts/lib"
+	cp "$app_root/scripts/lib/machine-hold.sh" "$app_root/scripts/lib/exec-with-bash-5.sh" "$fixture_app/scripts/lib/"
+	# shellcheck disable=SC2016 # the inner shell expands its own arguments
+	env -u READER_APP_MACHINE_HOLD -u READER_APP_MACHINE_HOLD_TOKEN READER_APP_MACHINE_HOLD_ROOT="$hold_root" \
+		"$BASH" -c 'source "$1"; machine_hold_try_exclusive "fixture gate" 0 || exit $?; : >"$2"; exec sleep 300' \
+		_ "$fixture_app/scripts/lib/machine-hold.sh" "$SCRATCH/holder-ready" &
+	HELD_HOLDER_PID=$!
+	for _ in $(seq 1 100); do
+		[[ -e "$SCRATCH/holder-ready" ]] && break
+		sleep 0.1
+	done
+	[[ -e "$SCRATCH/holder-ready" ]] || fail "a held Mac refuses the run — the fixture gate never took the hold"
+	held_exit=0
+	env -u READER_APP_MACHINE_HOLD -u READER_APP_MACHINE_HOLD_TOKEN -u READIUM_TEST_RESULT_BUNDLE -u READIUM_SKIP_TESTING \
+		PATH="$FAKE_BIN:$PATH" \
+		TMPDIR="$VERDICT_TMP" \
+		FAKE_SUPERPROJECT_ROOT="$fixture_app" \
+		READER_APP_MACHINE_HOLD_ROOT="$hold_root" \
+		READIUM_TEST_DESTINATION="platform=iOS Simulator,id=HELD-UDID" \
+		FAKE_XCODEBUILD_STATUS=0 \
+		FAKE_XCODEBUILD_OUTPUT="Test Succeeded" \
+		FAKE_XCODEBUILD_ARGS="$SCRATCH/held.args" \
+		FAKE_XCRESULT_DIR="$XCRESULT_FIXTURES" \
+		"$RUNNER" >"$SCRATCH/held.out" 2>&1 || held_exit=$?
+	kill -KILL "$HELD_HOLDER_PID" 2>/dev/null || true
+	wait "$HELD_HOLDER_PID" 2>/dev/null || true
+	HELD_HOLDER_PID=""
+	if [[ "$held_exit" -ne 76 ]]; then
+		cat "$SCRATCH/held.out" >&2
+		fail "a held Mac refuses the run — expected exit=76, got $held_exit"
+	fi
+	[[ ! -e "$SCRATCH/held.args" ]] || fail "a held Mac refuses the run — xcodebuild ran"
+	grep -Fq "fixture gate" "$SCRATCH/held.out" || fail "a held Mac refuses the run — the refusal did not name the holder"
+	echo "  PASS: a held Mac refuses the run"
+else
+	echo "  SKIP: a held Mac refuses the run (no app checkout around this fork)"
+fi
 
 echo "OK: all test.sh self-tests passed"
