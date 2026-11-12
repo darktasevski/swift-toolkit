@@ -462,15 +462,16 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public private(set) var currentLocation: Locator?
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
+        // Checked first, so a jump that cannot land leaves playback alone.
+        guard let newResourceIndex = publication.readingOrder.firstIndexWithHREF(locator.href) else {
+            return false
+        }
         let restart = oweRestartIfPlaying()
         // A jump that does not land owes nothing once it returns.
         defer { settleRestart(restart, landed: false) }
         // The engine's own pause: `play()`'s first jump runs inside the start task it would cancel.
         engine.pause()
 
-        guard let newResourceIndex = publication.readingOrder.firstIndexWithHREF(locator.href) else {
-            return false
-        }
         let link = publication.readingOrder[newResourceIndex]
 
         do {

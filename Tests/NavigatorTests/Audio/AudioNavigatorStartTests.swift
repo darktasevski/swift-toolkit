@@ -300,6 +300,20 @@ struct AudioNavigatorStartTests {
     }
 
     @MainActor
+    struct Jump {
+        /// A jump to an href outside the reading order cannot land, so it leaves playback alone.
+        @Test func toAnHrefOutsideTheReadingOrderLeavesPlaybackAlone() async throws {
+            let fixture = try await StartFixture.playing()
+            let outside = Locator(href: AnyURL(string: "missing.mp3")!, mediaType: .mp3)
+
+            let landed = await fixture.navigator.go(to: outside)
+
+            #expect(!landed)
+            #expect(fixture.engine.state == .playing)
+        }
+    }
+
+    @MainActor
     struct PendingPlay {
         /// Also the positive control for `cancelsAPlayWhoseFirstResourceIsLoading`: the same held load,
         /// released with no pause, plays within the bound.
