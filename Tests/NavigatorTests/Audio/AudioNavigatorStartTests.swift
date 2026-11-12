@@ -58,11 +58,11 @@ struct AudioNavigatorStartTests {
             fixture.engine.holdsSeeks = true
 
             let seeks = fixture.engine.seekCount
-            let seek = Task { await fixture.navigator.seek(to: 10) }
+            async let seek: Void = fixture.navigator.seek(to: 10)
             try await waitUntil { fixture.engine.seekCount == seeks + 1 }
             fixture.navigator.pause()
             fixture.engine.releaseSeek()
-            await seek.value
+            await seek
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 1)
@@ -72,11 +72,11 @@ struct AudioNavigatorStartTests {
             let fixture = try await StartFixture.playing(resources: 2)
             fixture.engine.holdsLoads = true
 
-            let jump = Task { await fixture.navigator.go(to: fixture.link(1)) }
+            async let jump = fixture.navigator.go(to: fixture.link(1))
             try await waitUntil { fixture.engine.loadCount == 2 }
             fixture.navigator.pause()
             fixture.engine.releaseLoad()
-            _ = await jump.value
+            _ = await jump
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 1)
@@ -109,10 +109,10 @@ struct AudioNavigatorStartTests {
             fixture.engine.holdsSeeks = true
 
             let seeks = fixture.engine.seekCount
-            let seek = Task { await fixture.navigator.seek(to: 10) }
+            async let seek: Void = fixture.navigator.seek(to: 10)
             try await waitUntil { fixture.engine.seekCount == seeks + 1 }
             fixture.engine.releaseSeek()
-            await seek.value
+            await seek
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 2)
@@ -123,10 +123,10 @@ struct AudioNavigatorStartTests {
             let fixture = try await StartFixture.playing(resources: 2)
             fixture.engine.holdsLoads = true
 
-            let jump = Task { await fixture.navigator.go(to: fixture.link(1)) }
+            async let jump = fixture.navigator.go(to: fixture.link(1))
             try await waitUntil { fixture.engine.loadCount == 2 }
             fixture.engine.releaseLoad()
-            _ = await jump.value
+            _ = await jump
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 2)
@@ -224,11 +224,11 @@ struct AudioNavigatorStartTests {
             fixture.engine.holdsSeeks = true
 
             let seeks = fixture.engine.seekCount
-            let seek = Task { await fixture.navigator.seek(to: 10) }
+            async let seek: Void = fixture.navigator.seek(to: 10)
             try await waitUntil { fixture.engine.seekCount == seeks + 1 }
             fixture.navigator.playPause()
             fixture.engine.releaseSeek()
-            await seek.value
+            await seek
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 1)
@@ -288,11 +288,11 @@ struct AudioNavigatorStartTests {
             fixture.engine.holdsSeeks = true
 
             let seeks = fixture.engine.seekCount
-            let seek = Task { await fixture.navigator.seek(to: 10) }
+            async let seek: Void = fixture.navigator.seek(to: 10)
             try await waitUntil { fixture.engine.seekCount == seeks + 1 }
             fixture.navigator.close()
             fixture.engine.releaseSeek()
-            await seek.value
+            await seek
             try await Task.sleep(nanoseconds: boundedWait)
 
             #expect(fixture.engine.playCount == 1)
@@ -457,6 +457,43 @@ private final class StartRecordingAudioSession: AudioSessionManaging {
     func user(_: AudioSessionUser, didChangePlaying _: Bool) {}
 }
 
+/// Where a held engine call waits for the test. A release made before the call arrives is kept for
+/// it, and cancelling the waiting task ends the wait, so a time limit ends a hold never released.
+@MainActor
+private final class Hold {
+    private var waiters: [(id: Int, continuation: CheckedContinuation<Void, Never>)] = []
+    private var keptReleases = 0
+    private var lastWaiterID = 0
+
+    func wait() async {
+        if keptReleases > 0 {
+            keptReleases -= 1
+            return
+        }
+        lastWaiterID += 1
+        let id = lastWaiterID
+        await withTaskCancellationHandler {
+            await withCheckedContinuation { waiters.append((id, $0)) }
+        } onCancel: {
+            // Runs on the cancelling thread; the hop lands after the wait has registered.
+            Task { @MainActor in self.endWait(id) }
+        }
+    }
+
+    func release() {
+        guard !waiters.isEmpty else {
+            keptReleases += 1
+            return
+        }
+        waiters.removeFirst().continuation.resume()
+    }
+
+    private func endWait(_ id: Int) {
+        guard let index = waiters.firstIndex(where: { $0.id == id }) else { return }
+        waiters.remove(at: index).continuation.resume()
+    }
+}
+
 private enum StartRecordingEngineError: Error {
     case loadFailed
 }
@@ -484,8 +521,8 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     private(set) var seekCount = 0
     /// When set, each seek waits for `releaseSeek()`.
     var holdsSeeks = false
-    private var heldSeek: CheckedContinuation<Void, Never>?
-    private var heldLoad: CheckedContinuation<Void, Never>?
+    private let loadHold = Hold()
+    private let seekHold = Hold()
 
     func load(_: AVURLAsset, originalFileURL _: URL?) async throws {
         loadCount += 1
@@ -494,14 +531,13 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
             throw StartRecordingEngineError.loadFailed
         }
         if holdsLoads {
-            await withCheckedContinuation { heldLoad = $0 }
+            await loadHold.wait()
         }
         state = .paused
     }
 
     func releaseLoad() {
-        heldLoad?.resume()
-        heldLoad = nil
+        loadHold.release()
     }
 
     func play() {
@@ -518,15 +554,14 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     func seek(to time: Double) async -> Bool {
         seekCount += 1
         if holdsSeeks {
-            await withCheckedContinuation { heldSeek = $0 }
+            await seekHold.wait()
         }
         currentTime = time
         return true
     }
 
     func releaseSeek() {
-        heldSeek?.resume()
-        heldSeek = nil
+        seekHold.release()
     }
 
     func stop() {
