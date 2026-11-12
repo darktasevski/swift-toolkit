@@ -23,6 +23,18 @@ final class EPUBPublicationMenu {
     }
 
     private weak var sheet: UIAlertController?
+    /// The export sheet's delegate, which UIKit holds weakly, kept until the sheet finishes.
+    private var export: EPUBImageExport?
+
+    func retain(_ export: EPUBImageExport) {
+        self.export?.finish()
+        self.export = export
+        export.onFinish = { [weak self, weak export] in
+            if let self, self.export === export {
+                self.export = nil
+            }
+        }
+    }
 
     func present(_ sheet: UIAlertController, in spread: EPUBSpreadView, at rect: CGRect) {
         guard spread.window != nil, self.sheet?.presentingViewController == nil else { return }
@@ -119,11 +131,11 @@ extension EPUBSpreadView {
             sink(png)
         case .save:
             do {
-                try await EPUBMenuImage.save(contents)
+                let export = try EPUBImageExport(contents, of: image)
+                publicationMenu.retain(export)
+                delegate?.spreadView(self, present: export.picker)
             } catch {
-                if isCurrent() {
-                    presentImageActionError()
-                }
+                presentImageActionError()
             }
         case .share:
             delegate?.spreadView(self, present: EPUBMenuImage.share(contents, sourceView: self, sourceRect: rect))

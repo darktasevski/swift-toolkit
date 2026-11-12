@@ -79,7 +79,9 @@ data only after the user selects Copy. A publication with a content-protection s
 no image menu: Readium defines rights for text only, and the selection menu already drops
 Share for such a publication. `EPUBMenuImage` limits input bytes and pixel dimensions before
 decoding, and admits only the EPUB core raster types (JPEG, PNG, GIF, WebP) judged by the
-bytes, since manifests often mislabel images.
+bytes, since manifests often mislabel images. Save Image opens the Files export sheet
+(`EPUBImageExport`: a save panel on Mac Catalyst, the Files browser on iOS) for a temporary
+copy named after the resource, removed when the sheet finishes, so it needs no Photos access.
 The bridge accepts resource addresses for menu presentation and has no operation that writes a clipboard.
 
 The host chooses how to present the destination after Open Link. The action sheet omits

@@ -41,6 +41,18 @@ final class EPUBMenuImageResourceTests: XCTestCase {
         XCTAssertEqual(content?.type, .png)
     }
 
+    @MainActor
+    func testSaveExportsTheEncodedBytesUnderTheResourceName() async throws {
+        let jpeg = try imageData(type: .jpeg, width: 2, height: 3)
+        let image = try XCTUnwrap(resolve(data: jpeg))
+        let content = await image.read()
+        let export = try EPUBImageExport(XCTUnwrap(content), of: image)
+        XCTAssertEqual(export.file.lastPathComponent, "image.jpeg")
+        XCTAssertEqual(try Data(contentsOf: export.file), jpeg)
+        export.finish()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: export.file.path))
+    }
+
     func testEncodingOutsideTheEPUBCoreRasterTypesIsRejected() async throws {
         let tiff = try imageData(type: .tiff, width: 2, height: 3)
         let image = try XCTUnwrap(resolve(data: tiff))
