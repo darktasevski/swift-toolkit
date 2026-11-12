@@ -232,6 +232,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public func close() {
         playTask?.cancel()
         playTask = nil
+        owedRestarts.removeAll()
         audioSession.end(for: self)
         engine.stop()
     }
@@ -287,6 +288,25 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         }
     }
 
+    /// Restarts owed by a seek or a jump made while playing, each settled once it lands. A pause or
+    /// a close cancels them as it cancels `playTask`, even while the seek or jump is in flight.
+    private var owedRestarts: Set<Int> = []
+    private var lastRestartToken = 0
+
+    /// Records the restart a seek or a jump owes when it begins while playing.
+    private func oweRestartIfPlaying() -> Int? {
+        guard state == .playing else { return nil }
+        lastRestartToken += 1
+        owedRestarts.insert(lastRestartToken)
+        return lastRestartToken
+    }
+
+    /// Settles `restart`, and plays if it was still owed and the seek or jump landed.
+    private func settleRestart(_ restart: Int?, landed: Bool) {
+        guard let restart, owedRestarts.remove(restart) != nil, landed else { return }
+        play()
+    }
+
     /// Preloads the first resource to make duration available without starting playback.
     ///
     /// Call this after initialization to show duration in the UI before the user presses play.
@@ -328,11 +348,11 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     }
 
     /// Pauses the playback, and cancels a start still pending: a play whose first resource is
-    /// loading, the restart a seek or a jump made while playing issues once it lands, or an advance
-    /// to the next resource. A seek or a jump still in flight restarts when it lands, even after a
-    /// pause: each reads whether it was playing when it began.
+    /// loading, the restart a seek or a jump made while playing owes, whether it has landed or is
+    /// still in flight, or an advance to the next resource.
     public func pause() {
         playTask = nil
+        owedRestarts.removeAll()
         engine.pause()
     }
 
@@ -348,13 +368,14 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
         }
     }
 
-    /// Toggles the playback. A start still pending counts as playing, so the toggle cancels it.
+    /// Toggles the playback. A start still pending counts as playing, so the toggle cancels it: the
+    /// engine is paused while a seek or a jump made while playing is in flight, but it owes a restart.
     public func playPause() {
         switch state {
         case .loading, .playing:
             pause()
         case .paused:
-            if playTask != nil {
+            if playTask != nil || !owedRestarts.isEmpty {
                 pause()
             } else {
                 play()
@@ -364,15 +385,13 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
 
     /// Seeks to the given time in the current resource.
     public func seek(to time: Double) async {
-        let wasPlaying = (state == .playing)
+        let restart = oweRestartIfPlaying()
         // The engine's own pause: a seek keeps a start that is still pending.
         engine.pause()
 
         await engine.seek(to: time)
 
-        if wasPlaying {
-            play()
-        }
+        settleRestart(restart, landed: true)
     }
 
     /// Seeks relatively from the current time in the current resource.
@@ -443,7 +462,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     public private(set) var currentLocation: Locator?
 
     public func go(to locator: Locator, options: NavigatorGoOptions) async -> Bool {
-        let wasPlaying = (state == .playing)
+        let restart = oweRestartIfPlaying()
+        // A jump that does not land owes nothing once it returns.
+        defer { settleRestart(restart, landed: false) }
         // The engine's own pause: `play()`'s first jump runs inside the start task it would cancel.
         engine.pause()
 
@@ -475,9 +496,7 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
                 await delegate?.navigator(self, didJumpTo: locator)
             }
 
-            if wasPlaying {
-                play()
-            }
+            settleRestart(restart, landed: true)
 
             return true
 
