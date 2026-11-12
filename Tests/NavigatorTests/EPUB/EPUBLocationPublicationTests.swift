@@ -390,7 +390,7 @@ final class EPUBLocationPublicationTests: XCTestCase {
         publication?.setIdle(true)
         publication?.request()
         try await pollUntil { calculation.started }
-        weak let weakPublication = publication
+        weak var weakPublication = publication
 
         publication = nil
         XCTAssertNil(weakPublication, "The running calculation kept the publication alive")
@@ -731,7 +731,7 @@ final class EPUBLocationPublicationTests: XCTestCase {
         publication?.setIdle(true)
         publication?.spreadWork = { .working }
         let wait = try PendingWait(weakly: XCTUnwrap(publication))
-        weak let weakPublication = publication
+        weak var weakPublication = publication
         try await pollUntil { deadlines.armedCount == 1 }
 
         publication = nil

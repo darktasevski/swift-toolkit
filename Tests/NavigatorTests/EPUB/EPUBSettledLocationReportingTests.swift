@@ -1203,7 +1203,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         defer { contents.release() }
         var reader: Reader? = try await openReader(tableOfContents: contents)
         try await reader?.waitFor("a calculation of the opening page") { contents.wasAsked }
-        weak let weakNavigator = reader?.navigator
+        weak var weakNavigator = reader?.navigator
         // A visible window keeps its former root controller until hidden.
         reader?.window.isHidden = true
         reader?.window.rootViewController = nil

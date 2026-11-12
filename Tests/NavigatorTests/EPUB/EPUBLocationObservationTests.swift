@@ -864,7 +864,7 @@ final class EPUBLocationObservationTests: XCTestCase {
         var fixture: ObservationFixture? = ObservationFixture()
         fixture?.observation.request()
         let reads = fixture?.reads ?? []
-        weak let weakObservation = fixture?.observation
+        weak var weakObservation = fixture?.observation
 
         fixture = nil
         XCTAssertNil(weakObservation, "The outstanding read kept the observation alive")
