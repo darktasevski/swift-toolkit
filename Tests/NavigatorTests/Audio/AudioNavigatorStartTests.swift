@@ -140,6 +140,26 @@ struct AudioNavigatorStartTests {
 
             #expect(fixture.engine.playCount == 2)
         }
+
+        /// An engine that is buffering is set to play, so a seek made then owes a restart too.
+        @Test func seekWhileBufferingPlaysAgain() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.buffer()
+
+            await fixture.navigator.seek(to: 10)
+
+            try await waitUntil { fixture.engine.playCount == 2 }
+        }
+
+        @Test func jumpWhileBufferingPlaysAgain() async throws {
+            let fixture = try await StartFixture.playing(resources: 2)
+            fixture.engine.buffer()
+
+            let landed = await fixture.navigator.go(to: fixture.link(1))
+            try #require(landed)
+
+            try await waitUntil { fixture.engine.playCount == 2 }
+        }
     }
 
     @MainActor
@@ -215,6 +235,17 @@ struct AudioNavigatorStartTests {
 
             #expect(fixture.engine.playCount == 0)
             #expect(fixture.audioSession.startCount == 0)
+        }
+
+        @Test func pausesABufferingEngine() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.buffer()
+
+            fixture.navigator.playPause()
+            await settle()
+
+            #expect(fixture.engine.state == .paused)
+            #expect(fixture.engine.playCount == 1)
         }
 
         /// The engine is paused while a seek made while playing is in flight, but the restart it owes
@@ -561,7 +592,7 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     }
 
     func pause() {
-        guard state == .playing else { return }
+        guard state == .playing || state == .loading else { return }
         send(.paused)
     }
 
@@ -591,6 +622,11 @@ private final class StartRecordingEngine: AudioPlaybackEngine {
     /// Pauses without the navigator asking, short of the resource's end.
     func stopOnItsOwn() {
         send(.paused)
+    }
+
+    /// Waits for data while set to play, as `AVPlayerEngine` reports a stall.
+    func buffer() {
+        send(.loading)
     }
 
     private func send(_ state: AudioEnginePlaybackState) {

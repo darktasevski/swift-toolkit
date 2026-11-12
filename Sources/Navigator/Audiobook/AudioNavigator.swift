@@ -293,9 +293,9 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     private var owedRestarts: Set<Int> = []
     private var lastRestartToken = 0
 
-    /// Records the restart a seek or a jump owes when it begins while playing.
+    /// Records the restart a seek or a jump owes when it begins while the engine plays or buffers.
     private func oweRestartIfPlaying() -> Int? {
-        guard state == .playing else { return nil }
+        guard state.isSetToPlay else { return nil }
         lastRestartToken += 1
         owedRestarts.insert(lastRestartToken)
         return lastRestartToken
@@ -371,15 +371,10 @@ public final class AudioNavigator: Navigator, Configurable, AudioSessionUser, Lo
     /// Toggles the playback. A start still pending counts as playing, so the toggle cancels it: the
     /// engine is paused while a seek or a jump made while playing is in flight, but it owes a restart.
     public func playPause() {
-        switch state {
-        case .loading, .playing:
+        if state.isSetToPlay || playTask != nil || !owedRestarts.isEmpty {
             pause()
-        case .paused:
-            if playTask != nil || !owedRestarts.isEmpty {
-                pause()
-            } else {
-                play()
-            }
+        } else {
+            play()
         }
     }
 
@@ -665,6 +660,17 @@ private extension MediaPlaybackState {
             self = .loading
         case .playing:
             self = .playing
+        }
+    }
+
+    /// Whether the engine plays, or buffers and plays once it can: `.loading` is a stall, never a
+    /// pause.
+    var isSetToPlay: Bool {
+        switch self {
+        case .loading, .playing:
+            true
+        case .paused:
+            false
         }
     }
 }
