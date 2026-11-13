@@ -67,6 +67,27 @@ final class AudioNavigatorAudioSessionTests: XCTestCase {
         XCTAssertNil(weakNavigator)
     }
 
+    /// A navigator released without `close()` ends its session and stops its engine from its
+    /// deinit, once each, before the release returns. The app's audiobook view only pauses, so
+    /// this is the path that ends its playback.
+    func testReleaseWithoutCloseEndsSessionAndStopsEngine() {
+        let audioSession = RecordingAudioSessionManager()
+        weak var weakNavigator: AudioNavigator?
+        var engine: RecordingAudioPlaybackEngine?
+
+        autoreleasepool {
+            var made: (navigator: AudioNavigator, engine: RecordingAudioPlaybackEngine)? =
+                makeNavigator(audioSession: audioSession)
+            weakNavigator = made?.navigator
+            engine = made?.engine
+            made = nil
+        }
+
+        XCTAssertNil(weakNavigator, "the release ran the deinit")
+        XCTAssertEqual(audioSession.endCount, 1)
+        XCTAssertEqual(engine?.stopCount, 1)
+    }
+
     private func makeNavigator(
         audioSession: RecordingAudioSessionManager
     ) -> (navigator: AudioNavigator, engine: RecordingAudioPlaybackEngine) {

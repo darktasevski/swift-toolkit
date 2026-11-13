@@ -82,6 +82,24 @@ struct AudioNavigatorStartTests {
             #expect(fixture.engine.playCount == 1)
         }
 
+        /// `Burst.aPlayMadeDuringItJoinsIt` is the positive control: the same joined play, with no
+        /// pause, starts once the seek lands.
+        @Test func cancelsAPlayJoinedToASeekInFlight() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.holdsSeeks = true
+
+            let seeks = fixture.engine.seekCount
+            async let seek: Void = fixture.navigator.seek(to: 10)
+            try await waitUntil { fixture.engine.seekCount == seeks + 1 }
+            fixture.navigator.play()
+            fixture.navigator.pause()
+            fixture.engine.releaseSeek()
+            await seek
+            try await Task.sleep(nanoseconds: boundedWait)
+
+            #expect(fixture.engine.playCount == 1)
+        }
+
         @Test func cancelsAPendingAdvance() async throws {
             let fixture = try await StartFixture.advancing()
 
@@ -329,6 +347,23 @@ struct AudioNavigatorStartTests {
             #expect(fixture.engine.playCount == 1)
         }
 
+        /// `Burst.aPlayMadeDuringItJoinsIt` is the positive control.
+        @Test func cancelsAPlayJoinedToASeekInFlight() async throws {
+            let fixture = try await StartFixture.playing()
+            fixture.engine.holdsSeeks = true
+
+            let seeks = fixture.engine.seekCount
+            async let seek: Void = fixture.navigator.seek(to: 10)
+            try await waitUntil { fixture.engine.seekCount == seeks + 1 }
+            fixture.navigator.play()
+            fixture.navigator.close()
+            fixture.engine.releaseSeek()
+            await seek
+            try await Task.sleep(nanoseconds: boundedWait)
+
+            #expect(fixture.engine.playCount == 1)
+        }
+
         /// A closed navigator never plays, nor turns the session on, once its opening jump lands.
         @Test func cancelsAPlayWhoseFirstResourceIsLoading() async throws {
             let fixture = StartFixture()
@@ -434,6 +469,18 @@ struct AudioNavigatorStartTests {
 
             #expect(!landed)
             #expect(fixture.engine.state == .playing)
+        }
+
+        /// A refused jump leaves nothing in flight, so the seek after it restarts.
+        /// `Restart.seekWhilePlayingPlaysAgain` is the positive control.
+        @Test func toAnHrefOutsideTheReadingOrderLeavesTheNextSeekItsRestart() async throws {
+            let fixture = try await StartFixture.playing()
+            let outside = Locator(href: AnyURL(string: "missing.mp3")!, mediaType: .mp3)
+
+            _ = await fixture.navigator.go(to: outside)
+            await fixture.navigator.seek(to: 10)
+
+            try await waitUntil { fixture.engine.playCount == 2 }
         }
     }
 

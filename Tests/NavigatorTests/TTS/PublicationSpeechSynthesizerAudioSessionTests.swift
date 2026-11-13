@@ -25,6 +25,22 @@ struct PublicationSpeechSynthesizerAudioSessionTests {
 
         #expect(audioSession.starts == 1)
     }
+
+    /// The synthesizer ends its session from its deinit, before the release returns.
+    @Test func releasingTheSynthesizerEndsTheAudioSession() throws {
+        let audioSession = RecordingAudioSession()
+        var synthesizer: PublicationSpeechSynthesizer? = try #require(PublicationSpeechSynthesizer(
+            publication: makePublication(),
+            audioSession: audioSession,
+            engineFactory: { SilentTTSEngine() }
+        ))
+        weak var released = synthesizer
+
+        synthesizer = nil
+
+        #expect(released == nil, "the release ran the deinit")
+        #expect(audioSession.ends == 1)
+    }
 }
 
 // MARK: - Helpers
@@ -47,12 +63,15 @@ private func makePublication() -> Publication {
 
 private final class RecordingAudioSession: AudioSessionManaging {
     private(set) var starts = 0
+    private(set) var ends = 0
 
     func start(with _: AudioSessionUser, isPlaying _: Bool) {
         starts += 1
     }
 
-    func end(for _: AudioSessionUser) {}
+    func end(for _: AudioSessionUser) {
+        ends += 1
+    }
 
     func user(_: AudioSessionUser, didChangePlaying _: Bool) {}
 }
