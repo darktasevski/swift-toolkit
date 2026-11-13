@@ -38,7 +38,30 @@ struct PublicationSpeechSynthesizerAudioSessionTests {
 
         synthesizer = nil
 
-        #expect(released == nil, "the release ran the deinit")
+        #expect(released == nil, "the release freed the synthesizer")
+        #expect(audioSession.ends == 1)
+    }
+
+    /// Started, then paused, then released: the paused utterance holds nothing past the release.
+    @Test func releasingAPausedSynthesizerEndsTheAudioSession() async throws {
+        let audioSession = RecordingAudioSession()
+        var synthesizer: PublicationSpeechSynthesizer? = try #require(PublicationSpeechSynthesizer(
+            publication: makePublication(),
+            audioSession: audioSession,
+            engineFactory: { SilentTTSEngine() }
+        ))
+        weak var released = synthesizer
+
+        synthesizer?.start()
+        try #require(audioSession.starts == 1, "precondition: the start started the session")
+        synthesizer?.pause()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        synthesizer = nil
+
+        #expect(released == nil, "the release freed the synthesizer")
         #expect(audioSession.ends == 1)
     }
 }

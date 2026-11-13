@@ -83,9 +83,35 @@ final class AudioNavigatorAudioSessionTests: XCTestCase {
             made = nil
         }
 
-        XCTAssertNil(weakNavigator, "the release ran the deinit")
+        XCTAssertNil(weakNavigator, "the release freed the navigator")
         XCTAssertEqual(audioSession.endCount, 1)
         XCTAssertEqual(engine?.stopCount, 1)
+    }
+
+    /// The host's own path: played, then paused, then released. The start task has ended by then,
+    /// so nothing holds the navigator past the release.
+    func testReleaseAfterPlayAndPauseEndsSessionAndStopsEngine() async throws {
+        let audioSession = RecordingAudioSessionManager()
+        var made: (navigator: AudioNavigator, engine: RecordingAudioPlaybackEngine)? =
+            makeNavigator(audioSession: audioSession)
+        let engine = try XCTUnwrap(made?.engine)
+        weak var weakNavigator = made?.navigator
+
+        made?.navigator.play()
+        for _ in 0 ..< 200 where audioSession.startCount == 0 {
+            try await Task.sleep(nanoseconds: 10_000_000)
+        }
+        XCTAssertEqual(audioSession.startCount, 1, "precondition: the play started")
+        made?.navigator.pause()
+        for _ in 0 ..< 20 {
+            await Task.yield()
+        }
+
+        made = nil
+
+        XCTAssertNil(weakNavigator, "the release freed the navigator")
+        XCTAssertEqual(audioSession.endCount, 1)
+        XCTAssertEqual(engine.stopCount, 1)
     }
 
     private func makeNavigator(
