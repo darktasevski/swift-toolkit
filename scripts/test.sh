@@ -32,7 +32,9 @@
 #
 # Exit: xcodebuild's non-zero status; 75 when the bundle cannot be read, or when
 # every test a selection chose skipped (for an unscoped run, when nothing ran
-# unskipped); 1 when an --only-testing identifier matched nothing; otherwise 0.
+# unskipped); 76 when, inside the app's checkout, a gate holds the Mac (the app's
+# scripts/lib/machine-hold.sh); 1 when an --only-testing identifier matched
+# nothing; otherwise 0.
 # Every run prints its counts and a final VERDICT line (scripts/test-verdict.sh).
 # =============================================================================
 
@@ -44,6 +46,14 @@ REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/test-simulator-isolation.sh"
 # shellcheck source=./scripts/test-verdict.sh
 source "$SCRIPT_DIR/test-verdict.sh"
+
+# Inside the app's checkout the runner takes the app's machine hold, whose library needs Bash 5.
+APP_MACHINE_HOLD=""
+APP_ROOT="$(git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+if [[ -n "$APP_ROOT" && -f "$APP_ROOT/scripts/lib/machine-hold.sh" ]]; then
+	APP_MACHINE_HOLD="$APP_ROOT/scripts/lib/machine-hold.sh"
+	((BASH_VERSINFO[0] >= 5)) || exec "$APP_ROOT/scripts/lib/exec-with-bash-5.sh" "$0" "$@"
+fi
 
 DEVICE="${SIMULATOR_NAME:-iPad (A16)}"
 DEVICE_EXPLICITLY_SET=false
@@ -100,6 +110,13 @@ fi
 if [[ "$PRUNE_CURRENT" == true ]]; then
 	readium_sim_prune_current "$REPO_ROOT" "$DEVICE"
 	exit 0
+fi
+
+# Refuse, rather than slow the app's gate while it holds the Mac (exit 76).
+if [[ -n "$APP_MACHINE_HOLD" ]]; then
+	# shellcheck source=/dev/null
+	source "$APP_MACHINE_HOLD"
+	machine_hold_take_shared "${0##*/} in $REPO_ROOT" || exit $?
 fi
 
 DESTINATION="$(readium_sim_resolve_destination "$REPO_ROOT" "$DEVICE" "$DEVICE_EXPLICITLY_SET")"

@@ -125,6 +125,8 @@ jobs:
         run: pnpm --dir "$scripts" run lint
       - name: Check formatting
         run: pnpm --dir "$scripts" run checkformat
+      - name: Test EPUB input gestures
+        run: pnpm --dir "$scripts" test
       - name: Check if bundled scripts are up-to-date
         run: |
             make scripts

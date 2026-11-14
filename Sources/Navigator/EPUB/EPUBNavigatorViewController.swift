@@ -245,6 +245,10 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         /// When `nil`, the navigator writes to the system pasteboard directly.
         public var copySelection: (@MainActor @Sendable (String) -> Void)?
 
+        /// Receives the PNG for an explicitly selected Copy action on an unrestricted
+        /// publication image. Without a sink, the image menu omits Copy.
+        public var copyImage: (@MainActor @Sendable (Data) -> Void)?
+
         public init(
             preferences: EPUBPreferences = .empty,
             defaults: EPUBDefaults = EPUBDefaults(),

@@ -13,6 +13,13 @@ import WebKit
 final class WebView: WKWebView {
     private let editingActions: EditingActionsController
 
+    /// EPUB spreads own their link and image menus. WebKit consults this getter while
+    /// constructing its interactions, before a caller can configure the finished view.
+    override var allowsLinkPreview: Bool {
+        get { false }
+        set {}
+    }
+
     convenience init(editingActions: EditingActionsController) {
         self.init(editingActions: editingActions, configuration: WKWebViewConfiguration())
     }

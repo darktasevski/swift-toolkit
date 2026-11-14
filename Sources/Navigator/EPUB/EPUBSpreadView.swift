@@ -90,6 +90,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     let webView: WebView
     let locatorCommandBridge: EPUBLocatorCommandBridge
     let externalLinkActivationBridge = EPUBExternalLinkActivationBridge()
+    let imageMenuBridge = EPUBImageMenuBridge()
+    let publicationMenu = EPUBPublicationMenu()
 
     private var lastClick: ClickEvent?
 
@@ -158,6 +160,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         )
         locatorCommandBridge.install(in: config)
         self.locatorCommandBridge = locatorCommandBridge
+        imageMenuBridge.install(in: config.userContentController)
         externalLinkActivationBridge.install(in: config)
 
         // Disable the Apple Intelligence Writing tools in the web views.
@@ -170,6 +173,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         locatorCommandBridge.attach(to: webView)
 
         super.init(frame: .zero)
+        configurePublicationMenu()
         locatorCommandBridge.onDecorationActivated = { [weak self] body in
             self?.decorationDidActivate(body)
         }
@@ -232,6 +236,8 @@ class EPUBSpreadView: UIView, Loggable, PageView {
         disableJSMessages()
         locatorCommandBridge.disableMessageHandler()
         externalLinkActivationBridge.disableMessageHandler()
+        imageMenuBridge.disableMessageHandler()
+        publicationMenu.dismiss()
     }
 
     func setupWebView() {
@@ -277,6 +283,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
             enableJSMessages()
             locatorCommandBridge.enableMessageHandler()
             externalLinkActivationBridge.enableMessageHandler()
+            imageMenuBridge.enableMessageHandler()
             scrollView.delegate = self
         }
     }
@@ -345,6 +352,7 @@ class EPUBSpreadView: UIView, Loggable, PageView {
     }
 
     private func beginMainFrameLoading() -> EPUBSpreadReadiness.Generation {
+        publicationMenu.dismiss()
         spreadLoadTask?.cancel()
         spreadLoadTask = nil
         let generation = readiness.beginLoading()

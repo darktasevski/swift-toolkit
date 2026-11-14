@@ -166,7 +166,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         let deadlines = ManualDeadlines()
         let calls = HeldCalls()
         var transport: EPUBLocationTransport? = EPUBLocationTransport(scheduler: deadlines.scheduler)
-        weak let weakTransport = transport
+        weak var weakTransport = transport
         var delivered = false
         transport?.start(
             until: EPUBLocatorOperationDeadline(startingAt: deadlines.now, budget: .seconds(5)),
@@ -321,7 +321,7 @@ final class EPUBLocationTransportTests: XCTestCase {
         var fixture: BridgeFixture? = try BridgeFixture()
         fixture?.bridge.setFrameCapability(EPUBSpreadFrameCapability())
         let scripts = try XCTUnwrap(fixture?.scripts)
-        weak let weakBridge = fixture?.bridge
+        weak var weakBridge = fixture?.bridge
 
         fixture = nil
         XCTAssertNil(weakBridge, "The outstanding injection kept the bridge alive")

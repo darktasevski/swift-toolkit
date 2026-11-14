@@ -64,11 +64,29 @@ Carried since the v3.9.0 sync. Upstream #792 added the official `PDFResourceCont
 | `Tests/StreamerTests/Parser/PDF/PDFTextNormalizerTests.swift` | 6 tests: within-paragraph join, paragraph-break preservation, hyphenation, multiple blank lines, empty, single-line. |
 | `Tests/StreamerTests/Parser/PDF/NormalizingPDFContentIteratorTests.swift` | 6 tests: segment+highlight rejoin, hyphenation, locator preservation, end-of-iteration nil, non-text pass-through, `previous()` normalization. |
 
-## Owned link context menu
+## EPUB image and link menus
 
-A long-press on a link that leaves the publication showed WebKit's link menu, whose preview fetched the destination and whose "Open Link" went to Safari without consulting the navigation policy, so a host app that confirms outbound links (Reader app #3016) was bypassed. Returning `nil` from the UI delegate does not suppress it for an `http(s)` link: WebKit falls back to DataDetectors' URL menu. The spread view returns its own configuration instead: no preview, and one item that takes the tap path (`spreadView(_:didTapOnExternalURL:)`). Links inside the publication and `javascript:` links get `nil`. An image keeps WebKit's menu unless it is inside an outbound link, where it gets this one, without Save, Copy or Share. Design record: [ADR-0186 in the host repository](../../docs/ADR/0186-converted-container-link-disposition.md).
+EPUB spreads disable WebKit previews at web-view construction. The gesture bridge
+requests a native menu for an external link. Its Open Link action
+takes the tap path (`spreadView(_:didTapOnExternalURL:)`). A link takes precedence over
+an image inside it. Internal links have no long-press action.
+[Outbound-link design](../../docs/ADR/0186-converted-container-link-disposition.md)
 
-For an upstream PR, three things would surprise: the item reads "Open Link…" with a `safari` image although upstream's default hand-off opens at once (and `mailto:` opens Mail); WebKit's Copy Link and Share are gone; and for a publication served over `http(s)` every internal link is `http(s)`, so returning `nil` for it still gets DataDetectors' menu — unreachable for a publication served from the custom scheme, as the host app's are.
+For a packaged bitmap, `EPUBPublicationMenu` offers Save Image and Share.
+Long-press the image on iOS or right-click it on Catalyst. Both reflowable and fixed-layout spreads use the same menu (#3660).
+Copy is available when the host supplies `Configuration.copyImage`. The host receives PNG
+data only after the user selects Copy. A publication with a content-protection service gets
+no image menu: Readium defines rights for text only, and the selection menu already drops
+Share for such a publication. `EPUBMenuImage` limits input bytes and pixel dimensions before
+decoding, and admits only the EPUB core raster types (JPEG, PNG, GIF, WebP) judged by the
+bytes, since manifests often mislabel images. Save Image opens the Files export sheet
+(`EPUBImageExport`: a save panel on Mac Catalyst, the Files browser on iOS) for a temporary
+copy named after the resource, removed when the sheet finishes, so it needs no Photos access.
+The bridge accepts resource addresses for menu presentation and has no operation that writes a clipboard.
+
+The host chooses how to present the destination after Open Link. The action sheet omits
+WebKit's Copy Link and Share actions. The navigator's WKUIDelegate configuration remains
+available to WebKit for link requests it delivers through that delegate.
 
 ### New files
 
@@ -182,9 +200,10 @@ Upstream's reflowable spread caches the first and last numbers the page world po
 
 | Path | Purpose | Upstream-PR-ready? |
 | --- | --- | --- |
-| `Sources/Navigator/EPUB/EPUBLocationObservation.swift` | The spread's observation scheduler: hints that only ask, one read at a time, a retained obligation, one bounded retry, explicit unavailable states and the recovery grants (`EPUBObservationGrant`). | No — it rests on the readiness model. |
+| `Sources/Navigator/EPUB/EPUBLocationObservation.swift` | The spread's observation scheduler: hints that only ask, one read at a time, a retained obligation, one bounded retry, explicit unavailable states and the recovery grants (`EPUBObservationGrant`). `pendingWork` and `onPendingWorkChange` tell the navigator's commit wait what the spread still owes. | No — it rests on the readiness model. |
 | `Sources/Navigator/EPUB/EPUBLocationTransport.swift` | The single outstanding location call per web view, a read or a capability injection; only WebKit's completion frees it. | No. |
-| `Sources/Navigator/EPUB/EPUBLocationPublication.swift` | The navigator's commit: one calculation at a time, `EPUBPublicationKey` currency, `hold()`/`release()` for a resource hop, and `rebuildLocation()`, where a spread rebuild starts. | No. |
+| `Sources/Navigator/EPUB/EPUBLocationPublication.swift` | The navigator's commit: one calculation at a time, `EPUBPublicationKey` currency, `hold()`/`release()` for a resource hop, and `rebuildLocation()`, where a spread rebuild starts. `awaitPendingCommit()` waits, within `calculationBudget`, until no commit is still to come. | No. |
+| `Sources/Navigator/EPUB/EPUBNavigatorViewController+PendingLocationCommit.swift` | `awaitPendingLocationCommit()` (public) and `EPUBPendingLocationCommit`: a host saving the position on dismiss waits for a location still being calculated, so it saves the place on screen (#3080); its `deadlinePassed` says whether the wait ended on a deadline, its own or an expired calculation's budget, with the move uncommitted. `EPUBSpreadLocationWork`, what the current spread still owes. | No — it rests on the publication and the observation. |
 | `Sources/Navigator/EPUB/EPUBReflowableSpreadView+LocationObservation.swift` | When a read may start (`observationEligibility`) and the scroll and scene signals that ask for one. | No. |
 | `Sources/Navigator/EPUB/EPUBSpreadView+ScrollSettlement.swift` | The scroll view's settlement callbacks a reflowable spread overrides. | No. |
 | `Sources/Navigator/EPUB/EPUBSpreadView+MeasuredPosition.swift` | `measuredPosition()` and `measuredProgression(of:)`, the spread's measurement for a rebuild and a selection. | No. |
@@ -219,12 +238,12 @@ Upstream's reflowable spread caches the first and last numbers the page world po
 
 | Path | Coverage |
 | --- | --- |
-| `Tests/NavigatorTests/EPUB/EPUBSettledLocationReportingTests.swift` | Real navigators and web views against a DOM oracle: page turns (LTR, RTL, animated), native scroll in paged, scroll and vertical-writing layouts, progression and element jumps, a jump into another resource, poisoned hints, reloads before a publication, during a hold and on a fixed layout, and the visible excerpt and selection locator on the showing spread. The animated turn runs in a host that never animates, and no test drives a real touch. |
+| `Tests/NavigatorTests/EPUB/EPUBSettledLocationReportingTests.swift` | Real navigators and web views against a DOM oracle: page turns (LTR, RTL, animated), native scroll in paged, scroll and vertical-writing layouts, progression and element jumps, a jump into another resource, poisoned hints, reloads before a publication, during a hold and on a fixed layout, the visible excerpt and selection locator on the showing spread, and `awaitPendingLocationCommit()`: at once when idle, the turned-to place after a turn into another resource, at once for a blocked spread, a spread that blocks mid-wait, and the callback it installs. The animated turn runs in a host that never animates, and no test drives a real touch. |
 | `Tests/NavigatorTests/EPUB/EPUBSpreadViewCommandOutcomeTests.swift` (also listed above) | Spread-level reporting: both registration orders, a command or native scroll revoking the accepted sample, the scroll-end callbacks, `publicationInput()` for reflowable and fixed spreads, a selection before any measurement, native input forwarded before reports, and a page turn settling on the scroll-quiet signal. |
 | `Tests/NavigatorTests/EPUB/EPUBLocatorFrameRegistryTests.swift`, `EPUBSpreadReadinessTests.swift`, `Tests/NavigatorTests/Toolkit/PaginationViewCurrentPageTests.swift` (also listed above) | A reflowable main frame's re-registration replaces its handle; every readiness change is reported in order; a native drag is admitted before the page changes. |
-| `Tests/NavigatorTests/EPUB/EPUBLocationObservationTests.swift` | The scheduler's state contract: one read at a time, retained obligation, the fixed hint window, one bounded retry, unavailable states, grants. |
+| `Tests/NavigatorTests/EPUB/EPUBLocationObservationTests.swift` | The scheduler's state contract: one read at a time, retained obligation, the fixed hint window, one bounded retry, unavailable states, grants; `pendingWork` and an `onPendingWorkChange` report for each of its inputs. |
 | `Tests/NavigatorTests/EPUB/EPUBLocationTransportTests.swift` | One physical call per web view; a deadline that frees no slot; completions that cannot keep their owner alive. |
-| `Tests/NavigatorTests/EPUB/EPUBLocationPublicationTests.swift` | Idle gating, one calculation at a time, key currency, expiry and late exit, holds, the rebuild location. |
+| `Tests/NavigatorTests/EPUB/EPUBLocationPublicationTests.swift` | Idle gating, one calculation at a time, key currency, expiry and late exit, holds, the rebuild location; the pending-commit wait: its at-once returns, the deadline from the wait's start, an expired calculation's budget ending it (before the wait, mid-wait, and beside a blocked spread), deferred re-evaluation, the navigation and hold terms, each spread term, and the waiter's lifecycle; a released publication's calculation commits nothing once its task ends. |
 | `Tests/NavigatorTests/EPUB/EPUBScrollAnimationCoordinatorTests.swift` | The animation coordinator resumes only the matching request on cancellation, a stale request or waiter cannot clear a newer one, and a superseded wait's fallback leaves the newer wait to its own timer. |
 | `Tests/NavigatorTests/EPUB/EPUBViewportAndLocationCalculatorTests.swift` (upstream file) | Adds the single-resource locator. |
 
@@ -285,6 +304,26 @@ Design record: [§ D6 of the App Lock design in the host repository](../../docs/
 | `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | Each test is bounded to a minute, so a held load or seek never released fails rather than hangs: the fake engine's holds end when the waiting task is cancelled, a seek or jump the test awaits runs as an `async let` child that the limit cancels, and a release made before the call arrives is kept for it. A pause, the toggle and `close()` cancel the restart that a seek or jump in flight owes, and a toggle after a failed jump starts again; the same held seek and jump, released unpaused, play again as the positive controls. A start refused after the first load leaves the audio session off; the session starts after the load and before the engine plays. A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; the gate refuses an advance; a toggle pauses a pending start, leaving the audio session unstarted, and starts again after a start ran to its end, after the last resource ends, and after the next resource fails to load; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. A jump to an href outside the reading order leaves the engine playing, and the seek after it still restarts. A seek or jump made while the engine buffers owes a restart, and the toggle pauses a buffering engine. Seeks and jumps in flight together restart once, after the last lands; a `play()` made meanwhile joins that restart and plays even if a jump fails, a jump that fails cancels a restart nobody joined, and `pause()` and `close()` cancel a joined play as well. |
 | `Tests/NavigatorTests/Audio/AudioNavigatorAudioSessionTests.swift` | The injected session starts on play, follows the engine's playing changes, and ends on `close()`, which stops the engine at once and leaves the navigator free to be released. A navigator released without `close()` ends its session and stops its engine from its `isolated deinit`, once each, before the release returns. |
 | `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerAudioSessionTests.swift` | `start(from:)` has started the audio session when it returns. The synthesizer ends its session from its `isolated deinit` before the release returns. |
+
+## Page snapping measures the scrollport (Reader app #1677)
+
+`utils.js` cached the page width from `window.innerWidth` on each body resize, starting at `0`. The visual viewport reads `0` for a moment after a resource transition while the layout is already sized (measured with live instrumentation, Reader app plan `2026-07-20-render-faithful-epub-index-locator-v7-refactor.md`, checkpoint 2026-07-24 09:01), and a snap to a width of `0` is `NaN`, which WebKit writes to `scrollLeft` as `0`: a resize in that window, or a snap before the first one, sent a paginated resource back to its first page. `pageWidth()` now measures `document.scrollingElement.clientWidth` when it is called, as `progressionScrollTarget` does, and answers `null` when the scrollport has no width. The snap and the two-column virtual-column check, the two width reads of the resize handler, both use it and leave the page alone on `null`.
+
+The hunk stands alone: it touches neither the fork's `progression.js` import nor its hint, so it can be offered upstream although the file as a whole stays divergent (see *Settled location reporting*). It deliberately does not share `progressionScrollTarget`'s snap or the isolated `reader-locator-commands.js` `snapOffset`, which would tie it to fork-only files. `scrollLeft`, `scrollRight` and `scrollToOffset` still take `window.innerWidth` as the page: no Swift code calls them, so they are left as upstream wrote them.
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/utils.js` | The `viewportWidth` cache is gone. `pageWidth()` reads the scrollport's width, `null` for none. On `null`, `snapCurrentPosition`, `scrollToPosition` and `appendVirtualColumnIfNeeded` change nothing, and `scrollToRect`, with `scrollToId` and `scrollToLocator` through it, returns `false`. | Yes, this hunk on its own — the bug is upstream's (2021 and 2025-05-15 lines). |
+| `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js` | Re-emitted by `pnpm run bundle`. | No (build artifacts). |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewPageSnapTests.swift` | 4 tests on a hosted, paginated spread. While the visual viewport reads `0`, a body resize snaps an off-boundary offset to its page start, and in two columns per screen evens out an odd column count. With no measurable scrollport, a resize and a jump (`scrollToPosition`, `scrollToId`) leave the offset alone, each shown to have measured the page in the same run, and `scrollToId` returns `false`. Each checks first that its setup held, since a spread that turns ready goes to its opening location. |
+| `Tests/NavigatorTests/EPUB/EPUBSpreadViewHosting.swift` | `waitForReady(in:)`, the third earned-skip site beside `waitForDocumentLoad` and `waitForFixedResourceLoad`. |
 
 ## Upstream-rebase guidance
 
