@@ -33,7 +33,8 @@
 # Exit: xcodebuild's non-zero status; 75 when the bundle cannot be read, or when
 # every test a selection chose skipped (for an unscoped run, when nothing ran
 # unskipped); 76 when, inside the app's checkout, a gate holds the Mac (the app's
-# scripts/lib/machine-hold.sh); 1 when an --only-testing identifier matched
+# scripts/lib/machine-hold.sh); 74 when that checkout has no such library, or the
+# hold's directory is unusable; 1 when an --only-testing identifier matched
 # nothing; otherwise 0.
 # Every run prints its counts and a final VERDICT line (scripts/test-verdict.sh).
 # =============================================================================
@@ -47,12 +48,18 @@ source "$SCRIPT_DIR/test-simulator-isolation.sh"
 # shellcheck source=./scripts/test-verdict.sh
 source "$SCRIPT_DIR/test-verdict.sh"
 
-# Inside the app's checkout the runner takes the app's machine hold, whose library needs Bash 5.
+# Inside the app's checkout the runner takes the app's machine hold. The lookup
+# drops git's location variables: an inherited GIT_DIR would answer for another
+# repository, and the run would go unheld.
 APP_MACHINE_HOLD=""
-APP_ROOT="$(git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
-if [[ -n "$APP_ROOT" && -f "$APP_ROOT/scripts/lib/machine-hold.sh" ]]; then
+APP_ROOT="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+	git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+if [[ -n "$APP_ROOT" ]]; then
 	APP_MACHINE_HOLD="$APP_ROOT/scripts/lib/machine-hold.sh"
-	((BASH_VERSINFO[0] >= 5)) || exec "$APP_ROOT/scripts/lib/exec-with-bash-5.sh" "$0" "$@"
+	[[ -f "$APP_MACHINE_HOLD" ]] || {
+		echo "The app checkout at $APP_ROOT has no scripts/lib/machine-hold.sh; refusing to run unheld." >&2
+		exit 74
+	}
 fi
 
 DEVICE="${SIMULATOR_NAME:-iPad (A16)}"

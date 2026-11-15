@@ -4,6 +4,12 @@
 
 set -euo pipefail
 
+# A git hook that runs this self-test exports GIT_DIR and its kin, which outrank
+# `git -C`. The cases run without them; the one that needs GIT_DIR sets its own.
+for git_variable in $(git rev-parse --local-env-vars); do
+	unset "$git_variable"
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$SCRIPT_DIR/test.sh"
@@ -30,6 +36,14 @@ cleanup() {
 trap cleanup EXIT
 
 FAKE_BIN="$SCRATCH/bin"
+# The app worktrees the simulator cases name. Each carries a stand-in hold library
+# that holds nothing; the machine-hold cases below use the app's real one.
+FAKE_APP_A="$SCRATCH/reader-app-worktree-a"
+FAKE_APP_B="$SCRATCH/reader-app-worktree-b"
+for fake_app in "$FAKE_APP_A" "$FAKE_APP_B"; do
+	mkdir -p "$fake_app/scripts/lib"
+	printf 'machine_hold_take_shared() { :; }\n' >"$fake_app/scripts/lib/machine-hold.sh"
+done
 mkdir -p "$FAKE_BIN"
 
 cat >"$FAKE_BIN/xcodebuild" <<'EOF'
@@ -95,6 +109,8 @@ set -euo pipefail
 
 case "$*" in
 *"rev-parse --show-superproject-working-tree")
+	# Real git answers about GIT_DIR's repository when one is inherited, not -C's.
+	[[ -z "${GIT_DIR:-}${GIT_WORK_TREE:-}${GIT_INDEX_FILE:-}" ]] || exit 0
 	printf '%s\n' "${FAKE_SUPERPROJECT_ROOT:-}"
 	;;
 *"rev-parse --path-format=absolute --git-common-dir")
@@ -257,7 +273,7 @@ run_cli_case() {
 		"TMPDIR=$SCRATCH/tmp"
 		"FAKE_SIMCTL_DEVICES_JSON=${CASE_SIMCTL_DEVICES_JSON:-}"
 		"FAKE_CREATED_UDID=${CASE_CREATED_UDID:-11111111-2222-3333-4444-555555555555}"
-		"FAKE_SUPERPROJECT_ROOT=${CASE_SUPERPROJECT_ROOT:-/tmp/reader-app-worktree-a}"
+		"FAKE_SUPERPROJECT_ROOT=${CASE_SUPERPROJECT_ROOT:-$FAKE_APP_A}"
 		"FAKE_GIT_COMMON_DIR=${CASE_GIT_COMMON_DIR:-/tmp/reader-app-common.git}"
 		"FAKE_GIT_WORKTREE_STATUS=${CASE_GIT_WORKTREE_STATUS:-0}"
 		"SIM_ISOLATION=${CASE_SIM_ISOLATION:-1}"
@@ -311,7 +327,7 @@ run_runner_case "grep error survives pipeline" 45 0 "build output" stdout 0 45
 # UDID. The dedicated name must vary with the owning worktree path even when
 # the linked repository's common directory is shared.
 unset CASE_READIUM_DESTINATION CASE_SIMULATOR_UDID CASE_SIMCTL_DEVICES_JSON
-CASE_SUPERPROJECT_ROOT=/tmp/reader-app-worktree-a
+CASE_SUPERPROJECT_ROOT="$FAKE_APP_A"
 run_cli_case "default creates dedicated simulator" 0
 assert_arg_pair "$SCRATCH/default creates dedicated simulator.args" \
 	-destination "platform=iOS Simulator,id=11111111-2222-3333-4444-555555555555"
@@ -320,14 +336,14 @@ create_a="$(sed -n 's/^simctl create \(.*\) iPad (A16)$/\1/p' \
 [[ "$create_a" =~ ^Readium-WT-[0-9a-f]{8}__[0-9a-f]{12}__iPad-A16$ ]] ||
 	fail "default run did not create a width-bounded Readium-WT simulator: $create_a"
 
-CASE_SUPERPROJECT_ROOT=/tmp/reader-app-worktree-b
+CASE_SUPERPROJECT_ROOT="$FAKE_APP_B"
 run_cli_case "second worktree gets another simulator" 0
 create_b="$(sed -n 's/^simctl create \(.*\) iPad (A16)$/\1/p' \
 	"$SCRATCH/second worktree gets another simulator.xcrun")"
 [[ -n "$create_b" && "$create_b" != "$create_a" ]] ||
 	fail "dedicated simulator name did not vary by worktree"
 
-CASE_SUPERPROJECT_ROOT=/tmp/reader-app-worktree-a
+CASE_SUPERPROJECT_ROOT="$FAKE_APP_A"
 CASE_SIMCTL_DEVICES_JSON="{\"devices\":{\"runtime\":[{\"name\":\"$create_a\",\"udid\":\"99999999-8888-7777-6666-555555555555\",\"isAvailable\":true}]}}"
 run_cli_case "existing dedicated simulator is reused" 0
 assert_arg_pair "$SCRATCH/existing dedicated simulator is reused.args" \
@@ -403,7 +419,7 @@ unset CASE_READIUM_DESTINATION
 
 # Case G: explicit cleanup preserves active worktrees and removes only the
 # requested current or orphaned dedicated simulator.
-CASE_SUPERPROJECT_ROOT=/tmp/reader-app-worktree-a
+CASE_SUPERPROJECT_ROOT="$FAKE_APP_A"
 name_prefix="${create_a%%__*}__"
 orphan_name="${name_prefix}deadbeefdead__iPad-A16"
 CASE_SIMCTL_DEVICES_JSON="{\"devices\":{\"runtime\":[{\"name\":\"$create_a\",\"udid\":\"ACTIVE-UDID\",\"isAvailable\":true},{\"name\":\"$orphan_name\",\"udid\":\"ORPHAN-UDID\",\"isAvailable\":true}]}}"
@@ -592,47 +608,93 @@ grep -Fq 'branches: [ main, develop, fork-extensions ]' "$REPO_ROOT/.github/work
 	fail "Checks workflow does not run for fork-extensions pushes"
 echo "  PASS: fork-extensions pushes run Checks"
 
-# Inside the app's checkout, a gate holding the Mac refuses the run before xcodebuild starts.
-app_root="$(git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
-if [[ -n "$app_root" && -f "$app_root/scripts/lib/machine-hold.sh" ]]; then
+# Inside the app's checkout the runner takes the app's machine hold. These cases
+# need the app's library, so a fork checked out on its own skips them; inside an
+# app checkout that lacks the library they fail rather than skip.
+app_root="$(env -u GIT_DIR -u GIT_WORK_TREE -u GIT_INDEX_FILE \
+	git -C "$REPO_ROOT" rev-parse --show-superproject-working-tree 2>/dev/null || true)"
+if [[ -n "$app_root" ]]; then
+	for lib in machine-hold.sh machine-hold-fixture.sh; do
+		[[ -f "$app_root/scripts/lib/$lib" ]] ||
+			fail "the app checkout around this fork has no scripts/lib/$lib"
+	done
 	fixture_app="$SCRATCH/app"
 	hold_root="$SCRATCH/machine-hold"
-	mkdir -p "$fixture_app/scripts/lib"
-	cp "$app_root/scripts/lib/machine-hold.sh" "$app_root/scripts/lib/exec-with-bash-5.sh" "$fixture_app/scripts/lib/"
-	# shellcheck disable=SC2016 # the inner shell expands its own arguments
-	env -u READER_APP_MACHINE_HOLD -u READER_APP_MACHINE_HOLD_TOKEN READER_APP_MACHINE_HOLD_ROOT="$hold_root" \
-		"$BASH" -c 'source "$1"; machine_hold_try_exclusive "fixture gate" 0 || exit $?; : >"$2"; exec sleep 300' \
-		_ "$fixture_app/scripts/lib/machine-hold.sh" "$SCRATCH/holder-ready" &
-	HELD_HOLDER_PID=$!
-	for _ in $(seq 1 100); do
-		[[ -e "$SCRATCH/holder-ready" ]] && break
-		sleep 0.1
-	done
-	[[ -e "$SCRATCH/holder-ready" ]] || fail "a held Mac refuses the run — the fixture gate never took the hold"
-	held_exit=0
-	env -u READER_APP_MACHINE_HOLD -u READER_APP_MACHINE_HOLD_TOKEN -u READIUM_TEST_RESULT_BUNDLE -u READIUM_SKIP_TESTING \
-		PATH="$FAKE_BIN:$PATH" \
-		TMPDIR="$VERDICT_TMP" \
-		FAKE_SUPERPROJECT_ROOT="$fixture_app" \
-		READER_APP_MACHINE_HOLD_ROOT="$hold_root" \
-		READIUM_TEST_DESTINATION="platform=iOS Simulator,id=HELD-UDID" \
-		FAKE_XCODEBUILD_STATUS=0 \
-		FAKE_XCODEBUILD_OUTPUT="Test Succeeded" \
-		FAKE_XCODEBUILD_ARGS="$SCRATCH/held.args" \
-		FAKE_XCRESULT_DIR="$XCRESULT_FIXTURES" \
-		"$RUNNER" >"$SCRATCH/held.out" 2>&1 || held_exit=$?
-	kill -KILL "$HELD_HOLDER_PID" 2>/dev/null || true
-	wait "$HELD_HOLDER_PID" 2>/dev/null || true
-	HELD_HOLDER_PID=""
+	mkdir -p "$fixture_app/scripts/lib" "$SCRATCH/app-without-hold/scripts/lib"
+	cp "$app_root/scripts/lib/machine-hold.sh" "$app_root/scripts/lib/machine-hold-fixture.sh" \
+		"$fixture_app/scripts/lib/"
+	# shellcheck source=/dev/null
+	source "$fixture_app/scripts/lib/machine-hold-fixture.sh"
+
+	# run_held LABEL SUPERPROJECT [VAR=value...] -- RUNNER-COMMAND...: runs the
+	# runner with the fixture Mac held; sets held_exit.
+	run_held() {
+		local label="$1" superproject="$2"
+		shift 2
+		local env_args=()
+		while [[ "$1" != -- ]]; do
+			env_args+=("$1")
+			shift
+		done
+		shift
+		held_exit=0
+		env -u READER_APP_MACHINE_HOLD -u READIUM_TEST_RESULT_BUNDLE -u READIUM_SKIP_TESTING \
+			PATH="$FAKE_BIN:$PATH" \
+			TMPDIR="$VERDICT_TMP" \
+			FAKE_SUPERPROJECT_ROOT="$superproject" \
+			READER_APP_MACHINE_HOLD_ROOT="$hold_root" \
+			READIUM_TEST_DESTINATION="platform=iOS Simulator,id=HELD-UDID" \
+			FAKE_XCODEBUILD_STATUS=0 \
+			FAKE_XCODEBUILD_OUTPUT="Test Succeeded" \
+			FAKE_XCODEBUILD_ARGS="$SCRATCH/$label.args" \
+			FAKE_XCRESULT_DIR="$XCRESULT_FIXTURES" \
+			${env_args[@]+"${env_args[@]}"} \
+			"$@" >"$SCRATCH/$label.out" 2>&1 || held_exit=$?
+	}
+
+	READER_APP_MACHINE_HOLD_ROOT="$hold_root" machine_hold_fixture_start exclusive "fixture gate" ||
+		fail "a held Mac refuses the run — the fixture gate never took the hold"
+	HELD_HOLDER_PID="$MACHINE_HOLD_FIXTURE_PID"
+
+	run_held held "$fixture_app" -- "$RUNNER"
 	if [[ "$held_exit" -ne 76 ]]; then
 		cat "$SCRATCH/held.out" >&2
 		fail "a held Mac refuses the run — expected exit=76, got $held_exit"
 	fi
 	[[ ! -e "$SCRATCH/held.args" ]] || fail "a held Mac refuses the run — xcodebuild ran"
-	grep -Fq "fixture gate" "$SCRATCH/held.out" || fail "a held Mac refuses the run — the refusal did not name the holder"
+	grep -Fq "The Mac is held by fixture gate" "$SCRATCH/held.out" ||
+		fail "a held Mac refuses the run — the refusal did not name the holder"
 	echo "  PASS: a held Mac refuses the run"
+
+	# The library runs under macOS's Bash 3.2, so the runner takes the hold there too.
+	run_held held-bash32 "$fixture_app" -- /bin/bash "$RUNNER"
+	if [[ "$held_exit" -ne 76 ]]; then
+		cat "$SCRATCH/held-bash32.out" >&2
+		fail "a held Mac refuses a Bash 3.2 run — expected exit=76, got $held_exit"
+	fi
+	echo "  PASS: a held Mac refuses a Bash 3.2 run"
+
+	# An inherited GIT_DIR must not hide the superproject from the lookup.
+	run_held held-git-dir "$fixture_app" GIT_DIR="$SCRATCH/elsewhere.git" -- "$RUNNER"
+	if [[ "$held_exit" -ne 76 ]]; then
+		cat "$SCRATCH/held-git-dir.out" >&2
+		fail "a held Mac refuses a run with GIT_DIR set — expected exit=76, got $held_exit"
+	fi
+	echo "  PASS: a held Mac refuses a run with GIT_DIR set"
+
+	machine_hold_fixture_stop "$HELD_HOLDER_PID"
+	HELD_HOLDER_PID=""
+
+	# A superproject without the hold library is refused, never run unheld.
+	run_held app-without-hold "$SCRATCH/app-without-hold" -- "$RUNNER"
+	if [[ "$held_exit" -ne 74 ]]; then
+		cat "$SCRATCH/app-without-hold.out" >&2
+		fail "a superproject without the hold library — expected exit=74, got $held_exit"
+	fi
+	[[ ! -e "$SCRATCH/app-without-hold.args" ]] || fail "a superproject without the hold library — xcodebuild ran"
+	echo "  PASS: a superproject without the hold library is refused"
 else
-	echo "  SKIP: a held Mac refuses the run (no app checkout around this fork)"
+	echo "  SKIP: the machine-hold cases (this fork is not inside an app checkout)"
 fi
 
 echo "OK: all test.sh self-tests passed"
