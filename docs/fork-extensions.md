@@ -299,6 +299,28 @@ The hunk stands alone: it touches neither the fork's `progression.js` import nor
 | `Tests/NavigatorTests/EPUB/EPUBSpreadViewPageSnapTests.swift` | 4 tests on a hosted, paginated spread. While the visual viewport reads `0`, a body resize snaps an off-boundary offset to its page start, and in two columns per screen evens out an odd column count. With no measurable scrollport, a resize and a jump (`scrollToPosition`, `scrollToId`) leave the offset alone, each shown to have measured the page in the same run, and `scrollToId` returns `false`. Each checks first that its setup held, since a spread that turns ready goes to its opening location. |
 | `Tests/NavigatorTests/EPUB/EPUBSpreadViewHosting.swift` | `waitForReady(in:)`, the third earned-skip site beside `waitForDocumentLoad` and `waitForFixedResourceLoad`. |
 
+## A disclosure's summary is the tap target, and navigation opens a disclosure (Reader app #3803)
+
+`findNearestInteractiveElement` counted a `<details>` and everything in it as a control, so a tap anywhere inside an open disclosure was dropped as a tap on a control: on every page of a long one, an edge tap turned no page and a centre tap showed no controls. Only a disclosure's `<summary>` opens and closes it, so the summary is the control now, and a tap in the content turns the page as anywhere else. A fragment, a locator or a search result inside a closed `<details>` scrolled to an element that is not rendered, which has no position: navigation now opens every closed disclosure whose content holds the target before it measures the target, as a browser does before it scrolls to a fragment. A target in a disclosure's summary leaves the disclosure as it was.
+
+### New files
+
+| Path | Purpose | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/details-reveal.js` | `revealDetailsAround(node)` opens each closed `<details>` above `node` whose first `<summary>` does not hold it. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/test/details.test.cjs` | 4 tests: a target in a closed disclosure's content opens it and the closed one around it; one in its summary leaves it closed; only the first `<summary>` is the summary; a tap in a disclosure's content is no control, one in its summary is (loading `dom.js` with its two imports stubbed). | Yes. |
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/EPUB/Scripts/src/dom.js` | `summary` replaces `details` in `findNearestInteractiveElement`'s tag list. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/src/utils.js` | `scrollToId` and `scrollToRange` call `revealDetailsAround` before they measure. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | `scrollToRange` calls `revealDetailsAround` before it measures. | No (fork file). |
+| `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js`, `readium-reader-locator-commands.js` (+ map) | Re-emitted by `pnpm run bundle`. | No (build artifacts). |
+
+The three calls are not tested here: each measures a rendered element, which the script tests, with no layout, cannot hold.
+
 ## Upstream-rebase guidance
 
 The fork follows upstream release tags, not `develop` (owner, 2026-10-18): it takes 3.x releases and hotfixes as they ship, and adopting Readium 4.0 is its own piece of work at 4.0.0. When merging an upstream release tag into `fork-extensions`:
