@@ -309,6 +309,7 @@ The hunk stands alone: it touches neither the fork's `progression.js` import nor
 | --- | --- | --- |
 | `Sources/Navigator/EPUB/Scripts/src/details-reveal.js` | `revealDetailsAround(node, offset)` opens each closed `<details>` whose first `<summary>` does not hold the target: `node` itself, or, given `offset`, the boundary point a range starts at, which for a range around an element (`selectNode`, as a table-of-contents entry's locator builds) is that element's parent, so the walk starts from the child at `offset`. | Yes. |
 | `Sources/Navigator/EPUB/Scripts/test/details.test.cjs` | 5 tests: a target in a closed disclosure's content opens it and the closed one around it; one in its summary leaves it closed; only the first `<summary>` is the summary; a range starting between a closed disclosure's own children opens it, unless before its summary; a tap in a disclosure's content is no control, one in its summary is (loading `dom.js` with its two imports stubbed). | Yes. |
+| `Tests/NavigatorTests/EPUB/EPUBDetailsRevealTests.swift` | 3 tests on a hosted, paginated spread whose target sits pages into a closed disclosure, one per call: `readium.scrollToId`, `readium.scrollToLocator` with a fragment, and the spread's own navigation to a fragment locator, which reaches `reader-locator-commands.js`. Each sees the disclosure open and the target start on the showing page. A closed disclosure's content is not laid out across pages: measured closed, the target overflows the foot of one page, and a page-world call that measures before it opens lands there, two pages short of the target in this fixture. The locator command checks its landing and scrolls again, so its order shows in no landing; its reveal does. Each test checks first that the spread opened at its start, paginated, with the disclosure closed. | Yes. |
 
 ### Modified upstream files
 
@@ -319,7 +320,7 @@ The hunk stands alone: it touches neither the fork's `progression.js` import nor
 | `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | `scrollToRange` calls `revealDetailsAround` with the range's start before it measures. | No (fork file). |
 | `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js`, `readium-reader-locator-commands.js` (+ map) | Re-emitted by `pnpm run bundle`. | No (build artifacts). |
 
-The three calls are not tested here: each measures a rendered element, which the script tests, with no layout, cannot hold.
+The script tests have no layout, so the three calls are tested in a hosted web view instead (`EPUBDetailsRevealTests`).
 
 ## Upstream-rebase guidance
 
