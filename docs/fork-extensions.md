@@ -307,16 +307,16 @@ The hunk stands alone: it touches neither the fork's `progression.js` import nor
 
 | Path | Purpose | Upstream-PR-ready? |
 | --- | --- | --- |
-| `Sources/Navigator/EPUB/Scripts/src/details-reveal.js` | `revealDetailsAround(node)` opens each closed `<details>` above `node` whose first `<summary>` does not hold it. | Yes. |
-| `Sources/Navigator/EPUB/Scripts/test/details.test.cjs` | 4 tests: a target in a closed disclosure's content opens it and the closed one around it; one in its summary leaves it closed; only the first `<summary>` is the summary; a tap in a disclosure's content is no control, one in its summary is (loading `dom.js` with its two imports stubbed). | Yes. |
+| `Sources/Navigator/EPUB/Scripts/src/details-reveal.js` | `revealDetailsAround(node, offset)` opens each closed `<details>` whose first `<summary>` does not hold the target: `node` itself, or, given `offset`, the boundary point a range starts at, which for a range around an element (`selectNode`, as a table-of-contents entry's locator builds) is that element's parent, so the walk starts from the child at `offset`. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/test/details.test.cjs` | 5 tests: a target in a closed disclosure's content opens it and the closed one around it; one in its summary leaves it closed; only the first `<summary>` is the summary; a range starting between a closed disclosure's own children opens it, unless before its summary; a tap in a disclosure's content is no control, one in its summary is (loading `dom.js` with its two imports stubbed). | Yes. |
 
 ### Modified upstream files
 
 | Path | Change | Upstream-PR-ready? |
 | --- | --- | --- |
 | `Sources/Navigator/EPUB/Scripts/src/dom.js` | `summary` replaces `details` in `findNearestInteractiveElement`'s tag list. | Yes. |
-| `Sources/Navigator/EPUB/Scripts/src/utils.js` | `scrollToId` and `scrollToRange` call `revealDetailsAround` before they measure. | Yes. |
-| `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | `scrollToRange` calls `revealDetailsAround` before it measures. | No (fork file). |
+| `Sources/Navigator/EPUB/Scripts/src/utils.js` | `scrollToId` and `scrollToRange` call `revealDetailsAround` before they measure, a range with its start offset. | Yes. |
+| `Sources/Navigator/EPUB/Scripts/src/reader-locator-commands.js` | `scrollToRange` calls `revealDetailsAround` with the range's start before it measures. | No (fork file). |
 | `Sources/Navigator/EPUB/Assets/Static/scripts/readium-reflowable.js`, `readium-fixed.js`, `readium-reader-locator-commands.js` (+ map) | Re-emitted by `pnpm run bundle`. | No (build artifacts). |
 
 The three calls are not tested here: each measures a rendered element, which the script tests, with no layout, cannot hold.

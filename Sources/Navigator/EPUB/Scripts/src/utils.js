@@ -202,7 +202,7 @@ export function scrollToLocator(locator, animated) {
 }
 
 function scrollToRange(range, animated) {
-  revealDetailsAround(range.startContainer);
+  revealDetailsAround(range.startContainer, range.startOffset);
   return scrollToRect(range.getBoundingClientRect(), animated);
 }
 

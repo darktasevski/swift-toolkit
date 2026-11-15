@@ -27,9 +27,11 @@ function load(file, stubs = {}) {
 // An element of a fake document: its children are attached as given.
 function element(localName, children = [], { open = false } = {}) {
   const node = {
+    nodeType: 1,
     localName,
     nodeName: localName.toUpperCase(),
     children: [],
+    childNodes: [],
     parentElement: null,
     open,
     outerHTML: `<${localName}>`,
@@ -38,6 +40,7 @@ function element(localName, children = [], { open = false } = {}) {
   };
   for (const child of children) {
     child.parentElement = node;
+    node.childNodes.push(child);
     if (child.localName) {
       node.children.push(child);
     }
@@ -46,7 +49,7 @@ function element(localName, children = [], { open = false } = {}) {
 }
 
 function text() {
-  return { parentElement: null };
+  return { nodeType: 3, parentElement: null };
 }
 
 test("a target in a closed disclosure's content opens it, and every closed one around it", () => {
@@ -81,6 +84,18 @@ test("only a disclosure's first summary is its summary", () => {
 
   revealDetailsAround(target);
 
+  assert.equal(details.open, true);
+});
+
+test("a range starting between a closed disclosure's children opens it, unless before its summary", () => {
+  const { revealDetailsAround } = load("details-reveal.js");
+  // `range.selectNode(heading)` starts at the heading's parent, at its index.
+  const details = element("details", [element("summary"), element("h1")]);
+
+  revealDetailsAround(details, 0);
+  assert.equal(details.open, false);
+
+  revealDetailsAround(details, 1);
   assert.equal(details.open, true);
 });
 
