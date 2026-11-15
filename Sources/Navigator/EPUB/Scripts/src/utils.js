@@ -10,6 +10,7 @@ import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getCurrentSelection } from "./selection";
 import { measureProgression } from "./progression";
 import { log } from "./native-log";
+import { revealDetailsAround } from "./details-reveal";
 
 window.addEventListener(
   "error",
@@ -157,6 +158,7 @@ export function scrollToId(id, animated) {
     return false;
   }
 
+  revealDetailsAround(element);
   return scrollToRect(element.getBoundingClientRect(), animated);
 }
 
@@ -200,6 +202,7 @@ export function scrollToLocator(locator, animated) {
 }
 
 function scrollToRange(range, animated) {
+  revealDetailsAround(range.startContainer, range.startOffset);
   return scrollToRect(range.getBoundingClientRect(), animated);
 }
 
