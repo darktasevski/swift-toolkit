@@ -1074,9 +1074,8 @@ function observeScrollEnd(signal) {
 // is dispatched as a task and an instant scroll completes synchronously — registering
 // after the write races the event. Only for "requested", because the no-op case
 // produces no `scrollend` at all and must not leave a listener waiting on one. The
-// comparison is deliberately conservative: it skips only when the offset is PROVABLY
-// unchanged, so a clamped write still arms a belt that never fires, which costs
-// nothing because the offset poll remains the bound.
+// target is compared where the write would land, clamped to the reachable range, so
+// a write the browser would clamp to the current offset is a no-op too.
 function scrollToRange(range, animated, armBelt) {
   revealDetailsAround(range.startContainer, range.startOffset);
   const rect = range.getBoundingClientRect();
@@ -1085,9 +1084,13 @@ function scrollToRange(range, animated, armBelt) {
     return "notScrollable";
   }
   const scrollsVertically = isScrollModeEnabled() && !isVerticalWritingMode();
-  const target = scrollsVertically
-    ? rect.top + globalThis.scrollY
-    : snapOffset(rect.left + globalThis.scrollX);
+  const target = clampToScrollRange(
+    scrollsVertically
+      ? rect.top + globalThis.scrollY
+      : snapOffset(rect.left + globalThis.scrollX),
+    scrollingElement,
+    scrollsVertically
+  );
   const current = scrollsVertically
     ? scrollingElement.scrollTop
     : scrollingElement.scrollLeft;
@@ -1100,6 +1103,17 @@ function scrollToRange(range, animated, armBelt) {
     scrollsVertically ? { top: target, behavior } : { left: target, behavior }
   );
   return "requested";
+}
+
+// The offsets a scroll on this axis can reach. A right-to-left or vertical-rl document
+// scrolls horizontally through negative offsets, as `progressionScrollTarget` models.
+function clampToScrollRange(offset, scrollingElement, vertically) {
+  const extent = vertically
+    ? scrollingElement.scrollHeight - scrollingElement.clientHeight
+    : scrollingElement.scrollWidth - scrollingElement.clientWidth;
+  const reach = Math.max(extent, 0);
+  const [low, high] = !vertically && isRTL() ? [-reach, 0] : [0, reach];
+  return Math.min(Math.max(offset, low), high);
 }
 
 // Issues one scroll and waits for it to settle. The belt is armed only for a scroll

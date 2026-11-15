@@ -12,7 +12,7 @@ enum PDFResourceContentIteratorTests {
     struct Navigation {
         @Test func iterateFromStartToFinish() async throws {
             let iter = makeIterator()
-            for expected in sampleElements {
+            for expected in try await sampleElements() {
                 let result = try await iter.next()
                 #expect(result?.equatable() == expected)
             }
@@ -27,25 +27,26 @@ enum PDFResourceContentIteratorTests {
 
         @Test func nextReturnsTheFirstElementFromTheBeginning() async throws {
             let result = try await makeIterator().next()
-            #expect(result?.equatable() == sampleElements[0])
+            #expect(try await result?.equatable() == sampleElements()[0])
         }
 
         @Test func nextThenPreviousReturnsNull() async throws {
             let iter = makeIterator()
             let first = try await iter.next()
-            #expect(first?.equatable() == sampleElements[0])
+            #expect(try await first?.equatable() == sampleElements()[0])
             let back = try await iter.previous()
             #expect(back == nil)
         }
 
         @Test func nextTwiceThenPreviousReturnsTheFirstElement() async throws {
             let iter = makeIterator()
+            let samples = try await sampleElements()
             let first = try await iter.next()
-            #expect(first?.equatable() == sampleElements[0])
+            #expect(first?.equatable() == samples[0])
             let second = try await iter.next()
-            #expect(second?.equatable() == sampleElements[1])
+            #expect(second?.equatable() == samples[1])
             let back = try await iter.previous()
-            #expect(back?.equatable() == sampleElements[0])
+            #expect(back?.equatable() == samples[0])
         }
 
         @Test func iterateFullyBackwardFromEnd() async throws {
@@ -57,32 +58,32 @@ enum PDFResourceContentIteratorTests {
                 backwardElements.append(element.equatable())
             }
 
-            #expect(backwardElements == sampleElements.dropLast().reversed())
+            #expect(try await backwardElements == sampleElements().dropLast().reversed())
         }
     }
 
     struct StartingPosition {
         @Test func startingFromPosition() async throws {
             let result = try await makeIterator(start: makeLocator(position: 5)).next()
-            #expect(result?.equatable() == makeElement(pageNumber: 5, text: p5Text))
+            #expect(try await result?.equatable() == sampleElement(pageNumber: 5))
         }
 
         @Test func startingFromPageFragment() async throws {
             // page=5 fragment should land on the same element as position 5.
             let result = try await makeIterator(start: makeLocator(pageFragment: 5)).next()
-            #expect(result?.equatable() == makeElement(pageNumber: 5, text: p5Text))
+            #expect(try await result?.equatable() == sampleElement(pageNumber: 5))
         }
 
         @Test func startingFromProgression() async throws {
             // progression=0.4, pageCount=9 → startPage = min(Int(0.4*9),8) = 3 (page 4).
             let result = try await makeIterator(start: makeLocator(progression: 0.4)).next()
-            #expect(result?.equatable() == makeElement(pageNumber: 4, text: p4Text))
+            #expect(try await result?.equatable() == sampleElement(pageNumber: 4))
         }
 
         @Test func startingFromEndProgression() async throws {
             let iter = makeIterator(start: makeLocator(progression: 1.0))
             let first = try await iter.next()
-            #expect(first?.equatable() == makeElement(pageNumber: 9, text: p9Text))
+            #expect(try await first?.equatable() == sampleElement(pageNumber: 9))
             let second = try await iter.next()
             #expect(second == nil)
         }
@@ -140,7 +141,7 @@ enum PDFResourceContentIteratorTests {
 
         @Test func highlightIsFullPageText() async throws {
             let iter = makeIterator()
-            let pageFull = [p2Text, p3Text, p4Text, p5Text, p6Text, p7Text, p8Text, p9Text]
+            let pageFull = try await pageTexts()
             for expected in pageFull {
                 let element = try await iter.next()
                 #expect(element?.locator.text.highlight == expected)
@@ -149,7 +150,7 @@ enum PDFResourceContentIteratorTests {
 
         @Test func segmentTextMatchesFullPageText() async throws {
             let iter = makeIterator()
-            let pageFull = [p2Text, p3Text, p4Text, p5Text, p6Text, p7Text, p8Text, p9Text]
+            let pageFull = try await pageTexts()
             for expected in pageFull {
                 let element = try await iter.next() as? TextContentElement
                 #expect(element?.text == expected)
@@ -239,14 +240,31 @@ enum PDFResourceContentIteratorTests {
 
 private let baseLocator = Locator(href: "daisy-truncated.pdf", mediaType: .pdf)
 
-private let p2Text = "D A I S Y M I L L E R"
-private let p3Text = "DAISY MILLER\nBy Henry James"
-private let p4Text = "Daisy Miller"
-private let p5Text = "C O N T E N T S\nPA R T O N E\n1\nPA R T T W O\n1 7\nPA R T T H R E E\n3 6\nPA R T F O U R\n5 4"
-private let p6Text = "P A R T O N E"
-private let p7Text = "At the little town of Vevey, in Switzerland, there is a particu-\nlarly comfortable hotel. There are, indeed, many hotels, for the\nentertainment of tourists is the business of the place, which, as\nmany travelers will remember, is seated upon the edge of a\nremarkably blue lake\u{2014}a lake that it behooves every tourist to\nvisit. The shore of the lake presents an unbroken array of estab-\nlishments of this order, of every category, from the \"grand hotel\u{201D}\nof the newest fashion, with a chalk-white front, a hundred bal-\nconies, and a dozen flags flying from its roof, to the little Swiss\npension of an elder day, with its name inscribed in German-look-\ning lettering upon a pink or yellow wall and an awkward sum-\nmerhouse in the angle of the garden. One of the hotels at Vevey,\nhowever, is famous, even classical, being distinguished from\nmany of its upstart neighbors by an air both of luxury and of\nmaturity. In this region, in the month of June, American travel-\ners are extremely numerous; it may be said, indeed, that Vevey\nassumes at this period some of the characteristics of an American\nwatering place. There are sights and sounds which evoke a\nvision, an echo, of Newport and Saratoga. There is a flitting\nhither and thither of \u{201C}stylish\u{201D} young girls, a rustling of muslin\nflounces, a rattle of dance music in the morning hours, a sound\nof high-pitched voices at all times. You receive an impression of\nthese things at the excellent inn of the \u{201C}Trois Couronnes\u{201D} and are\ntransported in fancy to the Ocean House or to Congress Hall.\nBut at the \u{201C}Trois Couronnes,\u{201D} it must be added, there are other\nfeatures that are much at variance with these suggestions: neat\nGerman waiters, who look like secretaries of legation; Russian\n2"
-private let p8Text = "princesses sitting in the garden; little Polish boys walking about\nheld by the hand, with their governors; a view of the sunny crest\nof the Dent du Midi and the picturesque towers of the Castle of\nChillon.\nI hardly know whether it was the analogies or the differences\nthat were uppermost in the mind of a young American, who,\ntwo or three years ago, sat in the garden of the \u{201C}Trois\nCouronnes,\u{201D} looking about him, rather idly, at some of the\ngraceful objects I have mentioned. It was a beautiful summer\nmorning, and in whatever fashion the young American looked at\nthings, they must have seemed to him charming. He had come\nfrom Geneva the day before by the little steamer, to see his aunt,\nwho was staying at the hotel\u{2014}Geneva having been for a long\ntime his place of residence. But his aunt had a headache\u{2014}his\naunt had almost always a headache\u{2014}and now she was shut up in\nher room, smelling camphor, so that he was at liberty to wander\nabout. He was some seven-and-twenty years of age; when his\nfriends spoke of him, they usually said that he was at Geneva\n\u{201C}studying.\u{201D}When his enemies spoke of him, they said\u{2014}but, after\nall, he had no enemies; he was an extremely amiable fellow, and\nuniversally liked.What I should say is, simply, that when certain\npersons spoke of him they affirmed that the reason of his spend-\ning so much time at Geneva was that he was extremely devoted\nto a lady who lived there\u{2014}a foreign lady\u{2014}a person older than\nhimself. Very few Americans\u{2014}indeed, I think none\u{2014}had ever\nseen this lady, about whom there were some singular stories. But\nWinterbourne had an old attachment for the little metropolis of\nCalvinism; he had been put to school there as a boy, and he had\nafterward gone to college there\u{2014}circumstances which had led\nto his forming a great many youthful friendships. Many of these\nhe had kept, and they were a source of great satisfaction to him.\nAfter knocking at his aunt\u{2019}s door and learning that she was\nD A I S Y M I L L E R\n3"
-private let p9Text = "Nevertheless, he went back to live at Geneva, whence there\ncontinue to come the most contradictory accounts of his\nmotives of sojourn: a report that he is \u{201C}studying\u{201D} hard—an inti-\nmation that he is much interested in a very clever foreign lady.\nThe End\nD A I S Y M I L L E R\n75"
+/// The pages of the fixture that carry text; page 1 has none.
+private let textPageNumbers = Array(2 ... 9)
+
+/// Each text page's content as PDFKit extracts it. The iterator passes that text through
+/// unchanged, and PDFKit's spacing of tracked letters differs between SDK releases, so the
+/// expected text comes from the same extraction rather than from recorded strings.
+private func pageTexts() async throws -> [String] {
+    let document = try #require(try await openFixture() as? PDFDocumentTextProviding)
+    var texts: [String] = []
+    for pageNumber in textPageNumbers {
+        let text = try #require(try await document.pageText(at: pageNumber - 1))
+        try #require(!text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+        texts.append(text)
+    }
+    return texts
+}
+
+private func sampleElements() async throws -> [AnyEquatableContentElement] {
+    let texts = try await pageTexts()
+    return zip(textPageNumbers, texts).map { makeElement(pageNumber: $0, text: $1) }
+}
+
+private func sampleElement(pageNumber: Int) async throws -> AnyEquatableContentElement {
+    try await sampleElements()[pageNumber - textPageNumbers[0]]
+}
 
 private func makeElement(
     pageNumber: Int,
@@ -264,17 +282,6 @@ private func makeElement(
         segments: [TextContentElement.Segment(locator: loc, text: text)]
     ).equatable()
 }
-
-private let sampleElements: [AnyEquatableContentElement] = [
-    makeElement(pageNumber: 2, text: p2Text),
-    makeElement(pageNumber: 3, text: p3Text),
-    makeElement(pageNumber: 4, text: p4Text),
-    makeElement(pageNumber: 5, text: p5Text),
-    makeElement(pageNumber: 6, text: p6Text),
-    makeElement(pageNumber: 7, text: p7Text),
-    makeElement(pageNumber: 8, text: p8Text),
-    makeElement(pageNumber: 9, text: p9Text),
-]
 
 private func makeLocator(
     position: Int? = nil,
@@ -296,16 +303,18 @@ private func makeLocator(
     )
 }
 
+private func openFixture() async throws -> PDFDocument {
+    let data = Fixtures(path: "Publication/Services").data(at: "daisy-truncated.pdf")
+    return try await DefaultPDFDocumentFactory().open(resource: DataResource(data: data), at: baseLocator.href, password: nil)
+}
+
 private func makeIterator(
     start startLocator: Locator? = nil,
     positionOffset: Int = 0,
     totalProgressionRange: ClosedRange<Double>? = nil
 ) -> PDFResourceContentIterator {
-    let data = Fixtures(path: "Publication/Services").data(at: "daisy-truncated.pdf")
-    let resource = DataResource(data: data)
-    let href = baseLocator.href
-    return PDFResourceContentIterator(
-        openDocument: { try await DefaultPDFDocumentFactory().open(resource: resource, at: href, password: nil) },
+    PDFResourceContentIterator(
+        openDocument: { try await openFixture() },
         resourceInfo: { PDFResourceContentIterator.ResourceInfo(positionOffset: positionOffset, totalProgressionRange: totalProgressionRange) },
         locator: startLocator ?? baseLocator
     )
