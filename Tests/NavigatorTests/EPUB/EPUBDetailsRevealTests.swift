@@ -67,10 +67,25 @@ final class EPUBDetailsRevealTests: XCTestCase {
 
     /// The navigator's own path to an anchored location, a table of contents entry's. The command
     /// checks where it landed and scrolls again when the target is not showing (`landAndVerify`),
-    /// so whether it opens the disclosure before or after it measures changes nothing this test
-    /// can see; that it opens it is what this test holds.
-    func testANavigationToAFragmentOpensItsDisclosureAndLandsOnIt() async throws {
+    /// so a measure before the disclosure opens still ends on the target, but spends one of its
+    /// two corrections, and a correction never animates: what shows the order is the disclosure's
+    /// state at each of its measures.
+    func testANavigationToAFragmentOpensItsDisclosureBeforeItMeasuresAndLandsOnIt() async throws {
         let spreadView = try await hostedSpread()
+        _ = try await spreadView.webView.callAsyncJavaScript(
+            """
+            globalThis.__measuredOpen = [];
+            const measure = Range.prototype.getBoundingClientRect;
+            Range.prototype.getBoundingClientRect = function () {
+              globalThis.__measuredOpen.push(document.querySelector("details").open);
+              return measure.call(this);
+            };
+            return true;
+            """,
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        )
         let locator = Locator(
             href: RelativeURL(path: EPUBSpreadViewHosting.chapterHREF)!.anyURL,
             mediaType: .html,
@@ -81,6 +96,15 @@ final class EPUBDetailsRevealTests: XCTestCase {
 
         XCTAssertEqual(outcome, .succeeded)
         try await assertLandedOnTheTarget(in: spreadView)
+        let measured = try await spreadView.webView.callAsyncJavaScript(
+            "return globalThis.__measuredOpen;",
+            arguments: [:],
+            in: nil,
+            contentWorld: EPUBLocatorCommandBridge.contentWorld
+        ) as? [Bool]
+        let opened = try XCTUnwrap(measured, "The command's measures were not read")
+        XCTAssertFalse(opened.isEmpty, "Fixture: the command measured no range")
+        XCTAssertFalse(opened.contains(false), "The command measured the target before opening its disclosure: \(opened)")
     }
 
     /// Hosted before it loads: a spread that turns ready goes to its opening location, which
