@@ -4,6 +4,7 @@
 
 import { TextQuoteAnchor } from "./vendor/hypothesis/anchoring/types";
 import { getClientRectsNoOverlap } from "./rect";
+import { revealDetailsAround } from "./details-reveal";
 import {
   isRTL,
   isScrollModeEnabled,
@@ -1077,6 +1078,7 @@ function observeScrollEnd(signal) {
 // unchanged, so a clamped write still arms a belt that never fires, which costs
 // nothing because the offset poll remains the bound.
 function scrollToRange(range, animated, armBelt) {
+  revealDetailsAround(range.startContainer, range.startOffset);
   const rect = range.getBoundingClientRect();
   const scrollingElement = document.scrollingElement;
   if (!scrollingElement) {

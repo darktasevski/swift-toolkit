@@ -16,17 +16,19 @@ export function findNearestInteractiveElement(element) {
     return null;
   }
 
+  // A disclosure's `<summary>` is what opens and closes it; the rest of a
+  // `<details>` is content, where a tap turns the page as anywhere else.
   var interactiveTags = [
     "a",
     "audio",
     "button",
     "canvas",
-    "details",
     "input",
     "label",
     "option",
     "select",
     "submit",
+    "summary",
     "textarea",
     "video",
   ];
