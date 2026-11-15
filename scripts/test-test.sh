@@ -4,6 +4,12 @@
 
 set -euo pipefail
 
+# A git hook that runs this self-test exports GIT_DIR and its kin, which outrank
+# `git -C`. The cases run without them; the one that needs GIT_DIR sets its own.
+for git_variable in $(git rev-parse --local-env-vars); do
+	unset "$git_variable"
+done
+
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 RUNNER="$SCRIPT_DIR/test.sh"
