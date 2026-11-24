@@ -149,7 +149,8 @@ public class PublicationSpeechSynthesizer: Loggable {
         self.delegate = delegate
     }
 
-    deinit {
+    /// Isolated, so the session ends before the synthesizer is freed.
+    isolated deinit {
         audioSession.end(for: audioSessionUser)
     }
 

@@ -270,14 +270,40 @@ fixes upstream does not have.
 
 Not carried: #808's audio-session half. It makes `AudioSessionManaging` `@MainActor` with a
 token-returning `start` and `end(with:)`, and gives `AudioSessionUser` an `isolated deinit`; both
-change the public protocol. Until it lands, `AudioSession`'s nonisolated `start(with:isPlaying:)`,
-`user(_:didChangePlaying:)` and `end(for:)` each post an unordered task.
+change the public protocol. Until it lands, `AudioSession`'s nonisolated `user(_:didChangePlaying:)` and
+`end(for:)` each post an unordered task. `start(with:isPlaying:)` is main-actor and synchronous,
+for the start gate (§ Audio playback starts meet a gate).
 
 ### Tests
 
 | Path | Coverage |
 | --- | --- |
 | `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerStateTests.swift` | The delegate has heard `.playing` then `.paused` when `pause()` returns; a word range reported after a pause leaves it paused; two skips in a row move two utterances on and the superseded one never reaches the engine; a new utterance starts only once the engine has returned the one it interrupts. `AVTTSEngine` has no test: its task and utterance types are private and it drives the real `AVSpeechSynthesizer`. |
+
+## Audio playback starts meet a gate, and a pause wins over a pending start
+
+`AudioNavigator.play()` starts the engine in a task, and `pause()` did not cancel it. Three starts
+come from the navigator itself and pass through no host control: the restart after a seek or a
+jump made while playing, and the advance to the next resource. A host that silenced the engine
+(the Reader app's App Lock playback hold) was undone by a start already issued, which ran on the
+next main-actor turn. A pause tapped while a first play was still loading was lost the same way.
+Design record: [§ D6 of the App Lock design in the host repository](../../docs/superpowers/specs/2026-10-27-catalyst-app-lock-design.md#d6-audio-while-locked-root-r5).
+
+### Modified upstream files
+
+| Path | Change | Upstream-PR-ready? |
+| --- | --- | --- |
+| `Sources/Navigator/Audiobook/AudioNavigator.swift` | `AudioNavigatorDelegate.navigatorShouldStartPlayback(_:)` (default `true`), asked when the start task begins and again once the first resource has loaded. `pause()` cancels the pending start task; `playPause()` counts a pending start as playing. The advance to the next resource is kept as that task. `seek(to:)` and `go(to:)` pause the engine directly, so a seek keeps a pending play and `play()`'s own opening jump does not cancel it. A start task clears itself once it ends uncancelled. A seek or a jump made while the engine plays or buffers (`.loading`) owes a restart. Seeks and jumps in flight together owe one, played once the last settles, and a `play()` asked meanwhile joins it rather than starting the engine mid-seek. `pause()`, `close()` and the toggle cancel that restart even while a seek or jump is in flight. A jump that fails cancels it, unless a joined `play()` asked for it. A jump to an href outside the reading order is refused before the engine is paused, so it leaves playback alone. The audio session starts only after the last gate check admits the start, and before the engine plays, so a refused start interrupts no other app's audio. | Yes |
+| `Sources/Shared/Toolkit/Media/AudioSession.swift` | `AudioSessionManaging.start(with:isPlaying:)` is `@MainActor`, and `AudioSession` activates the session before it returns instead of posting a task, so an engine started next plays in an active session. A start for the current user activates a session that ended under it, as on going to the background while paused. `init()`, `appDidEnterBackground()` and the `isSessionStarted` getter are internal, for tests. This is a narrower step than #808's audio-session half (below). `end(for:)` is `@MainActor` too and ends the session before it returns, so a start that follows for the same user is never taken back by a late end; upstream posted it. `AudioNavigator` and `PublicationSpeechSynthesizer` end theirs from an `isolated deinit`, which also keeps an end from reaching a later user allocated at a freed user's address. The session registers one interruption observer, at its first start, and never removes it, since the handler acts only for a current user: upstream registered one at every activation and dropped the token without removing it, so each activation after a background end added a handler. A session ended in the background, after the engine paused for a call, still hears the call end. `isSessionStarted` is set only by an activation that succeeded, so a failed one is tried again at the next start, and it is cleared when an interruption begins, since the system has deactivated the session. An interruption ending only calls the user's `play()`: the session turns on again through the user's own start, once it admits the resume, so a refused resume interrupts no other app's audio. Upstream called `setActive(true)` first. An `activations` count is internal, for tests. | No: #808 replaces the protocol |
+
+### Tests
+
+| Path | Coverage |
+| --- | --- |
+| `Tests/SharedTests/Toolkit/Media/AudioSessionTests.swift` | `start(with:isPlaying:)` has activated the session when it returns, activates it once across repeat starts, and activates it again for a user whose session ended on going to the background or whose interruption began. A failed activation (long-form audio that mixes with others) leaves the session inactive and is tried again. An interruption ending resumes the user once after three starts, once after a session activated again, and once after its session ended in the background, and activates nothing by itself. A start for another user ends the first user's session, applies the new user's configuration and resumes only the new user. The test cannot see a direct `AVAudioSession.setActive(true)` that bypasses `startSession`: the simulator exposes no activation state. |
+| `Tests/NavigatorTests/Audio/AudioNavigatorStartTests.swift` | Each test is bounded to a minute, so a held load or seek never released fails rather than hangs: the fake engine's holds end when the waiting task is cancelled, a seek or jump the test awaits runs as an `async let` child that the limit cancels, and a release made before the call arrives is kept for it. A pause, the toggle and `close()` cancel the restart that a seek or jump in flight owes, and a toggle after a failed jump starts again; the same held seek and jump, released unpaused, play again as the positive controls. A start refused after the first load leaves the audio session off; the session starts after the load and before the engine plays. A pause cancels a pending play, a seek's restart and a pending advance; a refused start leaves the engine and the audio session idle; the gate is asked again after the first load and refuses a seek's restart; the gate refuses an advance; a toggle pauses a pending start, leaving the audio session unstarted, and starts again after a start ran to its end, after the last resource ends, and after the next resource fails to load; a first play survives its own opening jump and a seek. The restart and the advance playing unheld are the positive controls. A jump to an href outside the reading order leaves the engine playing, and the seek after it still restarts. A seek or jump made while the engine buffers owes a restart, and the toggle pauses a buffering engine. Seeks and jumps in flight together restart once, after the last lands; a `play()` made meanwhile joins that restart and plays even if a jump fails, a jump that fails cancels a restart nobody joined, and `pause()` and `close()` cancel a joined play as well. |
+| `Tests/NavigatorTests/Audio/AudioNavigatorAudioSessionTests.swift` | The injected session starts on play, follows the engine's playing changes, and ends on `close()`, which stops the engine at once and leaves the navigator free to be released. A navigator released without `close()` ends its session and stops its engine from its `isolated deinit`, once each, before the release returns. |
+| `Tests/NavigatorTests/TTS/PublicationSpeechSynthesizerAudioSessionTests.swift` | `start(from:)` has started the audio session when it returns. The synthesizer ends its session from its `isolated deinit` before the release returns. |
 
 ## Page snapping measures the scrollport (Reader app #1677)
 
