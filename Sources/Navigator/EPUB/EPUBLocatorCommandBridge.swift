@@ -802,14 +802,20 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
     #endif
 
-    /// - Parameter deadline: the operation-wide deadline minted by the caller at
-    ///   operation start. The command spends what remains of it; it never mints its
-    ///   own, so a navigation that already hopped resources and waited for readiness
-    ///   arrives here with correspondingly less time rather than a fresh allowance.
+    /// - Parameters:
+    ///   - toleratesLateFrames: whether a frame later than one frame's wait counts
+    ///     as a frame, so a late frame leaves the command to its deadline, its frame
+    ///     caps and supersession. Without it the first late frame ends the command
+    ///     as a `paintTimeout` miss.
+    ///   - deadline: the operation-wide deadline minted by the caller at
+    ///     operation start. The command spends what remains of it; it never mints its
+    ///     own, so a navigation that already hopped resources and waited for readiness
+    ///     arrives here with correspondingly less time rather than a fresh allowance.
     func navigate(
         locatorJSON: String,
         targetHREF: AnyURL,
         animated: Bool,
+        toleratesLateFrames: Bool,
         deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
         let token = nextToken(
@@ -850,6 +856,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                     "kind": "navigateLocator",
                     "payload": locatorJSON,
                     "animated": animated,
+                    "toleratesLateFrames": toleratesLateFrames,
                 ],
                 token: token,
                 in: storedFrame.info,
@@ -997,6 +1004,9 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                 return Self.decodeResult(rawResult, expectedToken: token)
             }
         } catch {
+            if error is CancellationError {
+                invalidateAbandonedCommand(token: token, in: frame, of: webView)
+            }
             return Self.failure(for: error, token: token, isCurrent: isCurrent(token))
         }
 
@@ -1004,6 +1014,26 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
             return EPUBLocatorCommandResult(token: token, outcome: .cancelled, reason: .staleToken)
         }
         return decoded
+    }
+
+    /// Aborts in the page a command whose caller was cancelled. WebKit does not
+    /// cancel a script when the task awaiting it is, so the command would run on
+    /// to its own deadline and could still scroll the page the caller gave up on.
+    /// The relay runs in a task of its own: the cancelled caller's task would end
+    /// the round trip before it started.
+    private func invalidateAbandonedCommand(
+        token: EPUBLocatorCommandToken,
+        in frame: WKFrameInfo?,
+        of webView: WKWebView
+    ) {
+        let deadline = EPUBLocatorOperationDeadline(
+            startingAt: clock.now(),
+            budget: EPUBLocatorNavigationTaskQueue.predecessorAcknowledgementBudget
+        )
+        Task { [weak self, weak webView] in
+            guard let self, let webView else { return }
+            await self.invalidate(InFlightNavigation(token: token, frame: frame), in: webView, until: deadline)
+        }
     }
 
     /// Positively cancels the navigation command currently suspended inside
@@ -1023,6 +1053,14 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         guard let inFlight = inFlightNavigation, let webView else {
             return
         }
+        await invalidate(inFlight, in: webView, until: deadline)
+    }
+
+    private func invalidate(
+        _ inFlight: InFlightNavigation,
+        in webView: WKWebView,
+        until deadline: EPUBLocatorOperationDeadline
+    ) async {
         _ = try? await EPUBLocatorCommandWatchdog.run(until: deadline, clock: clock) {
             _ = try await webView.callAsyncJavaScript(
                 Self.invalidateScript,
