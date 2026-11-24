@@ -325,9 +325,11 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         return try XCTUnwrap(reader.spy.locations.last?.locations.progression, file: file, line: line)
     }
 
-    /// An animated jump to the page already showing writes nothing and returns
-    /// at once. No scroll starts, so nothing could end a wait for one before
-    /// the scroll-animation fallback, which holds the navigator meanwhile.
+    /// An animated jump to the page already showing writes nothing and waits
+    /// for no scroll. No scroll starts, so nothing could end a wait for one but
+    /// the scroll-animation fallback, which holds the navigator meanwhile. The
+    /// coordinator's record shows whether a wait ran; elapsed time cannot, as a
+    /// loaded host stretches the jump's script calls past the fallback alone.
     func test_anAnimatedJumpToTheShowingPageReturnsWithoutWriting() async throws {
         let reader = try await openReader()
         let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
@@ -338,9 +340,8 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         let showing = try await reader.waitForOffset(differentFrom: opening)
         try await reader.waitForReportsToSettle(quietFor: .seconds(Self.quietWindow))
         let writesBefore = try await scrollWrites(in: spread)
+        XCTAssertNil(spread.scrollAnimationCoordinator.lastSettlementForTesting, "Setup: a scroll animation settled before the jump")
 
-        let clock = ContinuousClock()
-        let started = clock.now
         let jumped = await reader.navigator.go(
             to: Locator(
                 href: Self.longChapterHREF.anyURL,
@@ -349,10 +350,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
             ),
             options: NavigatorGoOptions(animated: true)
         )
-        let elapsed = started.duration(to: clock.now)
 
         XCTAssertTrue(jumped)
-        XCTAssertLessThan(elapsed, Self.scrollAnimationFallback, "The jump waited for a scroll that never started")
+        XCTAssertNil(spread.scrollAnimationCoordinator.lastSettlementForTesting, "The jump waited for a scroll that never started")
         let writes = try await scrollWrites(in: spread)
         XCTAssertEqual(writes, writesBefore, "The jump wrote the offset it was already at")
         let settled = try await reader.requireGeometry()
