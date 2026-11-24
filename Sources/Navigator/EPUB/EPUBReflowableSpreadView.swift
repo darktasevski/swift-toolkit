@@ -960,6 +960,9 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             locatorJSON: json,
             targetHREF: viewModel.url(to: spread.first.link),
             animated: animated,
+            // A miss falls back to the locator's progression, so a late frame must
+            // not end the landing: the page would settle away from the anchor.
+            toleratesLateFrames: true,
             deadline: deadline
         )
         return result.outcome

@@ -802,14 +802,19 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
         }
     #endif
 
-    /// - Parameter deadline: the operation-wide deadline minted by the caller at
-    ///   operation start. The command spends what remains of it; it never mints its
-    ///   own, so a navigation that already hopped resources and waited for readiness
-    ///   arrives here with correspondingly less time rather than a fresh allowance.
+    /// - Parameters:
+    ///   - toleratesLateFrames: whether a frame later than one frame's wait counts
+    ///     as a frame, so only the deadline ends the command. Without it the first
+    ///     late frame ends the command as a `paintTimeout` miss.
+    ///   - deadline: the operation-wide deadline minted by the caller at
+    ///     operation start. The command spends what remains of it; it never mints its
+    ///     own, so a navigation that already hopped resources and waited for readiness
+    ///     arrives here with correspondingly less time rather than a fresh allowance.
     func navigate(
         locatorJSON: String,
         targetHREF: AnyURL,
         animated: Bool,
+        toleratesLateFrames: Bool,
         deadline: EPUBLocatorOperationDeadline
     ) async -> EPUBLocatorCommandResult {
         let token = nextToken(
@@ -850,6 +855,7 @@ final class EPUBLocatorCommandBridge: NSObject, Loggable {
                     "kind": "navigateLocator",
                     "payload": locatorJSON,
                     "animated": animated,
+                    "toleratesLateFrames": toleratesLateFrames,
                 ],
                 token: token,
                 in: storedFrame.info,

@@ -251,6 +251,9 @@ extension EPUBNavigatorViewController {
                 requestedAnimated: animated,
                 didHopToResource: didHopToResource
             ),
+            // A miss here is reported to the caller, so the navigation ends at its
+            // first late frame instead of waiting out its deadline.
+            toleratesLateFrames: false,
             deadline: deadline
         )
         switch result.outcome {
