@@ -860,7 +860,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             || locator.text.highlight != nil
 
         if hasDocumentAnchor {
-            let outcome = await navigationOutcome(to: locator, animated: animated)
+            let outcome = await navigationOutcome(to: locator, animated: animated, until: deadline)
             switch Self.anchorLandingDecision(for: outcome) {
             case .landed:
                 return true
@@ -940,22 +940,20 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
     /// collapsing them into a Bool let a cancelled command "succeed" via the
     /// caller's progression fallback). An unencodable locator is a miss: the
     /// anchor cannot be resolved, but nothing was interrupted.
+    ///
+    /// - Parameter deadline: the deadline of the position command or spread
+    ///   initialization placing this location, which a cross-resource hop's
+    ///   operation deadline already bounds. The command spends what remains of it,
+    ///   so the landing shares one deadline with the rungs after it instead of
+    ///   running past it.
     private func navigationOutcome(
         to locator: Locator,
-        animated: Bool
+        animated: Bool,
+        until deadline: ContinuousClock.Instant
     ) async -> EPUBLocatorCommandOutcome {
         guard let json = try? locator.jsonString() else {
             return .miss
         }
-        // A DISTINCT operation, not a rung of `performLocatorNavigation`: this is the
-        // spread's own anchor apply, reached through `go(to:animated:)` during spread
-        // setup, and no operation deadline exists above it to inherit. Minting here is
-        // therefore the operation start — not the per-rung re-arming the single-deadline
-        // contract forbids.
-        let deadline = EPUBLocatorOperationDeadline(
-            startingAt: ContinuousClock().now,
-            budget: .milliseconds(EPUBLocatorCommandBridge.totalCommandDeadlineMilliseconds)
-        )
         let result = await locatorCommandBridge.navigate(
             locatorJSON: json,
             targetHREF: viewModel.url(to: spread.first.link),
@@ -963,7 +961,7 @@ final class EPUBReflowableSpreadView: EPUBSpreadView {
             // A miss falls back to the locator's progression, so a late frame must
             // not end the landing: the page would settle away from the anchor.
             toleratesLateFrames: true,
-            deadline: deadline
+            deadline: EPUBLocatorOperationDeadline(expiringAt: deadline)
         )
         return result.outcome
     }

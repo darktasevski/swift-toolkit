@@ -225,7 +225,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// A jump to an element whose every frame comes late still lands on the
     /// element: only the jump's deadline ends it. A miss falls back to the
     /// progression the locator also carries, so a jump that ended at its first
-    /// late frame would land there, as one did on a loaded host.
+    /// late frame would land there.
     func test_aJumpToAnElementThroughLateFramesLandsOnTheElement() async throws {
         let reader = try await openReader(holdingCommandWorldFrames: true)
         try await reader.holdCommandWorldFrames()
@@ -244,6 +244,39 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         XCTAssertTrue(jumped)
         let landed = try await reader.requireGeometry()
         XCTAssertGreaterThan(landed.firstProgression, 0.3, "The jump ended at a late frame and landed on the progression it carries")
+    }
+
+    /// A jump to an element the user interrupts writes nothing once its frames
+    /// arrive. Its landing waits out late frames, so it would otherwise run on
+    /// in the page after the reader gave it up, and scroll back to the element.
+    func test_anInterruptedJumpToAnElementWritesNothingOnceItsFramesArrive() async throws {
+        let reader = try await openReader(holdingCommandWorldFrames: true)
+        let spread = try XCTUnwrap(reader.currentSpread as? EPUBReflowableSpreadView)
+        try await makeSmoothScrollsLand(after: .zero, in: spread)
+        let opening = try await reader.requireGeometry()
+        try await reader.holdCommandWorldFrames()
+
+        let jump = Task { @MainActor in
+            await reader.navigator.go(
+                to: Locator(
+                    href: Self.longChapterHREF.anyURL,
+                    mediaType: .html,
+                    locations: Locator.Locations(otherLocations: ["cssSelector": .string("p:nth-of-type(80)")])
+                ),
+                options: NavigatorGoOptions(animated: false)
+            )
+        }
+        try await reader.waitForLiveHeldCommandWorldFrames("the jump's landing to wait on a held frame") { $0 > 0 }
+        spread.cancelInFlightCommandForUserInteraction()
+        let jumped = await jump.value
+        try await reader.waitForLiveHeldCommandWorldFrames("the interrupted landing to end in the page") { $0 == 0 }
+        _ = try await reader.releaseCommandWorldFrames()
+
+        XCTAssertFalse(jumped, "Setup: the interruption did not cancel the jump")
+        let writes = try await scrollWrites(in: spread)
+        XCTAssertEqual(writes, 0, "The interrupted jump scrolled once its frames arrived")
+        let settled = try await reader.requireGeometry()
+        XCTAssertEqual(settled, opening)
     }
 
     /// A jump into another resource reports the destination measured where
@@ -1578,9 +1611,9 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
     /// and only its deadline could end it.
     func test_aLocatorNavigationToleratingLateFramesLandsThroughThem() async throws {
         let page = try await openProgressionPage(.leftToRightPages, holdingCommandWorldFrames: true)
-        // Restored well after the late frame before the scroll, so the viewport
-        // wait runs on late frames too.
-        try await page.emptyCommandWorldViewport(restoringAfterMilliseconds: 1000)
+        // The frame before the scroll is the first held one, so the viewport wait
+        // runs on two late frames of its own before the size returns.
+        try await page.emptyCommandWorldViewport(restoringAtHeldFrame: 3)
         try await page.holdCommandWorldFrames()
 
         let answer = try await page.executeLocatorNavigation(
@@ -1590,7 +1623,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
 
         XCTAssertEqual(answer, ["applied", "none"])
         let heldAtRestore = try await page.heldCommandWorldFramesAtViewportRestore()
-        XCTAssertGreaterThan(heldAtRestore, 1, "Setup: the viewport wait held no frame of its own")
+        XCTAssertEqual(heldAtRestore, 3, "Setup: the viewport wait did not run on held frames of its own")
         let held = try await page.heldCommandWorldFrames()
         XCTAssertGreaterThan(held, heldAtRestore, "Setup: the settle held no frame of its own")
     }
@@ -1898,7 +1931,7 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         assertSample(observed.sample, first: 1.0 / 3, last: 2.0 / 3)
 
         let undisturbed = try await page.navigate(sequence: 1, alongside: .nothing)
-        XCTAssertNotEqual(undisturbed, "cancelled", "Setup: the command does not finish on its own")
+        XCTAssertEqual(undisturbed, "applied", "Setup: the command does not land on its own")
         let invalidated = try await page.navigate(sequence: 2, alongside: .invalidation)
         XCTAssertEqual(invalidated, "cancelled", "Setup: this command's cancellation is not observable")
         let alongsideRead = try await page.navigate(sequence: 3, alongside: .read(ProgressionPage.capability))
@@ -3012,6 +3045,31 @@ private struct Reader {
         XCTAssertEqual(value as? Bool, true, "Setup: the command world has no frame request to hold")
     }
 
+    /// Polls the number of held frames the current spread's command world still
+    /// waits on (requested, and neither delivered nor cancelled) until it
+    /// satisfies `condition`.
+    func waitForLiveHeldCommandWorldFrames(_ description: String, until condition: (Int) -> Bool) async throws {
+        let webView = try XCTUnwrap(currentSpread?.webView, "Setup: no spread to count frames in")
+        let clock = ContinuousClock()
+        let deadline = clock.now.advanced(by: Self.setupTimeout)
+        while clock.now < deadline {
+            let value = try await webView.callAsyncJavaScript(
+                "return globalThis.__liveHeldFrames?.size ?? -1;",
+                arguments: [:],
+                in: nil,
+                contentWorld: EPUBLocatorCommandBridge.contentWorld
+            )
+            let live = try XCTUnwrap(value as? Int, "Setup: the live held frames were not counted")
+            XCTAssertGreaterThanOrEqual(live, 0, "Setup: the command world has no frame request to hold")
+            if condition(live) {
+                return
+            }
+            try await clock.sleep(for: .milliseconds(20))
+        }
+        XCTFail("Timed out waiting for \(description)")
+        throw SetupTimeout()
+    }
+
     /// Delivers the frames `holdCommandWorldFrames()` held and stops holding.
     /// Returns how many it held.
     func releaseCommandWorldFrames() async throws -> Int {
@@ -3300,16 +3358,31 @@ private final class ProgressionPage {
     nonisolated static let capability = "settled-location-test-capability"
     static let frameHoldingScript = """
     globalThis.__deliverFrame = globalThis.requestAnimationFrame.bind(globalThis);
+    globalThis.__cancelDeliveredFrame = globalThis.cancelAnimationFrame.bind(globalThis);
     globalThis.__heldFrames = null;
     globalThis.__framesBeforeHolding = 0;
+    globalThis.__liveHeldFrames = new Set();
+    globalThis.__lastHeldFrameID = 0;
     globalThis.requestAnimationFrame = (callback) => {
         if (globalThis.__heldFrames && globalThis.__framesBeforeHolding > 0) {
             globalThis.__framesBeforeHolding -= 1;
         } else if (globalThis.__heldFrames) {
             globalThis.__heldFrames.push(callback);
-            return 0;
+            if (globalThis.__heldFrames.length === globalThis.__restoreViewportAtHeldFrame) {
+                globalThis.__heldFramesAtViewportRestore = globalThis.__heldFrames.length;
+                delete document.documentElement.clientWidth;
+            }
+            // Negative, so it is never a delivered frame's id.
+            globalThis.__lastHeldFrameID -= 1;
+            globalThis.__liveHeldFrames.add(globalThis.__lastHeldFrameID);
+            return globalThis.__lastHeldFrameID;
         }
         return globalThis.__deliverFrame(callback);
+    };
+    globalThis.cancelAnimationFrame = (frameID) => {
+        if (!globalThis.__liveHeldFrames.delete(frameID)) {
+            globalThis.__cancelDeliveredFrame(frameID);
+        }
     };
     """
     /// The document's only element, as a locator command payload.
@@ -3757,6 +3830,22 @@ private final class ProgressionPage {
         )
     }
 
+    /// Gives the document no viewport size in the command world until it asks
+    /// for its `heldFrame`th held frame, so a wait on held frames sees the size
+    /// return after a known number of its own frames rather than after a time.
+    func emptyCommandWorldViewport(restoringAtHeldFrame heldFrame: Int) async throws {
+        try await runInCommandWorld(
+            """
+            Object.defineProperty(document.documentElement, "clientWidth", {
+                get() { return 0; },
+                configurable: true,
+            });
+            globalThis.__restoreViewportAtHeldFrame = heldFrame;
+            """,
+            arguments: ["heldFrame": heldFrame]
+        )
+    }
+
     /// Holds every animation frame the command world asks for from now on,
     /// after delivering the first `deliveredFrames`. Needs a page opened
     /// `holdingCommandWorldFrames`.
@@ -4044,7 +4133,7 @@ private final class ProgressionPage {
                 budgetMilliseconds: 10000,
             };
             const pending = readerLocatorCommands.execute(
-                { kind: "navigateLocator", payload: locator, animated: false },
+                { kind: "navigateLocator", payload: locator, animated: false, toleratesLateFrames: false },
                 token
             );
             if (companionKind === "invalidation") {
