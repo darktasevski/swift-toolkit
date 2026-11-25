@@ -175,6 +175,7 @@ extension EPUBNavigatorViewController {
             let loaded = paginationView.loadedViews[spreadIndex] as? EPUBSpreadView,
             loaded.isCommandReady
         {
+            guard canNavigateToReadyLocator else { return .miss }
             spreadView = loaded
         } else {
             // Hop with the FULL locator, not a resource-only one: the pending

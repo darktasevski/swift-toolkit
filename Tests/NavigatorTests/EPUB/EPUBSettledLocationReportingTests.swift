@@ -1233,6 +1233,223 @@ final class EPUBSettledLocationReportingTests: XCTestCase {
         await fulfillment(of: [report], timeout: Self.reportTimeout)
     }
 
+    func test_aTypedLocatorCannotWriteToTheSourceDuringAnOrdinaryJump() async throws {
+        let reader = try await openReader(minimumScreens: 4, positioned: true)
+        let navigator = reader.navigator
+        let pagination = try XCTUnwrap(navigator.paginationView)
+        try await reader.waitFor("a ready target spread") {
+            (pagination.loadedViews[1] as? EPUBSpreadView)?.isCommandReady == true
+        }
+        let template = try XCTUnwrap(pagination.loadedViews[1] as? EPUBSpreadView)
+        let target = try FixedLayoutCancellationTarget(cloning: template)
+        let proxy = FixedLayoutCancellationPaginationDelegate(navigator: navigator, target: target)
+        let commandGate = HopGate()
+        defer { commandGate.release() }
+        pagination.delegate = proxy
+        defer { pagination.delegate = navigator }
+        pagination.reloadAtIndex(0, location: .start, pageCount: 4, readingProgression: .ltr)
+        try await waitForPaginationLoaderExit(pagination)
+        try await reader.waitFor("a ready source spread") {
+            (pagination.currentView as? EPUBSpreadView)?.isCommandReady == true
+        }
+
+        target.gate = commandGate
+        let destination = Locator(href: Self.nextChapterHREF.anyURL, mediaType: .html)
+        let finished = XCTestExpectation(description: "The ordinary jump finishes")
+        let ordinary = Task {
+            _ = await navigator.goToLocator(destination, options: NavigatorGoOptions(animated: false))
+            finished.fulfill()
+        }
+        defer { ordinary.cancel() }
+        try await reader.waitFor("the ordinary jump to enter its destination command") { commandGate.isWaiting }
+
+        let competing = await navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false)
+        XCTAssertEqual(competing.outcome, .miss, "A typed locator bypassed the ordinary jump's admission")
+        XCTAssertNil(competing.receipt)
+
+        ordinary.cancel()
+        try await reader.waitFor("the ordinary command to acknowledge cancellation") { target.cancellationObserved }
+        commandGate.release()
+        await fulfillment(of: [finished], timeout: Self.reportTimeout)
+
+        let admitted = await navigator.navigateToLocatorJSON(Self.middleOfTheLongChapterJSON, animated: false)
+        XCTAssertEqual(admitted.outcome, .landed, "The source locator is valid once the jump settles")
+    }
+
+    func test_cancelledQueuedFixedLayoutMoveKeepsTheVisibleSourceAndReportedLocation() async throws {
+        let (reader, pagination, scroll, target) = try await openFixedLayoutCancellationReader()
+        let navigator = reader.navigator
+        let predecessorGate = HopGate()
+        defer { predecessorGate.release() }
+        let proxy = FixedLayoutCancellationPaginationDelegate(navigator: navigator, target: target)
+        proxy.predecessor.gate = predecessorGate
+        pagination.delegate = proxy
+        defer { pagination.delegate = navigator }
+        pagination.reloadAtIndex(0, location: .start, pageCount: 4, readingProgression: .ltr)
+
+        try await reader.waitFor("the ready target and held predecessor") {
+            predecessorGate.isWaiting && target.publicationInput() != nil && target.commandCount == 1
+        }
+        let source = try XCTUnwrap(pagination.loadedViews[0])
+        let sourceOffset = scroll.contentOffset
+        let commandCount = target.commandCount
+        let updateCount = proxy.updates
+        try await waitForOpeningSourceReport(in: reader)
+        let reportCount = reader.spy.locations.count
+
+        var replacementWasScheduled = false
+        proxy.onNextPositionCount = { replacementWasScheduled = true }
+        let destination = Locator(href: Self.nextChapterHREF.anyURL, mediaType: .html)
+        let navigationFinished = XCTestExpectation(description: "Queued navigation cancelled")
+        var outcome: PageCommandOutcome?
+        let navigation = Task {
+            outcome = await navigator.goToLocator(destination, options: NavigatorGoOptions(animated: false))
+            navigationFinished.fulfill()
+        }
+        defer { navigation.cancel() }
+        try await reader.waitFor("the replacement scheduling pass") { replacementWasScheduled }
+        navigation.cancel()
+        await fulfillment(of: [navigationFinished], timeout: Self.reportTimeout)
+        XCTAssertEqual(try XCTUnwrap(outcome), .cancelled)
+
+        try await assertSettledSource(in: reader, pagination: pagination, scroll: scroll,
+                                      source: source, offset: sourceOffset, since: reportCount)
+        XCTAssertEqual(target.commandCount - commandCount, 0)
+        XCTAssertEqual(proxy.updates - updateCount, 0)
+
+        predecessorGate.release()
+        try await waitForPaginationLoaderExit(pagination)
+        XCTAssertTrue(pagination.loadedViews[3] === proxy.finalNeighbor)
+        pagination.setNeedsLayout()
+        pagination.layoutIfNeeded()
+
+        try await assertSettledSource(in: reader, pagination: pagination, scroll: scroll,
+                                      source: source, offset: sourceOffset, since: reportCount)
+        XCTAssertEqual(target.commandCount - commandCount, 0)
+        XCTAssertEqual(proxy.updates - updateCount, 0)
+    }
+
+    func test_cancelledStartedFixedLayoutMoveSettlesLocationAtTheVisibleSource() async throws {
+        let (reader, pagination, scroll, target) = try await openFixedLayoutCancellationReader()
+        let navigator = reader.navigator
+        let commandGate = HopGate()
+        let firstNeighborGate = HopGate()
+        let replacementNeighborGate = HopGate()
+        defer {
+            commandGate.release()
+            firstNeighborGate.release()
+            replacementNeighborGate.release()
+        }
+        let proxy = FixedLayoutCancellationPaginationDelegate(navigator: navigator, target: target)
+        proxy.predecessor.gate = firstNeighborGate
+        pagination.delegate = proxy
+        defer { pagination.delegate = navigator }
+        pagination.reloadAtIndex(0, location: .start, pageCount: 4, readingProgression: .ltr)
+
+        try await reader.waitFor("the opening preload's held neighbor") { firstNeighborGate.isWaiting }
+        firstNeighborGate.release()
+        try await waitForPaginationLoaderExit(pagination)
+        XCTAssertEqual(proxy.updates, 1)
+        let source = try XCTUnwrap(pagination.loadedViews[0])
+        let sourceOffset = scroll.contentOffset
+        let commandCount = target.commandCount
+        let updateCount = proxy.updates
+        try await waitForOpeningSourceReport(in: reader)
+        let reportCount = reader.spy.locations.count
+        target.gate = commandGate
+        proxy.predecessor.gate = replacementNeighborGate
+
+        let destination = Locator(href: Self.nextChapterHREF.anyURL, mediaType: .html)
+        let navigationFinished = XCTestExpectation(description: "Started navigation cancelled")
+        var outcome: PageCommandOutcome?
+        let navigation = Task {
+            outcome = await navigator.goToLocator(destination, options: NavigatorGoOptions(animated: false))
+            navigationFinished.fulfill()
+        }
+        defer { navigation.cancel() }
+        try await reader.waitFor("the target command to start") { commandGate.isWaiting }
+        XCTAssertEqual(scroll.contentOffset, sourceOffset)
+        navigation.cancel()
+        try await reader.waitFor("the target command to acknowledge cancellation") { target.cancellationObserved }
+        commandGate.release()
+        await fulfillment(of: [navigationFinished], timeout: Self.reportTimeout)
+        XCTAssertEqual(try XCTUnwrap(outcome), .cancelled)
+        try await reader.waitFor("the replacement neighbor to enter its command") { replacementNeighborGate.isWaiting }
+        pagination.setNeedsLayout()
+        pagination.layoutIfNeeded()
+
+        try await assertSettledSource(in: reader, pagination: pagination, scroll: scroll,
+                                      source: source, offset: sourceOffset, since: reportCount)
+        XCTAssertEqual(target.commandCount - commandCount, 1)
+        XCTAssertEqual(proxy.updates - updateCount, 1)
+
+        replacementNeighborGate.release()
+        try await waitForPaginationLoaderExit(pagination)
+        XCTAssertTrue(pagination.loadedViews[3] === proxy.finalNeighbor)
+        pagination.setNeedsLayout()
+        pagination.layoutIfNeeded()
+
+        try await assertSettledSource(in: reader, pagination: pagination, scroll: scroll,
+                                      source: source, offset: sourceOffset, since: reportCount)
+        XCTAssertEqual(target.commandCount - commandCount, 1)
+        XCTAssertEqual(proxy.updates - updateCount, 1)
+    }
+
+    private func waitForPaginationLoaderExit(_ pagination: PaginationView) async throws {
+        let loader = try XCTUnwrap(pagination.loadPagesTaskForTesting)
+        let exited = XCTestExpectation(description: "Pagination loader exited")
+        Task { @MainActor in
+            await loader.value
+            exited.fulfill()
+        }
+        await fulfillment(of: [exited], timeout: Self.reportTimeout)
+    }
+
+    private func openFixedLayoutCancellationReader() async throws -> (Reader, PaginationView, UIScrollView, FixedLayoutCancellationTarget) {
+        let reader = try await openReader(
+            layout: .fixed,
+            minimumScreens: 0,
+            positioned: true,
+            preferences: EPUBPreferences(spread: .never)
+        )
+        let pagination = try XCTUnwrap(reader.navigator.paginationView)
+        let scroll = try XCTUnwrap(pagination.subviews.compactMap { $0 as? UIScrollView }.first)
+        try await reader.waitFor("the ready fixed-layout target") {
+            (pagination.loadedViews[1] as? EPUBSpreadView)?.publicationInput() != nil
+        }
+        let template = try XCTUnwrap(pagination.loadedViews[1] as? EPUBSpreadView)
+        return try (reader, pagination, scroll, FixedLayoutCancellationTarget(cloning: template))
+    }
+
+    private func waitForOpeningSourceReport(in reader: Reader) async throws {
+        let href = Self.longChapterHREF.anyURL
+        try await reader.waitFor("the opening report for the source") {
+            reader.spy.locations.last?.href.isEquivalentTo(href) == true
+        }
+    }
+
+    private func assertSettledSource(
+        in reader: Reader,
+        pagination: PaginationView,
+        scroll: UIScrollView,
+        source: UIView,
+        offset: CGPoint,
+        since reportCount: Int,
+        file: StaticString = #filePath,
+        line: UInt = #line
+    ) async throws {
+        XCTAssertEqual(scroll.contentOffset, offset, "The outer viewport moved off the source", file: file, line: line)
+        XCTAssertEqual(pagination.currentIndex, 0, "The selected index changed", file: file, line: line)
+        XCTAssertTrue(pagination.currentView === source, "The selected view is no longer the source", file: file, line: line)
+        let commit = await reader.navigator.awaitPendingLocationCommit()
+        let href = Self.longChapterHREF.anyURL
+        XCTAssertFalse(commit.deadlinePassed, "Pending close did not settle", file: file, line: line)
+        XCTAssertTrue(commit.location?.href.isEquivalentTo(href) == true, "Pending close left the source", file: file, line: line)
+        XCTAssertTrue(reader.spy.locations.last?.href.isEquivalentTo(href) == true, "The last delegate report left the source", file: file, line: line)
+        XCTAssertTrue(reader.spy.locations.dropFirst(reportCount).allSatisfy { $0.href.isEquivalentTo(href) },
+                      "The delegate reported a different spread", file: file, line: line)
+    }
+
     private func assertOnlyTheNewGeometryIsReported(
         by reader: Reader,
         once contents: HeldTableOfContents,
@@ -4430,5 +4647,98 @@ private final class HeldTableOfContents: TableOfContentsService {
             return
         }
         await withCheckedContinuation { waiters.append($0) }
+    }
+}
+
+@MainActor
+private final class FixedLayoutCancellationPaginationDelegate: PaginationViewDelegate {
+    let navigator: EPUBNavigatorViewController
+    let target: FixedLayoutCancellationTarget
+    let predecessor = FixedLayoutCancellationNeighbor()
+    let finalNeighbor = FixedLayoutCancellationNeighbor()
+    var onNextPositionCount: (() -> Void)?
+    private(set) var updates = 0
+
+    init(navigator: EPUBNavigatorViewController, target: FixedLayoutCancellationTarget) {
+        self.navigator = navigator
+        self.target = target
+    }
+
+    func paginationViewWillBeginUserNavigation(_ paginationView: PaginationView) {}
+
+    func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)? {
+        switch index {
+        case 1: return target
+        case 2: return predecessor
+        case 3: return finalNeighbor
+        default: return navigator.paginationView(paginationView, pageViewAtIndex: index)
+        }
+    }
+
+    func paginationViewDidUpdateViews(_ paginationView: PaginationView) {
+        updates += 1
+        navigator.paginationViewDidUpdateViews(paginationView)
+    }
+
+    func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int {
+        let onNextPositionCount = onNextPositionCount
+        self.onNextPositionCount = nil
+        onNextPositionCount?()
+        // Opening preloads slots 1 and 2. A move to slot 1 adds slot 3 and forces a fresh layout.
+        return 3
+    }
+}
+
+@MainActor
+private final class FixedLayoutCancellationNeighbor: UIView, PageView {
+    var gate: HopGate?
+
+    init() {
+        super.init(frame: .zero)
+    }
+
+    @available(*, unavailable)
+    required init?(coder: NSCoder) {
+        fatalError("init(coder:) is unavailable")
+    }
+
+    func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {
+        if let gate {
+            self.gate = nil
+            await gate.wait()
+        }
+        return Task.isCancelled ? .cancelled : .succeeded
+    }
+}
+
+/// Holds a command while retaining the actual publication's ready spread identity.
+@MainActor
+private final class FixedLayoutCancellationTarget: EPUBSpreadView {
+    var gate: HopGate?
+    private(set) var commandCount = 0
+    private(set) var cancellationObserved = false
+
+    convenience init(cloning template: EPUBSpreadView) throws {
+        self.init(viewModel: template.viewModel, spread: template.spread, scripts: [], animatedLoad: false)
+        let generation = readiness.beginLoading()
+        let lease = try XCTUnwrap(readiness.beginInitialization(
+            for: generation, frameCapability: EPUBSpreadFrameCapability()
+        ))
+        readiness.finishInitialization(lease, outcome: .succeeded)
+    }
+
+    override func loadSpread() {}
+
+    override func go(to location: PageLocation, animated: Bool) async -> PageCommandOutcome {
+        commandCount += 1
+        if let gate {
+            self.gate = nil
+            await withTaskCancellationHandler {
+                await gate.wait()
+            } onCancel: {
+                Task { @MainActor in self.cancellationObserved = true }
+            }
+        }
+        return Task.isCancelled ? .cancelled : .succeeded
     }
 }

@@ -981,6 +981,11 @@ open class EPUBNavigatorViewController: InputObservableViewController,
         return outcome
     }
 
+    /// Read by +LocatorCommands.swift when the typed command can skip the resource hop.
+    var canNavigateToReadyLocator: Bool {
+        state == .idle
+    }
+
     public func go(to link: Link, options: NavigatorGoOptions) async -> Bool {
         guard let locator = await publication.locate(link) else {
             return false

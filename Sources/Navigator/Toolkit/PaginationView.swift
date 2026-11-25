@@ -57,14 +57,15 @@ protocol PaginationViewDelegate: AnyObject {
     /// Creates the page view for the page at given index.
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)?
 
-    /// Called when the page views were updated.
+    /// Called when the current-page attempt terminates, before neighbor preloading.
+    /// A terminal attempt does not imply a successful landing.
     func paginationViewDidUpdateViews(_ paginationView: PaginationView)
 
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
     func paginationView(_ paginationView: PaginationView, positionCountAtIndex index: Int) -> Int
 }
 
-final class PaginationView: UIView, Loggable {
+final class PaginationView: UIView {
     private struct LoadGeneration: Equatable, Hashable {
         let id = UUID()
     }
@@ -87,6 +88,21 @@ final class PaginationView: UIView, Loggable {
         let navigationID: UUID?
         let view: UIView & PageView
         let task: Task<PageCommandOutcome, Never>
+    }
+
+    private struct PageMove: Equatable {
+        let key: PageLoadKey
+        let sourceIndex: Int
+    }
+
+    private enum ViewportTransition: Equatable {
+        case positioning(PageMove)
+        case presenting(PageLoadKey)
+
+        var sourceIndex: Int? {
+            guard case let .positioning(move) = self else { return nil }
+            return move.sourceIndex
+        }
     }
 
     private struct CurrentPageWaiter {
@@ -139,29 +155,23 @@ final class PaginationView: UIView, Loggable {
         loadedViews[currentIndex]
     }
 
-    /// Loaded page views in reading order.
-    private var orderedViews: [UIView & PageView] {
-        var orderedViews = loadedViews
-            .sorted { $0.key < $1.key }
-            .map(\.value)
-
-        if readingProgression == .rtl {
-            orderedViews.reverse()
-        }
-
-        return orderedViews
-    }
-
     private let scrollView = UIScrollView()
 
-    /// Set while a transition animation is in progress to prevent
-    /// `layoutSubviews` from resetting `contentOffset` and interrupting the
-    /// animation.
-    private var isAnimatingContentOffset = false
+    private var viewportTransition: ViewportTransition?
+    private var transitionSnapshot: UIView?
+    private var committedPreloadRange: ClosedRange<Int>?
+    private var preloadWaiter: CheckedContinuation<Void, Never>?
+
+    private var commandAttemptIndex: Int {
+        if case let .positioning(move) = viewportTransition {
+            return move.key.index
+        }
+        return currentIndex
+    }
 
     /// Allows the scroll view to scroll.
     var isScrollEnabled: Bool {
-        didSet { scrollView.isScrollEnabled = isScrollEnabled }
+        didSet { scrollView.isScrollEnabled = isScrollEnabled && viewportTransition == nil }
     }
 
     init(
@@ -213,7 +223,10 @@ final class PaginationView: UIView, Loggable {
             view.frame = CGRect(origin: CGPoint(x: xOffsetForIndex(index), y: 0), size: size)
         }
 
-        if !isAnimatingContentOffset {
+        switch viewportTransition {
+        case .presenting:
+            break
+        case .positioning, nil:
             scrollView.contentOffset.x = xOffsetForIndex(currentIndex)
         }
     }
@@ -252,106 +265,117 @@ final class PaginationView: UIView, Loggable {
         precondition(pageCount >= 1)
         precondition(0 ..< pageCount ~= index)
 
-        activePageCommand?.view.acknowledgeCommandSupersession()
-        let predecessor = invalidateLoads(removingLoadedViews: true)
+        let generation = invalidateLoads(removingLoadedViews: true, acknowledgingSupersession: true)
+        guard loadGeneration == generation else { return }
         self.pageCount = pageCount
         self.readingProgression = readingProgression
-        setCurrentIndex(
-            index,
-            location: location,
-            replacing: predecessor,
-            startsNewGeneration: false
-        )
+        scheduleCurrentPage(PageLoadKey(generation: generation, index: index), location: location)
     }
 
-    /// Updates the current and pre-loaded views.
-    private func setCurrentIndex(
-        _ index: Int,
-        location: PageLocation? = nil,
-        replacing predecessor: Task<Void, Never>? = nil,
-        startsNewGeneration: Bool = true,
-        replacingCurrentCommand: Bool = false,
-        pageNavigationAnimated: Bool = false,
+    /// Updates the selection after a native drag has already moved the viewport.
+    private func selectDraggedPage(_ index: Int) {
+        guard 0 ..< pageCount ~= index, isEmpty || index != currentIndex else { return }
+        let generation = invalidateLoads(removingLoadedViews: false, acknowledgingSupersession: true)
+        guard loadGeneration == generation else { return }
+        let location: PageLocation = currentIndex - 1 == index ? .end : .start
+        scheduleCurrentPage(PageLoadKey(generation: generation, index: index), location: location)
+    }
+
+    @discardableResult
+    private func scheduleCurrentPage(
+        _ key: PageLoadKey,
+        location: PageLocation,
+        animated: Bool = false,
         navigationID: UUID? = nil
-    ) {
-        guard replacingCurrentCommand || isEmpty || index != currentIndex else {
-            return
+    ) -> ClosedRange<Int>? {
+        let generation = key.generation
+        guard loadGeneration == generation else { return nil }
+        if viewportTransition == nil {
+            currentIndex = key.index
         }
+        enqueuePage(key, location: location, animated: animated, navigationID: navigationID)
 
-        let loadPredecessor: Task<Void, Never>?
-        if startsNewGeneration {
-            activePageCommand?.view.acknowledgeCommandSupersession()
-            loadPredecessor = invalidateLoads(removingLoadedViews: false)
-        } else {
-            loadPredecessor = predecessor
+        // Current page first, followed by forward and backward preloads.
+        let last = scheduleNeighbors(from: key, upToPositionCount: preloadNextPositionCount, direction: .forward, location: .start)
+        let first = scheduleNeighbors(from: key, upToPositionCount: preloadPreviousPositionCount, direction: .backward, location: .end)
+        guard loadGeneration == generation else { return nil }
+
+        let preloadRange = first ... last
+        let retainedSource = viewportTransition?.sourceIndex
+        let retainedRange = retainedSource == nil ? nil : committedPreloadRange
+        if retainedSource == nil {
+            committedPreloadRange = preloadRange
         }
+        evictViews(outside: preloadRange, alsoKeeping: retainedRange, source: retainedSource)
 
-        // If no explicit location is given, we'll load either the beginning or the end of the
-        // resource depending on the last index. This allows to navigate backward across resources,
-        // starting from the end of each previous resource.
-        let movingBackward = (currentIndex - 1 == index)
-        let location = location ?? (movingBackward ? .end : .start)
-
-        currentIndex = index
-
-        // To make sure that the views the most likely to be visible are loaded first, we first load
-        // the current one, then the next ones and to finish the previous ones.
-        scheduleLoadPage(
-            at: index,
-            location: location,
-            animated: pageNavigationAnimated,
-            navigationID: navigationID
-        )
-        let lastIndex = scheduleLoadPages(from: index, upToPositionCount: preloadNextPositionCount, direction: .forward, location: .start)
-        let firstIndex = scheduleLoadPages(from: index, upToPositionCount: preloadPreviousPositionCount, direction: .backward, location: .end)
-
-        for (i, view) in loadedViews {
-            // Flushes the views that are not needed anymore.
-            guard firstIndex ... lastIndex ~= i else {
-                view.removeFromSuperview()
-                loadedViews.removeValue(forKey: i)
-                continue
-            }
-        }
-
-        loadPages(replacing: loadPredecessor)
+        startLoader(for: key)
+        return loadGeneration == generation ? preloadRange : nil
     }
 
-    private func loadPages(replacing predecessor: Task<Void, Never>?) {
-        let generation = loadGeneration
-        loadPagesTask = Task { @MainActor [weak self] in
-            await predecessor?.value
-            guard
-                !Task.isCancelled,
-                let self,
-                self.loadGeneration == generation
-            else {
-                return
-            }
-
-            await self.loadNextPage(for: generation)
-            guard
-                !Task.isCancelled,
-                self.loadGeneration == generation
-            else {
-                return
-            }
-            self.delegate?.paginationViewDidUpdateViews(self)
+    private func evictViews(
+        outside preloadRange: ClosedRange<Int>,
+        alsoKeeping retainedRange: ClosedRange<Int>? = nil,
+        source retainedSource: Int? = nil
+    ) {
+        let evicted = loadedViews.filter { index, _ in
+            index != retainedSource && retainedRange?.contains(index) != true && !preloadRange.contains(index)
+        }
+        for index in evicted.keys {
+            loadedViews.removeValue(forKey: index)
+        }
+        for view in evicted.values {
+            view.removeFromSuperview()
         }
     }
 
     private var loadPagesTask: Task<Void, Never>?
 
-    private func loadNextPage(for generation: LoadGeneration) async {
-        guard
-            !Task.isCancelled,
-            loadGeneration == generation,
-            let request = loadingPageQueue.popFirst(),
-            request.key.generation == generation
-        else {
-            return
-        }
+    private func startLoader(for currentAttempt: PageLoadKey) {
+        let generation = currentAttempt.generation
+        guard loadGeneration == generation else { return }
+        let predecessor = loadPagesTask
+        loadPagesTask = Task { @MainActor [weak self] in
+            await predecessor?.value
+            guard let self else { return }
 
+            while !Task.isCancelled,
+                  self.loadGeneration == generation,
+                  let request = self.loadingPageQueue.first
+            {
+                if case let .positioning(move) = self.viewportTransition,
+                   self.repositionsSourcePreload(request, during: move)
+                {
+                    await withCheckedContinuation { self.preloadWaiter = $0 }
+                    continue
+                }
+                self.loadingPageQueue.removeFirst()
+                guard self.isCurrent(request.key) else { continue }
+                await self.loadPage(request)
+                guard !Task.isCancelled, self.loadGeneration == generation else { return }
+                if request.key == currentAttempt,
+                   self.pageCommandOutcomes[request.key] != nil || self.failedPageLoads.contains(request.key)
+                {
+                    self.delegate?.paginationViewDidUpdateViews(self)
+                }
+            }
+        }
+    }
+
+    private func resumePreloading() {
+        let waiter = preloadWaiter
+        preloadWaiter = nil
+        waiter?.resume()
+    }
+
+    private func repositionsSourcePreload(_ request: PageLoadRequest, during move: PageMove) -> Bool {
+        let index = request.key.index
+        return request.key != move.key
+            && committedPreloadRange?.contains(index) == true
+            && loadedViews[index] != nil
+            && (index < move.sourceIndex) != (index < move.key.index)
+    }
+
+    private func loadPage(_ request: PageLoadRequest) async {
         let index = request.key.index
         guard isCurrent(request.key) else {
             return
@@ -363,13 +387,17 @@ final class PaginationView: UIView, Loggable {
                 return
             }
 
-            guard isCurrent(request.key), loadedViews[index] == nil else {
-                view.removeFromSuperview()
-                return
-            }
+            guard isCurrent(request.key), loadedViews[index] == nil else { return }
 
             loadedViews[index] = view
+            defer {
+                // UIKit can attach the view after willMove(toSuperview:) invalidates its load.
+                if loadedViews[index] !== view {
+                    view.removeFromSuperview()
+                }
+            }
             scrollView.addSubview(view)
+            guard isCurrent(request.key), loadedViews[index] === view else { return }
             setNeedsLayout()
             // The freshly added page view has no frame until the deferred layout
             // pass runs, but `view.go(to:)` below immediately drives
@@ -421,56 +449,43 @@ final class PaginationView: UIView, Loggable {
         scheduledPageLoads.remove(request.key)
         pageCommandOutcomes[request.key] = outcome
         resumePageCommandWaiters(with: outcome, for: request.key)
-        // Neighbor preloading is deliberately independent of this page's own
-        // outcome. A page that could not position itself (a broken resource)
-        // or whose command the user interrupted mid-drag says nothing about
-        // the other resources queued behind it, and stopping here would strand
-        // them until something else starts a new generation. Staleness — the
-        // only reason to abandon the queue — is re-checked on entry to every
-        // recursion.
-        await loadNextPage(for: generation)
     }
 
-    /// Queue views to be loaded until reaching the given number of pre-loaded positions.
-    ///
-    /// - Parameters:
-    ///   - positionCount: Number of positions to pre-load before stopping.
-    ///   - sourceIndex: Starting page index from which to pre-load the views.
-    ///   - direction: The direction in which to load the views from the sourceIndex.
-    /// - Returns: The last page index to be loaded after reaching the requested number of positions.
-    private func scheduleLoadPages(from sourceIndex: Int, upToPositionCount positionCount: Int, direction: PageIndexDirection, location: PageLocation) -> Int {
-        let index = sourceIndex + direction.rawValue
-        guard
-            positionCount > 0,
-            scheduleLoadPage(at: index, location: location),
-            let indexPositionCount = delegate?.paginationView(self, positionCountAtIndex: index)
-        else {
-            return sourceIndex
+    /// Queues neighbors until the position budget is exhausted.
+    private func scheduleNeighbors(
+        from source: PageLoadKey,
+        upToPositionCount positionCount: Int,
+        direction: PageIndexDirection,
+        location: PageLocation
+    ) -> Int {
+        let index = source.index + direction.rawValue
+        guard source.generation == loadGeneration, positionCount > 0, 0 ..< pageCount ~= index else {
+            return source.index
         }
 
-        return scheduleLoadPages(
-            from: index,
-            upToPositionCount: positionCount - indexPositionCount,
+        let neighbor = PageLoadKey(generation: source.generation, index: index)
+        if index != viewportTransition?.sourceIndex || loadedViews[index] == nil {
+            enqueuePage(neighbor, location: location)
+        }
+
+        guard let count = delegate?.paginationView(self, positionCountAtIndex: index) else {
+            return source.index
+        }
+        guard source.generation == loadGeneration else { return source.index }
+        return scheduleNeighbors(
+            from: neighbor,
+            upToPositionCount: positionCount - count,
             direction: direction,
             location: location
         )
     }
 
-    /// Queue a page to be loaded at the given index, if it's not already loaded.
-    ///
-    /// - Returns: Whether page is or will be loaded.
-    @discardableResult
-    private func scheduleLoadPage(
-        at index: Int,
+    private func enqueuePage(
+        _ key: PageLoadKey,
         location: PageLocation,
         animated: Bool = false,
         navigationID: UUID? = nil
-    ) -> Bool {
-        guard 0 ..< pageCount ~= index else {
-            return false
-        }
-
-        let key = PageLoadKey(generation: loadGeneration, index: index)
+    ) {
         loadingPageQueue.removeAll { $0.key == key }
         scheduledPageLoads.insert(key)
         loadingPageQueue.append(PageLoadRequest(
@@ -479,7 +494,6 @@ final class PaginationView: UIView, Loggable {
             animated: animated,
             navigationID: navigationID
         ))
-        return true
     }
 
     private func isCurrent(_ key: PageLoadKey) -> Bool {
@@ -502,11 +516,9 @@ final class PaginationView: UIView, Loggable {
         if let view = loadedViews[index] {
             return view
         }
-        if Task.isCancelled {
-            return nil
-        }
+        guard !Task.isCancelled, scheduledPageLoads.contains(key) else { return nil }
 
-        let generation = loadGeneration
+        let generation = key.generation
         let waiterID = UUID()
         return await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
@@ -520,10 +532,7 @@ final class PaginationView: UIView, Loggable {
                     continuation.resume(returning: view)
                 } else if generation != loadGeneration || index != currentIndex {
                     continuation.resume(returning: nil)
-                } else if failedPageLoads.contains(PageLoadKey(
-                    generation: generation,
-                    index: index
-                )) {
+                } else if !scheduledPageLoads.contains(key) {
                     continuation.resume(returning: nil)
                 } else {
                     currentPageWaiters[waiterID] = CurrentPageWaiter(
@@ -540,11 +549,10 @@ final class PaginationView: UIView, Loggable {
         }
     }
 
-    /// Terminal outcome for a page-command wait whose target is no longer the
-    /// pagination's current page, or `nil` to proceed with the wait.
+    /// Reports supersession of a page-command wait, or `nil` to proceed with the wait.
     ///
     /// Callers bounds-validate their index at `goToIndex`, so both stale forms
-    /// observable here — the current index moved on, or a concurrent reload
+    /// observable here — the attempt index moved on, or a concurrent reload
     /// shrank the page count — are supersession by the reader's own newer
     /// work, not a resolution failure inside the still-current generation.
     /// Reporting `.failed` would map to `.miss` at the consumer seam and send
@@ -553,28 +561,27 @@ final class PaginationView: UIView, Loggable {
     /// as `.cancelled`; this keeps the entry check symmetric with it.
     static func currentPageCommandEntryOutcome(
         index: Int,
-        currentIndex: Int,
+        attemptIndex: Int,
         pageCount: Int
     ) -> PageCommandOutcome? {
-        guard index == currentIndex, 0 ..< pageCount ~= index else {
+        guard index == attemptIndex, 0 ..< pageCount ~= index else {
             return .cancelled
         }
         return nil
     }
 
-    /// Suspends until the exact current page's positioning command completes
-    /// for the active pagination generation. Neighbor preloading is not part
-    /// of this completion stage.
-    private func waitForCurrentPageCommand(at index: Int) async -> PageCommandOutcome {
+    /// Waits for the active generation's exact target command. A staged target
+    /// can be different from the visible page during a cross-page move.
+    private func waitForCurrentPageCommand(for key: PageLoadKey) async -> PageCommandOutcome {
+        guard key.generation == loadGeneration else { return .cancelled }
         if let outcome = Self.currentPageCommandEntryOutcome(
-            index: index,
-            currentIndex: currentIndex,
+            index: key.index,
+            attemptIndex: commandAttemptIndex,
             pageCount: pageCount
         ) {
             return outcome
         }
 
-        let key = PageLoadKey(generation: loadGeneration, index: index)
         if let outcome = pageCommandOutcomes[key] {
             return outcome
         }
@@ -594,7 +601,7 @@ final class PaginationView: UIView, Loggable {
                     continuation.resume(returning: outcome)
                 } else if
                     key.generation != loadGeneration ||
-                    key.index != currentIndex
+                    key.index != commandAttemptIndex
                 {
                     continuation.resume(returning: .cancelled)
                 } else if failedPageLoads.contains(key) {
@@ -614,27 +621,51 @@ final class PaginationView: UIView, Loggable {
     }
 
     @discardableResult
-    private func invalidateLoads(removingLoadedViews: Bool) -> Task<Void, Never>? {
+    private func invalidateLoads(
+        removingLoadedViews: Bool,
+        acknowledgingSupersession: Bool = false
+    ) -> LoadGeneration {
+        let generation = LoadGeneration()
         let predecessor = loadPagesTask
-        activePageCommand?.task.cancel()
-        predecessor?.cancel()
-        loadPagesTask = nil
-        loadGeneration = LoadGeneration()
+        let outgoingCommand = activePageCommand
+        let removedViews = removingLoadedViews ? Array(loadedViews.values) : []
+        let interruptedTransition = viewportTransition
+        let snapshot = transitionSnapshot
+
+        loadGeneration = generation
+        activePageCommand = nil
+        viewportTransition = nil
+        transitionSnapshot = nil
         loadingPageQueue.removeAll()
         scheduledPageLoads.removeAll()
         pageCommandOutcomes.removeAll()
         failedPageLoads.removeAll()
         drainCurrentPageWaiters()
         drainPageCommandWaiters()
+        resumePreloading()
 
         if removingLoadedViews {
-            for view in loadedViews.values {
-                view.removeFromSuperview()
-            }
             loadedViews.removeAll()
+            committedPreloadRange = nil
         }
 
-        return predecessor
+        snapshot?.removeFromSuperview()
+        if case .presenting = interruptedTransition, !removingLoadedViews, loadGeneration == generation {
+            alignCommittedPage()
+        }
+        if interruptedTransition != nil {
+            restorePresentation(for: generation)
+        }
+        if acknowledgingSupersession {
+            outgoingCommand?.view.acknowledgeCommandSupersession()
+        }
+        outgoingCommand?.task.cancel()
+        predecessor?.cancel()
+        for view in removedViews {
+            view.removeFromSuperview()
+        }
+
+        return generation
     }
 
     @discardableResult
@@ -655,13 +686,14 @@ final class PaginationView: UIView, Loggable {
         for request in cancelledRequests where request.key.generation == loadGeneration {
             scheduledPageLoads.remove(request.key)
             pageCommandOutcomes[request.key] = .cancelled
+            resumeCurrentPageWaiters(with: nil, for: request.key)
             resumePageCommandWaiters(with: .cancelled, for: request.key)
         }
         return nil
     }
 
     private func resumeCurrentPageWaiters(
-        with view: UIView & PageView,
+        with view: (UIView & PageView)?,
         for key: PageLoadKey
     ) {
         let waiterIDs = currentPageWaiters.compactMap { id, waiter in
@@ -682,18 +714,7 @@ final class PaginationView: UIView, Loggable {
         scheduledPageLoads.remove(key)
         failedPageLoads.insert(key)
 
-        let identityWaiterIDs = currentPageWaiters.compactMap { id, waiter in
-            waiter.generation == key.generation && waiter.index == key.index
-                ? id
-                : nil
-        }
-        for id in identityWaiterIDs {
-            guard let waiter = currentPageWaiters.removeValue(forKey: id) else {
-                continue
-            }
-            waiter.continuation.resume(returning: nil)
-        }
-
+        resumeCurrentPageWaiters(with: nil, for: key)
         resumePageCommandWaiters(with: .failed, for: key)
     }
 
@@ -754,7 +775,7 @@ final class PaginationView: UIView, Loggable {
     /// - Parameters:
     ///   - index: The index to move to.
     ///   - location: The location to move the future current page view to.
-    /// - Returns: The terminal outcome of the page-positioning command.
+    /// - Returns: The outcome of positioning the page and settling any viewport move.
     func goToIndex(
         _ index: Int,
         location: PageLocation,
@@ -807,148 +828,125 @@ final class PaginationView: UIView, Loggable {
 
         let shouldAnimate = options.animated && !UIAccessibility.isReduceMotionEnabled
 
-        if currentIndex == index {
-            return await scrollToView(
-                at: index,
-                location: location,
-                animated: shouldAnimate,
-                navigationID: navigationID
-            )
-        } else if abs(currentIndex - index) == 1 {
-            return await slideToView(
-                at: index,
-                location: location,
-                animated: shouldAnimate,
-                navigationID: navigationID
-            )
-        } else {
-            return await fadeToView(
-                at: index,
-                location: location,
-                animated: shouldAnimate,
-                navigationID: navigationID
-            )
-        }
-    }
+        let sourceIndex = currentIndex
+        let generation = invalidateLoads(removingLoadedViews: false, acknowledgingSupersession: true)
+        guard loadGeneration == generation else { return .cancelled }
 
-    private func slideToView(
-        at index: Int,
-        location: PageLocation,
-        animated: Bool,
-        navigationID: UUID
-    ) async -> PageCommandOutcome {
-        let fromOffset = scrollView.contentOffset
-        let targetOffset = CGPoint(x: xOffsetForIndex(index), y: fromOffset.y)
-        let translationX = fromOffset.x - targetOffset.x
-
-        // We use a snapshot of the current view for two reasons:
-        //
-        // 1. The current view might get flushed when calling
-        //    `setCurrentIndex()`, but we want to keep it on the screen during
-        //    the animation.
-        // 2. A workaround for visual glitches, see https://github.com/readium/swift-toolkit/issues/737#issuecomment-4090386881
-        let snapshot = snapshotView(afterScreenUpdates: false)
-        if let snapshot {
-            snapshot.frame = bounds
-            addSubview(snapshot)
-        } else {
-            log(.warning, "Could not take a snapshot before sliding to view at index \(index); page transition may flash")
+        let key = PageLoadKey(generation: generation, index: index)
+        if sourceIndex == index {
+            scheduleCurrentPage(key, location: location, animated: shouldAnimate, navigationID: navigationID)
+            let outcome = await waitForCurrentPageCommand(for: key)
+            return loadGeneration == generation ? outcome : .cancelled
         }
 
-        isAnimatingContentOffset = true
-        scrollView.isScrollEnabled = false
-
-        defer {
-            snapshot?.removeFromSuperview()
-            isAnimatingContentOffset = false
-            scrollView.isScrollEnabled = isScrollEnabled
-        }
-
-        setCurrentIndex(index, location: location, navigationID: navigationID)
-
-        guard await waitForCurrentPage(at: index) != nil else {
-            return await waitForCurrentPageCommand(at: index)
-        }
-        let outcome = await waitForCurrentPageCommand(at: index)
-        guard outcome == .succeeded else {
-            return outcome
-        }
-
-        scrollView.contentOffset = fromOffset
-
-        if animated {
-            await animate(duration: 0.3) {
-                snapshot?.transform = CGAffineTransform(translationX: translationX, y: 0)
-                self.scrollView.contentOffset = targetOffset
-            }
-        } else {
-            scrollView.contentOffset = targetOffset
-        }
-        return .succeeded
-    }
-
-    private func fadeToView(
-        at index: Int,
-        location: PageLocation,
-        animated: Bool,
-        navigationID: UUID
-    ) async -> PageCommandOutcome {
-        func fade(to alpha: CGFloat) async {
-            await animate(duration: animated ? 0.15 : 0) {
-                self.alpha = alpha
-            }
-        }
-
-        await fade(to: 0)
-        let outcome = await scrollToView(
-            at: index,
+        return await moveToView(
+            PageMove(key: key, sourceIndex: sourceIndex),
             location: location,
-            animated: false,
+            animated: shouldAnimate,
             navigationID: navigationID
         )
-        await fade(to: 1)
-        return outcome
     }
 
-    private func scrollToView(
-        at index: Int,
+    private func moveToView(
+        _ move: PageMove,
         location: PageLocation,
         animated: Bool,
         navigationID: UUID
     ) async -> PageCommandOutcome {
-        guard currentIndex != index else {
-            setCurrentIndex(
-                index,
-                location: location,
-                replacingCurrentCommand: true,
-                pageNavigationAnimated: animated,
-                navigationID: navigationID
-            )
-            guard await waitForCurrentPage(at: index) != nil else {
-                return await waitForCurrentPageCommand(at: index)
-            }
-            return await waitForCurrentPageCommand(at: index)
+        let key = move.key
+        let positioning = ViewportTransition.positioning(move)
+        let presenting = ViewportTransition.presenting(key)
+        viewportTransition = positioning
+        scrollView.isScrollEnabled = false
+        guard let preloadRange = scheduleCurrentPage(key, location: location, navigationID: navigationID) else {
+            return .cancelled
         }
 
-        scrollView.isScrollEnabled = isScrollEnabled
-        setCurrentIndex(index, location: location, navigationID: navigationID)
-
-        guard await waitForCurrentPage(at: index) != nil else {
-            return await waitForCurrentPageCommand(at: index)
-        }
-        let outcome = await waitForCurrentPageCommand(at: index)
+        let outcome = await waitForCurrentPageCommand(for: key)
         guard outcome == .succeeded else {
-            return outcome
+            abortMove(move)
+            return Task.isCancelled || loadGeneration != key.generation ? .cancelled : outcome
+        }
+        guard viewportTransition == positioning else { return .cancelled }
+
+        let isAdjacent = abs(move.sourceIndex - key.index) == 1
+        // The snapshot avoids exposing a rendering gap while a page slides in.
+        let snapshot = animated && isAdjacent ? snapshotView(afterScreenUpdates: false) : nil
+        defer { snapshot?.removeFromSuperview() }
+        if let snapshot, viewportTransition == positioning {
+            snapshot.frame = bounds
+            transitionSnapshot = snapshot
+            addSubview(snapshot)
         }
 
-        scrollView.scrollRectToVisible(CGRect(
-            origin: CGPoint(
-                x: xOffsetForIndex(index),
-                y: scrollView.contentOffset.y
-            ),
-            size: scrollView.frame.size
-        ), animated: animated)
-        return .succeeded
+        if !isAdjacent, animated {
+            await animate(duration: 0.15) {
+                guard self.viewportTransition == positioning, !Task.isCancelled else { return }
+                self.alpha = 0
+            }
+        }
+
+        await animate(duration: isAdjacent && animated ? 0.3 : 0) {
+            guard self.viewportTransition == positioning, !Task.isCancelled else { return }
+            let offset = self.xOffsetForIndex(key.index)
+            let translation = self.scrollView.contentOffset.x - offset
+            self.currentIndex = key.index
+            self.committedPreloadRange = preloadRange
+            self.viewportTransition = presenting
+            self.resumePreloading()
+            self.scrollView.contentOffset.x = offset
+            snapshot?.transform = CGAffineTransform(translationX: translation, y: 0)
+        }
+
+        guard viewportTransition == presenting else {
+            abortMove(move)
+            return .cancelled
+        }
+
+        if !isAdjacent, animated {
+            await animate(duration: 0.15) {
+                guard self.viewportTransition == presenting else { return }
+                self.alpha = 1
+            }
+        }
+
+        guard viewportTransition == presenting else { return .cancelled }
+        viewportTransition = nil
+        transitionSnapshot = nil
+        alignCommittedPage()
+        restorePresentation(for: key.generation)
+        if loadGeneration == key.generation {
+            evictViews(outside: preloadRange)
+        }
+        return loadGeneration == key.generation ? .succeeded : .cancelled
+    }
+
+    private func abortMove(_ move: PageMove) {
+        guard viewportTransition == .positioning(move) else { return }
+        // Keep cached source neighbors at their original entry edge if the move never commits.
+        loadingPageQueue.removeAll { request in
+            guard repositionsSourcePreload(request, during: move) else { return false }
+            scheduledPageLoads.remove(request.key)
+            return true
+        }
+        viewportTransition = nil
+        transitionSnapshot = nil
+        resumePreloading()
+        setNeedsLayout()
+        scrollView.contentOffset.x = xOffsetForIndex(move.sourceIndex)
+        restorePresentation(for: move.key.generation)
+    }
+
+    private func alignCommittedPage() {
+        setNeedsLayout()
+        layoutIfNeeded()
+    }
+
+    private func restorePresentation(for generation: LoadGeneration) {
+        guard loadGeneration == generation else { return }
+        alpha = 1
+        guard loadGeneration == generation else { return }
+        scrollView.isScrollEnabled = isScrollEnabled
     }
 
     private func animate(duration: TimeInterval, animations: @escaping () -> Void) async {
@@ -980,20 +978,18 @@ extension PaginationView: UIScrollViewDelegate {
     }
 
     func scrollViewDidEndScrollingAnimation(_ scrollView: UIScrollView) {
-        scrollView.isScrollEnabled = isScrollEnabled
+        scrollView.isScrollEnabled = isScrollEnabled && viewportTransition == nil
     }
 
     func scrollViewDidEndDragging(_ scrollView: UIScrollView, willDecelerate decelerate: Bool) {
         if !decelerate {
-            scrollView.isScrollEnabled = isScrollEnabled
+            scrollView.isScrollEnabled = isScrollEnabled && viewportTransition == nil
         }
     }
 
     func scrollViewDidEndDecelerating(_ scrollView: UIScrollView) {
-        // A programmatic slide animation sets isScrollEnabled = false and drives the
-        // content offset directly. If a delegate callback fires during or just after
-        // that window it could call setCurrentIndex with a stale offset, so we bail out.
-        guard !isAnimatingContentOffset else { return }
+        // A programmatic transition owns the viewport until it settles.
+        guard viewportTransition == nil else { return }
 
         scrollView.isScrollEnabled = isScrollEnabled
 
@@ -1002,6 +998,14 @@ extension PaginationView: UIScrollViewDelegate {
             : scrollView.contentOffset.x
 
         let newIndex = Int(round(currentOffset / scrollView.frame.width))
-        setCurrentIndex(newIndex)
+        selectDraggedPage(newIndex)
     }
 }
+
+#if RENDER_FAITHFUL_NAV_TESTING
+    extension PaginationView {
+        var loadPagesTaskForTesting: Task<Void, Never>? {
+            loadPagesTask
+        }
+    }
+#endif
