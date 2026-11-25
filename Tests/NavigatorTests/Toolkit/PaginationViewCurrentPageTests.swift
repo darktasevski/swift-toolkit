@@ -747,6 +747,39 @@ final class PaginationViewCurrentPageTests: XCTestCase {
         XCTAssertEqual(neighbor.lastLocation, .end)
     }
 
+    func testCommittedMovePreloadsItsFormerSourceAtTheEntryEdge() async {
+        for sourceIndex in [0, 2] {
+            let destination = 2 - sourceIndex
+            let entryEdge: PageLocation = sourceIndex < destination ? .end : .start
+            let openingEdge: PageLocation = sourceIndex < destination ? .start : .end
+            let source = TestPageView()
+            let delegate = TestPaginationDelegate(pages: [
+                sourceIndex: source,
+                destination: TestPageView(),
+            ])
+            let pagination = makePaginationView(preloadPositionCount: 2)
+            pagination.delegate = delegate
+            pagination.reloadAtIndex(sourceIndex, location: openingEdge, pageCount: 3, readingProgression: .ltr)
+            await drain(pagination)
+            // A cached middle page would already hold the queue until commit.
+            delegate.pages[1] = TestPageView()
+
+            var selectedIndexAtPreload: Int?
+            source.onGo = { [weak pagination] in selectedIndexAtPreload = pagination?.currentIndex }
+            let finished = expectation(description: "The cross-spread move commits")
+            let navigation = Task { @MainActor in
+                _ = await pagination.goToIndex(destination, location: .start, options: NavigatorGoOptions(animated: true))
+                finished.fulfill()
+            }
+            defer { navigation.cancel() }
+            await fulfillment(of: [finished], timeout: 5)
+            await drain(pagination)
+
+            XCTAssertEqual(source.lastLocation, entryEdge, "The outgoing page must be ready for a swipe back")
+            XCTAssertEqual(selectedIndexAtPreload, destination, "The source position must outlive the uncommitted move")
+        }
+    }
+
     func testFailedAdjacentMoveDoesNotRepositionItsSource() async {
         let source = TestPageView()
         let target = TestPageView(commandOutcome: .failed)

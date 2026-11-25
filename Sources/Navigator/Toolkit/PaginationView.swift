@@ -57,8 +57,8 @@ protocol PaginationViewDelegate: AnyObject {
     /// Creates the page view for the page at given index.
     func paginationView(_ paginationView: PaginationView, pageViewAtIndex index: Int) -> (UIView & PageView)?
 
-    /// Called when the current-page attempt terminates, before neighbor preloading.
-    /// A terminal attempt does not imply a successful landing.
+    /// Called when the generation's primary page attempt terminates, before neighbor preloading.
+    /// A staged move can still be showing its source page at this point.
     func paginationViewDidUpdateViews(_ paginationView: PaginationView)
 
     /// Returns the number of positions (as in `Publication.positionList`) in the page view at given index.
@@ -370,9 +370,10 @@ final class PaginationView: UIView {
     private func repositionsSourcePreload(_ request: PageLoadRequest, during move: PageMove) -> Bool {
         let index = request.key.index
         return request.key != move.key
-            && committedPreloadRange?.contains(index) == true
             && loadedViews[index] != nil
-            && (index < move.sourceIndex) != (index < move.key.index)
+            && (index == move.sourceIndex
+                || (committedPreloadRange?.contains(index) == true
+                    && (index < move.sourceIndex) != (index < move.key.index)))
     }
 
     private func loadPage(_ request: PageLoadRequest) async {
@@ -464,9 +465,7 @@ final class PaginationView: UIView {
         }
 
         let neighbor = PageLoadKey(generation: source.generation, index: index)
-        if index != viewportTransition?.sourceIndex || loadedViews[index] == nil {
-            enqueuePage(neighbor, location: location)
-        }
+        enqueuePage(neighbor, location: location)
 
         guard let count = delegate?.paginationView(self, positionCountAtIndex: index) else {
             return source.index
