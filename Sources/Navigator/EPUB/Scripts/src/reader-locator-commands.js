@@ -48,7 +48,12 @@ const LOCATION_KEYS = new Set([
 const TEXT_KEYS = new Set(["before", "highlight", "after"]);
 const DOM_RANGE_KEYS = new Set(["start", "end"]);
 const DOM_POINT_KEYS = new Set(["cssSelector", "textNodeIndex", "charOffset"]);
-const NAVIGATE_KEYS = new Set(["kind", "payload", "animated"]);
+const NAVIGATE_KEYS = new Set([
+  "kind",
+  "payload",
+  "animated",
+  "toleratesLateFrames",
+]);
 const NAVIGATE_PROGRESSION_KEYS = new Set(["kind", "progression", "animated"]);
 const VALIDATE_UNIQUE_TEXT_KEYS = new Set(["kind", "payload", "cssSelector"]);
 const REPLACE_DECORATIONS_KEYS = new Set([
@@ -1127,7 +1132,8 @@ async function scrollAndSettle(
   token,
   maximumFrames,
   signal,
-  deadlineAt
+  deadlineAt,
+  toleratesLateFrames
 ) {
   let belt = null;
   // The scroll write itself is INSIDE the try: `armBelt` runs immediately before it, so
@@ -1148,7 +1154,8 @@ async function scrollAndSettle(
       maximumFrames,
       signal,
       deadlineAt,
-      belt
+      belt,
+      toleratesLateFrames
     );
   } finally {
     if (belt) {
@@ -1584,13 +1591,23 @@ function isLateFrame(frameStatus, deadlineAt) {
   return frameStatus === "timeout" && deadlineAt - performance.now() > 0;
 }
 
+// A frame wait's status as a command that tolerates late frames reads it: a
+// late frame counts as a frame, so only the deadline or a supersession ends
+// the wait.
+function countingLateFrames(frameStatus, deadlineAt, toleratesLateFrames) {
+  return toleratesLateFrames && isLateFrame(frameStatus, deadlineAt)
+    ? "current"
+    : frameStatus;
+}
+
 // Waits, bounded, for the document to have a usable (non-zero) layout
 // viewport before any viewport-relative work runs. Returns "usable",
 // "notReady" (still 0-sized after `VIEWPORT_READY_FRAMES` frames), "timeout"
 // (a frame never arrived), or "stale". `toleratesLateFrames` counts a late
-// frame as a frame, for a command whose miss fails its document: a late frame
-// does not end a current command's wait, only the deadline or the frame cap
-// does; a command superseded meanwhile ends it as "stale" (see `nextFrame`).
+// frame as a frame, for a command whose miss fails its document or lands it
+// elsewhere: a late frame does not end a current command's wait, only the
+// deadline or the frame cap does; a command superseded meanwhile ends it as
+// "stale" (see `nextFrame`).
 async function awaitUsableViewport(
   token,
   signal,
@@ -1628,7 +1645,8 @@ async function awaitOffsetStability(
   maximumFrames,
   signal,
   deadlineAt,
-  belt
+  belt,
+  toleratesLateFrames
 ) {
   let previousX = globalThis.scrollX;
   let previousY = globalThis.scrollY;
@@ -1637,7 +1655,11 @@ async function awaitOffsetStability(
     if (signal?.aborted || !isCurrent(token)) {
       return "stale";
     }
-    const frameStatus = await nextFrame(token, signal, deadlineAt);
+    const frameStatus = countingLateFrames(
+      await nextFrame(token, signal, deadlineAt),
+      deadlineAt,
+      toleratesLateFrames
+    );
     if (frameStatus !== "current") {
       return frameStatus === "timeout" ? "timeout" : "stale";
     }
@@ -1747,10 +1769,13 @@ async function landAndVerify(
   initialRange,
   token,
   animated,
+  toleratesLateFrames,
   signal,
   deadlineAt
 ) {
-  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt);
+  const viewportStatus = await awaitUsableViewport(token, signal, deadlineAt, {
+    toleratesLateFrames,
+  });
   if (viewportStatus === "stale") {
     return { status: "cancelled" };
   }
@@ -1770,7 +1795,8 @@ async function landAndVerify(
     token,
     animated ? 120 : 2,
     signal,
-    deadlineAt
+    deadlineAt,
+    toleratesLateFrames
   );
   if (settleOutcome === "notScrollable") {
     return { status: "miss", reason: "notScrollable" };
@@ -1807,7 +1833,8 @@ async function landAndVerify(
       token,
       CORRECTION_SETTLE_FRAMES,
       signal,
-      deadlineAt
+      deadlineAt,
+      toleratesLateFrames
     );
     if (settleOutcome === "notScrollable") {
       return { status: "miss", reason: "notScrollable" };
@@ -1816,11 +1843,15 @@ async function landAndVerify(
   return { status: "miss", reason: "rangeNotVisible" };
 }
 
+// `toleratesLateFrames` is the caller's: a spread placing its pending location
+// falls back to the locator's progression on a miss, so a late frame must not
+// end that landing, while a navigator navigation reports its miss to its caller.
 async function navigateLocator(command, token, signal, deadlineAt) {
   requireOnlyKeys(command, NAVIGATE_KEYS);
   if (
     command.kind !== "navigateLocator" ||
-    typeof command.animated !== "boolean"
+    typeof command.animated !== "boolean" ||
+    typeof command.toleratesLateFrames !== "boolean"
   ) {
     reject("invalidCommand");
   }
@@ -1838,7 +1869,11 @@ async function navigateLocator(command, token, signal, deadlineAt) {
   if (signal?.aborted || !isCurrent(token)) {
     return commandResult(token, "cancelled", "staleToken");
   }
-  const preScrollFrame = await nextFrame(token, signal, deadlineAt);
+  const preScrollFrame = countingLateFrames(
+    await nextFrame(token, signal, deadlineAt),
+    deadlineAt,
+    command.toleratesLateFrames
+  );
   if (preScrollFrame === "timeout") {
     return commandResult(token, "miss", "paintTimeout");
   }
@@ -1850,6 +1885,7 @@ async function navigateLocator(command, token, signal, deadlineAt) {
     range,
     token,
     command.animated,
+    command.toleratesLateFrames,
     signal,
     deadlineAt
   );
