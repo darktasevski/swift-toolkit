@@ -22,6 +22,8 @@ final class PaginationViewCurrentPageTests: XCTestCase {
 
     func testCurrentPageIdentityResolvesBeforeItsGoAndNeighborPreloading() async {
         let current = TestPageView(blocksGo: true)
+        let commandStarted = expectation(description: "Current page has suspended its command")
+        current.didSuspendGo = commandStarted
         let previous = TestPageView()
         let next = TestPageView()
         let delegate = TestPaginationDelegate(pages: [
@@ -36,7 +38,7 @@ final class PaginationViewCurrentPageTests: XCTestCase {
 
         let installed = await pagination.waitForCurrentPage(at: 1)
         XCTAssertTrue(installed === current)
-        XCTAssertTrue(current.goStarted)
+        await fulfillment(of: [commandStarted], timeout: 5)
         XCTAssertEqual(delegate.requestedIndices, [1])
         XCTAssertNil(pagination.loadedViews[0])
         XCTAssertNil(pagination.loadedViews[2])
@@ -46,19 +48,22 @@ final class PaginationViewCurrentPageTests: XCTestCase {
 
     func testReplacementLoaderWaitsForCancelledPredecessorAcknowledgement() async {
         let first = TestPageView(blocksGo: true)
-        let second = TestPageView(blocksGo: true)
+        let commandStarted = expectation(description: "Predecessor has suspended its command")
+        let commandCancelled = expectation(description: "Predecessor has observed cancellation")
+        first.didSuspendGo = commandStarted
+        first.didObserveCancellation = commandCancelled
+        let second = TestPageView()
         let delegate = TestPaginationDelegate(pages: [0: first, 1: second])
         let pagination = makePaginationView(preloadPositionCount: 0)
         pagination.delegate = delegate
 
         pagination.reloadAtIndex(0, location: .start, pageCount: 2, readingProgression: .ltr)
         _ = await pagination.waitForCurrentPage(at: 0)
-        XCTAssertTrue(first.goStarted)
+        await fulfillment(of: [commandStarted], timeout: 5)
 
         pagination.reloadAtIndex(1, location: .start, pageCount: 2, readingProgression: .ltr)
-        await Task.yield()
+        await fulfillment(of: [commandCancelled], timeout: 5)
 
-        XCTAssertTrue(first.cancellationObserved)
         XCTAssertEqual(delegate.requestedIndices, [0])
 
         first.finishGo()
@@ -66,7 +71,6 @@ final class PaginationViewCurrentPageTests: XCTestCase {
 
         XCTAssertTrue(installed === second)
         XCTAssertEqual(delegate.requestedIndices, [0, 1])
-        second.finishGo()
     }
 
     func testDelegateResultFromSupersededGenerationIsRejected() async {
@@ -1277,9 +1281,8 @@ private final class TestPageView: UIView, PageView {
     private(set) var landingCount = 0
     private(set) var lastLocation: PageLocation?
 
-    var goStarted: Bool {
-        goCallCount > 0
-    }
+    var didSuspendGo: XCTestExpectation?
+    var didObserveCancellation: XCTestExpectation?
 
     init(
         blocksGo: Bool = false,
@@ -1318,10 +1321,12 @@ private final class TestPageView: UIView, PageView {
         let outcome = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 goContinuations.append(continuation)
+                didSuspendGo?.fulfill()
             }
         } onCancel: {
             Task { @MainActor [weak self] in
                 self?.cancellationObserved = true
+                self?.didObserveCancellation?.fulfill()
             }
         }
         guard !Task.isCancelled else { return .cancelled }
